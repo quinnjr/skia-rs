@@ -115,7 +115,7 @@ struct ParsedTypeface {
 /// callers fall back to a bbox-derived estimate. ttf-parser does not
 /// surface this field, hence the manual offset read.
 #[inline]
-fn os2_avg_char_width(table: &[u8]) -> Option<i16> {
+const fn os2_avg_char_width(table: &[u8]) -> Option<i16> {
     if table.len() >= 4 {
         Some(i16::from_be_bytes([table[2], table[3]]))
     } else {

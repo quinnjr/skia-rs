@@ -30,10 +30,10 @@ fn flatten_quad_recursive(
     tolerance: Scalar,
     depth: u32,
 ) {
-    let chord_mid = Point::new((start.x + end.x) * 0.5, (start.y + end.y) * 0.5);
+    let chord_mid = Point::new(f32::midpoint(start.x, end.x), f32::midpoint(start.y, end.y));
     let dx = ctrl.x - chord_mid.x;
     let dy = ctrl.y - chord_mid.y;
-    let dev_sq = dx * dx + dy * dy;
+    let dev_sq = dy.mul_add(dy, dx * dx);
     let tol_sq = tolerance * tolerance;
 
     if depth >= MAX_SUBDIVISION_DEPTH || dev_sq < tol_sq * 4.0 {
@@ -41,9 +41,12 @@ fn flatten_quad_recursive(
         return;
     }
 
-    let m1 = Point::new((start.x + ctrl.x) * 0.5, (start.y + ctrl.y) * 0.5);
-    let m2 = Point::new((ctrl.x + end.x) * 0.5, (ctrl.y + end.y) * 0.5);
-    let m12 = Point::new((m1.x + m2.x) * 0.5, (m1.y + m2.y) * 0.5);
+    let m1 = Point::new(
+        f32::midpoint(start.x, ctrl.x),
+        f32::midpoint(start.y, ctrl.y),
+    );
+    let m2 = Point::new(f32::midpoint(ctrl.x, end.x), f32::midpoint(ctrl.y, end.y));
+    let m12 = Point::new(f32::midpoint(m1.x, m2.x), f32::midpoint(m1.y, m2.y));
 
     flatten_quad_recursive(output, start, m1, m12, tolerance, depth + 1);
     flatten_quad_recursive(output, m12, m2, end, tolerance, depth + 1);
@@ -99,12 +102,18 @@ fn flatten_cubic_recursive(
         return;
     }
 
-    let m1 = Point::new((start.x + ctrl1.x) * 0.5, (start.y + ctrl1.y) * 0.5);
-    let m2 = Point::new((ctrl1.x + ctrl2.x) * 0.5, (ctrl1.y + ctrl2.y) * 0.5);
-    let m3 = Point::new((ctrl2.x + end.x) * 0.5, (ctrl2.y + end.y) * 0.5);
-    let m12 = Point::new((m1.x + m2.x) * 0.5, (m1.y + m2.y) * 0.5);
-    let m23 = Point::new((m2.x + m3.x) * 0.5, (m2.y + m3.y) * 0.5);
-    let mid = Point::new((m12.x + m23.x) * 0.5, (m12.y + m23.y) * 0.5);
+    let m1 = Point::new(
+        f32::midpoint(start.x, ctrl1.x),
+        f32::midpoint(start.y, ctrl1.y),
+    );
+    let m2 = Point::new(
+        f32::midpoint(ctrl1.x, ctrl2.x),
+        f32::midpoint(ctrl1.y, ctrl2.y),
+    );
+    let m3 = Point::new(f32::midpoint(ctrl2.x, end.x), f32::midpoint(ctrl2.y, end.y));
+    let m12 = Point::new(f32::midpoint(m1.x, m2.x), f32::midpoint(m1.y, m2.y));
+    let m23 = Point::new(f32::midpoint(m2.x, m3.x), f32::midpoint(m2.y, m3.y));
+    let mid = Point::new(f32::midpoint(m12.x, m23.x), f32::midpoint(m12.y, m23.y));
 
     flatten_cubic_recursive(output, start, m1, m12, mid, tolerance, depth + 1);
     flatten_cubic_recursive(output, mid, m23, m3, end, tolerance, depth + 1);
@@ -153,12 +162,12 @@ fn flatten_conic_recursive(
 ) {
     let p0 = eval_conic(start, ctrl, end, weight, t0);
     let p1 = eval_conic(start, ctrl, end, weight, t1);
-    let tm = (t0 + t1) * 0.5;
+    let tm = f32::midpoint(t0, t1);
     let pm = eval_conic(start, ctrl, end, weight, tm);
-    let chord_mid = Point::new((p0.x + p1.x) * 0.5, (p0.y + p1.y) * 0.5);
+    let chord_mid = Point::new(f32::midpoint(p0.x, p1.x), f32::midpoint(p0.y, p1.y));
     let dx = pm.x - chord_mid.x;
     let dy = pm.y - chord_mid.y;
-    let dev_sq = dx * dx + dy * dy;
+    let dev_sq = dy.mul_add(dy, dx * dx);
     let tol_sq = tolerance * tolerance;
 
     if depth >= MAX_SUBDIVISION_DEPTH || dev_sq < tol_sq {

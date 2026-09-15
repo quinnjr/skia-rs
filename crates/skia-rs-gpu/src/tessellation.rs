@@ -176,7 +176,7 @@ pub fn matrix_max_scale(m: &Matrix) -> Scalar {
     let aa = d.mul_add(d, c.mul_add(c, a.mul_add(a, b * b)));
     let det = a.mul_add(d, -(b * c));
     let disc = aa.mul_add(aa, -(4.0 * det * det)).max(0.0).sqrt();
-    (0.5 * (aa + disc)).max(0.0).sqrt()
+    f32::midpoint(aa, disc).max(0.0).sqrt()
 }
 
 /// Stroke join style (how consecutive segments meet at a vertex).

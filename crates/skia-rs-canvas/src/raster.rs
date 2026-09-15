@@ -1486,6 +1486,90 @@ pub(crate) fn path_to_region(path: &Path, clip_bounds: &IRect) -> Region {
     region
 }
 
+/// Rasterize a path into per-pixel coverage using the same edge-table
+/// algorithm as anti-aliased path fills.
+pub(crate) fn path_coverage_aa(path: &Path, clip_bounds: &IRect) -> Vec<u8> {
+    use skia_rs_core::cast::{ceil_to_i32, f32_to_u8_sat, floor_to_i32, scalar_from_i32};
+
+    const SAMPLE_OFFSETS: [f32; 4] = [0.125, 0.375, 0.625, 0.875];
+    let width = clip_bounds.width();
+    let height = clip_bounds.height();
+    let size = usize::try_from(width.saturating_mul(height)).unwrap_or(0);
+    let mut result = vec![0; size];
+    let fill_type = path.fill_type();
+    let inverse = matches!(
+        fill_type,
+        FillType::InverseWinding | FillType::InverseEvenOdd
+    );
+    let edges = collect_edges(path, &Matrix::IDENTITY);
+    if edges.is_empty() {
+        if inverse {
+            result.fill(255);
+        }
+        return result;
+    }
+
+    let (y_min, y_max) = if inverse {
+        (clip_bounds.top, clip_bounds.bottom)
+    } else {
+        let ymin = edges.iter().map(|e| e.y_min).fold(f32::INFINITY, f32::min);
+        let ymax = edges
+            .iter()
+            .map(|e| e.y_max)
+            .fold(f32::NEG_INFINITY, f32::max);
+        (
+            floor_to_i32(ymin).max(clip_bounds.top),
+            ceil_to_i32(ymax).min(clip_bounds.bottom),
+        )
+    };
+
+    let row_width = usize::try_from(width).unwrap_or(0);
+    let mut coverage = vec![0.0f32; row_width];
+    let mut get = GlobalEdgeTable::new(edges);
+    let mut aet = ActiveEdgeTable::new();
+
+    for y in y_min..y_max {
+        coverage.fill(0.0);
+        for &offset in &SAMPLE_OFFSETS {
+            let scanline = scalar_from_i32(y) + offset;
+            aet.add_edges(get.get_new_edges_at(scanline), scanline);
+            aet.remove_inactive(scanline);
+            if aet.is_empty() {
+                continue;
+            }
+            aet.sort_by_x();
+            for (x0, x1) in aet.get_spans(fill_type) {
+                let x0 = x0.max(scalar_from_i32(clip_bounds.left));
+                let x1 = x1.min(scalar_from_i32(clip_bounds.right));
+                if x0 >= x1 {
+                    continue;
+                }
+                let px_start = floor_to_i32(x0).max(clip_bounds.left);
+                let px_end = ceil_to_i32(x1).min(clip_bounds.right);
+                for x in px_start..px_end {
+                    let index = usize::try_from(x - clip_bounds.left).unwrap_or(0);
+                    let l = scalar_from_i32(x).max(x0);
+                    let r = scalar_from_i32(x + 1).min(x1);
+                    coverage[index] = (r - l).max(0.0).mul_add(0.25, coverage[index]);
+                }
+            }
+            aet.step_all();
+        }
+
+        for (x, &cov) in coverage.iter().enumerate() {
+            let cov = if inverse { 1.0 - cov } else { cov.min(1.0) };
+            if cov > 0.0 {
+                let index = usize::try_from(y - clip_bounds.top)
+                    .unwrap_or(0)
+                    .saturating_mul(row_width)
+                    .saturating_add(x);
+                result[index] = f32_to_u8_sat(cov * 255.0);
+            }
+        }
+    }
+    result
+}
+
 /// An edge for scanline rasterization with winding direction.
 ///
 /// Edges are oriented from `y_min` to `y_max`, and the winding direction

@@ -608,6 +608,36 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Clip to a rounded rectangle.
+    pub fn clip_round_rect(
+        &mut self,
+        rect: &Rect,
+        rx: Scalar,
+        ry: Scalar,
+        op: ClipOp,
+        do_anti_alias: bool,
+    ) {
+        let matrix = *self.total_matrix();
+        let mut path_builder = skia_rs_path::PathBuilder::new();
+        path_builder.add_round_rect(rect, rx, ry);
+        let mut path = path_builder.build();
+        path.transform(&matrix);
+
+        let device_bounds = IRect::new(0, 0, self.width, self.height);
+        self.clip_stack
+            .clip_path_with_op(&path, &device_bounds, op, do_anti_alias);
+
+        if let Backing::Recording(commands) = &mut self.backing {
+            commands.push(DrawCommand::ClipRoundRect {
+                rect: *rect,
+                rx,
+                ry,
+                op,
+                anti_alias: do_anti_alias,
+            });
+        }
+    }
+
     // =========================================================================
     // Raster-backing helper
     // =========================================================================
@@ -2637,6 +2667,21 @@ mod tests {
             !c.clip_stack.contains(81, 13),
             "corner inside bounds but outside triangle must be clipped"
         );
+    }
+
+    #[test]
+    fn test_clip_round_rect_clips_corner() {
+        let mut c = Canvas::new_null(100, 100);
+        c.clip_round_rect(
+            &Rect::from_xywh(20.0, 20.0, 60.0, 60.0),
+            10.0,
+            10.0,
+            ClipOp::Intersect,
+            false,
+        );
+
+        assert!(c.clip_stack.contains(50, 50));
+        assert!(!c.clip_stack.contains(20, 20));
     }
 
     #[test]

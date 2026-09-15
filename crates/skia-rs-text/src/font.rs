@@ -1236,19 +1236,19 @@ fn flatten_quad(
 ) {
     use skia_rs_core::Point;
     // Midpoint of p0-p2 chord.
-    let midx = (p0.x + p2.x) * 0.5;
-    let midy = (p0.y + p2.y) * 0.5;
+    let midx = f32::midpoint(p0.x, p2.x);
+    let midy = f32::midpoint(p0.y, p2.y);
     // Distance from control to the chord midpoint.
     let dx = p1.x - midx;
     let dy = p1.y - midy;
-    if dx * dx + dy * dy <= tol * tol {
+    if dy.mul_add(dy, dx * dx) <= tol * tol {
         out.push((p0, p2));
         return;
     }
     // Subdivide at t=0.5 using de Casteljau.
-    let q0 = Point::new((p0.x + p1.x) * 0.5, (p0.y + p1.y) * 0.5);
-    let q1 = Point::new((p1.x + p2.x) * 0.5, (p1.y + p2.y) * 0.5);
-    let mid = Point::new((q0.x + q1.x) * 0.5, (q0.y + q1.y) * 0.5);
+    let q0 = Point::new(f32::midpoint(p0.x, p1.x), f32::midpoint(p0.y, p1.y));
+    let q1 = Point::new(f32::midpoint(p1.x, p2.x), f32::midpoint(p1.y, p2.y));
+    let mid = Point::new(f32::midpoint(q0.x, q1.x), f32::midpoint(q0.y, q1.y));
     flatten_quad(p0, q0, mid, tol, out);
     flatten_quad(mid, q1, p2, tol, out);
 }
@@ -1264,29 +1264,29 @@ fn flatten_cubic(
 ) {
     use skia_rs_core::Point;
     // Flatness heuristic: distance of control points from the chord.
-    let cx = (p0.x + p3.x) * 0.5;
-    let cy = (p0.y + p3.y) * 0.5;
+    let cx = f32::midpoint(p0.x, p3.x);
+    let cy = f32::midpoint(p0.y, p3.y);
     let d1 = {
         let dx = p1.x - cx;
         let dy = p1.y - cy;
-        dx * dx + dy * dy
+        dy.mul_add(dy, dx * dx)
     };
     let d2 = {
         let dx = p2.x - cx;
         let dy = p2.y - cy;
-        dx * dx + dy * dy
+        dy.mul_add(dy, dx * dx)
     };
     if d1 <= tol * tol && d2 <= tol * tol {
         out.push((p0, p3));
         return;
     }
     // De Casteljau at t=0.5.
-    let q0 = Point::new((p0.x + p1.x) * 0.5, (p0.y + p1.y) * 0.5);
-    let q1 = Point::new((p1.x + p2.x) * 0.5, (p1.y + p2.y) * 0.5);
-    let q2 = Point::new((p2.x + p3.x) * 0.5, (p2.y + p3.y) * 0.5);
-    let r0 = Point::new((q0.x + q1.x) * 0.5, (q0.y + q1.y) * 0.5);
-    let r1 = Point::new((q1.x + q2.x) * 0.5, (q1.y + q2.y) * 0.5);
-    let mid = Point::new((r0.x + r1.x) * 0.5, (r0.y + r1.y) * 0.5);
+    let q0 = Point::new(f32::midpoint(p0.x, p1.x), f32::midpoint(p0.y, p1.y));
+    let q1 = Point::new(f32::midpoint(p1.x, p2.x), f32::midpoint(p1.y, p2.y));
+    let q2 = Point::new(f32::midpoint(p2.x, p3.x), f32::midpoint(p2.y, p3.y));
+    let r0 = Point::new(f32::midpoint(q0.x, q1.x), f32::midpoint(q0.y, q1.y));
+    let r1 = Point::new(f32::midpoint(q1.x, q2.x), f32::midpoint(q1.y, q2.y));
+    let mid = Point::new(f32::midpoint(r0.x, r1.x), f32::midpoint(r0.y, r1.y));
     flatten_cubic(p0, q0, r0, mid, tol, out);
     flatten_cubic(mid, r1, q2, p3, tol, out);
 }
