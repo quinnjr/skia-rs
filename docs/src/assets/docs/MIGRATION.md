@@ -491,5 +491,5 @@ std::fs::write("output.png", png_data)?;
 ## Getting Help
 
 - [API Documentation](https://docs.rs/skia-rs)
-- [GitHub Issues](https://github.com/pegasusheavy/skia-rs/issues)
-- [Examples](https://github.com/pegasusheavy/skia-rs/tree/main/examples)
+- [GitHub Issues](https://github.com/quinnjr/skia-rs/issues)
+- [Examples](https://github.com/quinnjr/skia-rs/tree/main/examples)

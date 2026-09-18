@@ -1,6 +1,6 @@
 # skia-rs-codec
 
-Image encoding and decoding for [skia-rs](https://github.com/pegasusheavy/skia-rs), a pure Rust implementation of the Skia 2D graphics library.
+Image encoding and decoding for [skia-rs](https://github.com/quinnjr/skia-rs), a pure Rust implementation of the Skia 2D graphics library.
 
 ## Features
 
@@ -18,7 +18,7 @@ Image encoding and decoding for [skia-rs](https://github.com/pegasusheavy/skia-r
 | `png`   | ✅ | PNG codec |
 | `jpeg`  | ✅ | JPEG codec |
 | `gif`   | ✅ | GIF codec |
-| `webp`  | ✅ | WebP codec |
+| `webp`  | ❌ | WebP codec (pulls in `libwebp-sys`) |
 
 ## Usage
 
@@ -42,4 +42,4 @@ let png_data = image.encode_png()?;
 
 MIT OR Apache-2.0
 
-See the [main repository](https://github.com/pegasusheavy/skia-rs) for more information.
+See the [main repository](https://github.com/quinnjr/skia-rs) for more information.

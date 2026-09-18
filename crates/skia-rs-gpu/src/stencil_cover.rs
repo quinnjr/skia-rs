@@ -505,8 +505,8 @@ fn eval_quad(p0: Point, p1: Point, p2: Point, t: Scalar) -> Point {
     let mt2 = mt * mt;
     let t2 = t * t;
     Point::new(
-        t2.mul_add(p2.x, mt2 * p0.x + 2.0 * mt * t * p1.x),
-        t2.mul_add(p2.y, mt2 * p0.y + 2.0 * mt * t * p1.y),
+        t2.mul_add(p2.x, (2.0 * mt * t).mul_add(p1.x, mt2 * p0.x)),
+        t2.mul_add(p2.y, (2.0 * mt * t).mul_add(p1.y, mt2 * p0.y)),
     )
 }
 
@@ -531,11 +531,11 @@ fn eval_cubic(p0: Point, p1: Point, p2: Point, p3: Point, t: Scalar) -> Point {
     Point::new(
         t3.mul_add(
             p3.x,
-            (3.0 * mt * t2).mul_add(p2.x, mt3 * p0.x + 3.0 * mt2 * t * p1.x),
+            (3.0 * mt * t2).mul_add(p2.x, (3.0 * mt2 * t).mul_add(p1.x, mt3 * p0.x)),
         ),
         t3.mul_add(
             p3.y,
-            (3.0 * mt * t2).mul_add(p2.y, mt3 * p0.y + 3.0 * mt2 * t * p1.y),
+            (3.0 * mt * t2).mul_add(p2.y, (3.0 * mt2 * t).mul_add(p1.y, mt3 * p0.y)),
         ),
     )
 }

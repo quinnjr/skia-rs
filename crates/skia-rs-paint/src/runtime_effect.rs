@@ -1995,7 +1995,7 @@ mod tests {
         data.set_float2(4, 800.0, 600.0);
 
         let shader = effect.make_shader(&data, &[]).unwrap();
-        assert!(shader.effect().uniforms().len() == 2);
+        assert_eq!(shader.effect().uniforms().len(), 2);
     }
 
     #[test]

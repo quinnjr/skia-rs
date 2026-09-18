@@ -1,7 +1,7 @@
 [package]
 name = "skia-rs-fuzz"
 version = "0.0.0"
-authors = ["Pegasus Heavy Industries"]
+authors = ["Joseph R. Quinn"]
 publish = false
 edition = "2021"  # Use 2021 for fuzz targets (libfuzzer compatibility)
 
@@ -17,7 +17,7 @@ skia-rs-core = { path = "../crates/skia-rs-core" }
 skia-rs-path = { path = "../crates/skia-rs-path" }
 skia-rs-paint = { path = "../crates/skia-rs-paint" }
 skia-rs-canvas = { path = "../crates/skia-rs-canvas" }
-skia-rs-codec = { path = "../crates/skia-rs-codec" }
+skia-rs-codec = { path = "../crates/skia-rs-codec", features = ["webp"] }
 
 # Workspace feature flags
 [features]

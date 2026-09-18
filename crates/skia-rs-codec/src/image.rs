@@ -981,7 +981,7 @@ fn resample_separable(
                 let w = h_taps.weights[base + k];
                 let p = &src_row[sx * bpp..sx * bpp + bpp];
                 for c in 0..bpp {
-                    acc[c] += f32::from(p[c]) * w;
+                    acc[c] = f32::from(p[c]).mul_add(w, acc[c]);
                 }
             }
             for c in 0..bpp {
@@ -1003,7 +1003,7 @@ fn resample_separable(
                 let w = v_taps.weights[base + k];
                 let p = &intermediate[sy * dst_w * bpp + x * bpp..sy * dst_w * bpp + x * bpp + bpp];
                 for c in 0..bpp {
-                    acc[c] += p[c] * w;
+                    acc[c] = p[c].mul_add(w, acc[c]);
                 }
             }
             for c in 0..bpp {

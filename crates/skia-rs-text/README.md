@@ -1,6 +1,6 @@
 # skia-rs-text
 
-Text layout and rendering for [skia-rs](https://github.com/pegasusheavy/skia-rs), a pure Rust implementation of the Skia 2D graphics library.
+Text layout and rendering for [skia-rs](https://github.com/quinnjr/skia-rs), a pure Rust implementation of the Skia 2D graphics library.
 
 ## Features
 
@@ -36,4 +36,4 @@ canvas.draw_text_blob(&blob, 100.0, 100.0, &paint);
 
 MIT OR Apache-2.0
 
-See the [main repository](https://github.com/pegasusheavy/skia-rs) for more information.
+See the [main repository](https://github.com/quinnjr/skia-rs) for more information.

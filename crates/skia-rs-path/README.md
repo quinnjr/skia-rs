@@ -1,6 +1,6 @@
 # skia-rs-path
 
-Path geometry and operations for [skia-rs](https://github.com/pegasusheavy/skia-rs), a pure Rust implementation of the Skia 2D graphics library.
+Path geometry and operations for [skia-rs](https://github.com/quinnjr/skia-rs), a pure Rust implementation of the Skia 2D graphics library.
 
 ## Features
 
@@ -34,4 +34,4 @@ let union = PathOps::union(&path1, &path2);
 
 MIT OR Apache-2.0
 
-See the [main repository](https://github.com/pegasusheavy/skia-rs) for more information.
+See the [main repository](https://github.com/quinnjr/skia-rs) for more information.

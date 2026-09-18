@@ -4,8 +4,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/skia-rs-safe.svg)](https://crates.io/crates/skia-rs-safe)
 [![Documentation](https://docs.rs/skia-rs-safe/badge.svg)](https://docs.rs/skia-rs-safe)
-[![License](https://img.shields.io/crates/l/skia-rs-safe.svg)](https://github.com/pegasusheavy/skia-rs#license)
-[![Build Status](https://github.com/pegasusheavy/skia-rs/workflows/CI/badge.svg)](https://github.com/pegasusheavy/skia-rs/actions)
+[![License](https://img.shields.io/crates/l/skia-rs-safe.svg)](https://github.com/quinnjr/skia-rs#license)
+[![Build Status](https://github.com/quinnjr/skia-rs/workflows/CI/badge.svg)](https://github.com/quinnjr/skia-rs/actions)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://blog.rust-lang.org/2024/02/08/Rust-1.85.0.html)
 
 **A 100% Rust implementation of the Skia 2D graphics library**
@@ -281,7 +281,7 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 
 ```bash
 # Clone the repository
-git clone https://github.com/pegasusheavy/skia-rs.git
+git clone https://github.com/quinnjr/skia-rs.git
 cd skia-rs
 
 # Build all crates
@@ -334,5 +334,5 @@ at your option.
 ---
 
 <div align="center">
-Made with 🦀 by <a href="https://github.com/pegasusheavy">Pegasus Heavy Industries</a>
+Made with 🦀 by <a href="https://github.com/quinnjr">Joseph R. Quinn</a>
 </div>

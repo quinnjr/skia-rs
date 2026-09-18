@@ -2344,7 +2344,7 @@ checksum = "56199f7ddabf13fe5074ce809e7d3f42b42ae711800501b5b16ea82ad029c39d"
 
 [[package]]
 name = "skia-rs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "skia-rs-canvas",
  "skia-rs-codec",
@@ -2362,7 +2362,7 @@ dependencies = [
 
 [[package]]
 name = "skia-rs-bench"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "criterion",
  "rand 0.8.5",
@@ -2377,7 +2377,7 @@ dependencies = [
 
 [[package]]
 name = "skia-rs-canvas"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "proptest",
  "skia-rs-canvas",
@@ -2392,7 +2392,7 @@ dependencies = [
 
 [[package]]
 name = "skia-rs-codec"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "avif-decode",
  "gif",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "skia-rs-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bitflags 2.10.0",
  "bytemuck",
@@ -2426,7 +2426,7 @@ dependencies = [
 
 [[package]]
 name = "skia-rs-ffi"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cbindgen",
  "libc",
@@ -2441,7 +2441,7 @@ dependencies = [
 
 [[package]]
 name = "skia-rs-gpu"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ash",
  "glow 0.16.0",
@@ -2460,7 +2460,7 @@ dependencies = [
 
 [[package]]
 name = "skia-rs-node"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "napi",
  "napi-build",
@@ -2473,7 +2473,7 @@ dependencies = [
 
 [[package]]
 name = "skia-rs-paint"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bitflags 2.10.0",
  "naga",
@@ -2486,7 +2486,7 @@ dependencies = [
 
 [[package]]
 name = "skia-rs-path"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "geo",
  "serde",
@@ -2496,7 +2496,7 @@ dependencies = [
 
 [[package]]
 name = "skia-rs-pdf"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flate2",
  "pdf-writer",
@@ -2512,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "skia-rs-python"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "pyo3",
  "pyo3-build-config",
@@ -2524,7 +2524,7 @@ dependencies = [
 
 [[package]]
 name = "skia-rs-safe"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bitflags 2.10.0",
  "js-sys",
@@ -2546,7 +2546,7 @@ dependencies = [
 
 [[package]]
 name = "skia-rs-skottie"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "proptest",
  "serde",
@@ -2560,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "skia-rs-svg"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "flate2",
@@ -2578,7 +2578,7 @@ dependencies = [
 
 [[package]]
 name = "skia-rs-text"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "fontdb",
  "proptest",

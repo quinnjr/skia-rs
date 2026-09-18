@@ -1385,8 +1385,9 @@ impl<'a> Rasterizer<'a> {
                     for x in px_start..px_end {
                         let l = scalar_from_i32(x).max(x0);
                         let r = scalar_from_i32(x + 1).min(x1);
-                        coverage[usize::try_from(x - clip_x0).unwrap_or(0)] +=
-                            (r - l).max(0.0) * 0.25;
+                        coverage[usize::try_from(x - clip_x0).unwrap_or(0)] = (r - l)
+                            .max(0.0)
+                            .mul_add(0.25, coverage[usize::try_from(x - clip_x0).unwrap_or(0)]);
                     }
                 }
             }

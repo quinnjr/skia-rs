@@ -924,7 +924,11 @@ impl ImageDecoder for WebpDecoder {
 /// WebP encoder.
 #[derive(Debug)]
 pub struct WebpEncoder {
+    // Only read by the feature-gated encode path; the stub keeps the type
+    // constructible so downstream code compiles without the feature.
+    #[cfg_attr(not(feature = "webp"), allow(dead_code))]
     quality: EncoderQuality,
+    #[cfg_attr(not(feature = "webp"), allow(dead_code))]
     lossless: bool,
 }
 

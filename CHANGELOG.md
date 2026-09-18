@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-19
+
+### Changed
+
+- **Breaking**: `skia-rs-codec` no longer enables the `webp` feature by
+  default, so `libwebp-sys` (a native C build) is only compiled when WebP
+  support is explicitly requested. Enable it with the `webp` feature on
+  `skia-rs-codec`, or `codec-webp` / `codec-all` on `skia-rs` /
+  `skia-rs-safe`. Without the feature, `WebpDecoder` / `WebpEncoder` remain
+  available but return `CodecError::Unsupported`.
+- Project metadata now points at the new repository home
+  (`github.com/quinnjr/skia-rs`) and author (Joseph R. Quinn) across crate
+  manifests, READMEs, licenses, and the generated C headers.
+
 ## [0.3.0] - 2026-07-12
 
 This release lands a large conformance audit against upstream C++ Skia. It
@@ -1107,7 +1121,8 @@ The first public release of skia-rs, a pure Rust implementation of the Skia 2D g
 - Benchmark documentation (`BENCHMARK.md`)
 
 
-[0.1.0]: https://github.com/pegasusheavy/skia-rs/releases/tag/v0.1.0
+[0.1.0]: https://github.com/quinnjr/skia-rs/releases/tag/v0.1.0
 [0.3.0]: https://github.com/quinnjr/skia-rs/compare/v0.2.7...v0.3.0
-[Unreleased]: https://github.com/quinnjr/skia-rs/compare/v0.3.0...HEAD
+[0.4.0]: https://github.com/quinnjr/skia-rs/compare/v0.3.0...v0.4.0
+[Unreleased]: https://github.com/quinnjr/skia-rs/compare/v0.4.0...HEAD
 

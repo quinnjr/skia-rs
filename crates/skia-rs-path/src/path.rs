@@ -923,7 +923,7 @@ impl Path {
                                 n_roots = 1;
                             }
                         } else {
-                            let disc = b * b - 4.0 * a * cc;
+                            let disc = (4.0 * a).mul_add(-cc, b * b);
                             if disc >= 0.0 {
                                 let sqrt_disc = disc.sqrt();
                                 roots[0] = (-b + sqrt_disc) / (2.0 * a);

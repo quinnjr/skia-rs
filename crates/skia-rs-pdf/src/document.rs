@@ -743,10 +743,8 @@ impl<'a> WriteCtx<'a> {
         // Any holes (unlikely with our sequential allocator) get entered as
         // free objects; the producer is strictly append-only so this won't
         // happen in practice — assert in debug.
-        let mut expected = 1u32;
-        for (id, off) in &sorted {
+        for (expected, (id, off)) in (1u32..).zip(sorted.iter()) {
             debug_assert_eq!(*id, expected, "xref hole at {expected}");
-            expected += 1;
             self.write_bytes(writer, format!("{off:010} 00000 n \n").as_bytes())?;
         }
 

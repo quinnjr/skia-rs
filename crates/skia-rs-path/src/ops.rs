@@ -212,8 +212,8 @@ impl Polygon {
         let n = self.points.len();
         for i in 0..n {
             let j = (i + 1) % n;
-            area += self.points[i].x * self.points[j].y;
-            area -= self.points[j].x * self.points[i].y;
+            area = self.points[i].x.mul_add(self.points[j].y, area);
+            area = self.points[j].x.mul_add(-self.points[i].y, area);
         }
         area / 2.0
     }

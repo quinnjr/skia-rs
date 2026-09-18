@@ -128,7 +128,7 @@ pub fn flatten_conic_adaptive(
 
 fn eval_conic(start: Point, ctrl: Point, end: Point, w: Scalar, t: Scalar) -> Point {
     let mt = 1.0 - t;
-    let denom = t.mul_add(t, mt * mt + 2.0 * w * t * mt);
+    let denom = t.mul_add(t, (2.0 * w * t).mul_add(mt, mt * mt));
     let inv_denom = 1.0 / denom;
     Point::new(
         (end.x * t).mul_add(t, (start.x * mt).mul_add(mt, 2.0 * ctrl.x * w * t * mt)) * inv_denom,

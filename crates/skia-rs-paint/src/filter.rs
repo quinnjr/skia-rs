@@ -1588,7 +1588,7 @@ impl ImageFilter for MatrixConvolutionImageFilter {
                         if self.convolve_alpha {
                             // Convolve the premultiplied channels directly.
                             for c in 0..4 {
-                                acc[c] += f32::from(src[sidx + c]) * k;
+                                acc[c] = f32::from(src[sidx + c]).mul_add(k, acc[c]);
                             }
                         } else {
                             // Upstream (SkKnownRuntimeEffects convolution):
@@ -1596,7 +1596,7 @@ impl ImageFilter for MatrixConvolutionImageFilter {
                             let sa = f32::from(src[sidx + 3]) / 255.0;
                             if sa > 0.0 {
                                 for c in 0..3 {
-                                    acc[c] += (f32::from(src[sidx + c]) / sa) * k;
+                                    acc[c] = (f32::from(src[sidx + c]) / sa).mul_add(k, acc[c]);
                                 }
                             }
                         }

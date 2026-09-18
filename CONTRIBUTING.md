@@ -18,7 +18,7 @@ This project adheres to the [Rust Code of Conduct](https://www.rust-lang.org/pol
 
 ```bash
 # Clone the repository
-git clone https://github.com/pegasusheavy/skia-rs.git
+git clone https://github.com/quinnjr/skia-rs.git
 cd skia-rs
 
 # Initialize the Skia submodule (for reference)

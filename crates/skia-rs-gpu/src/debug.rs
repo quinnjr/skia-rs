@@ -570,9 +570,9 @@ impl ShaderDebugger {
                     });
                 }
             }
-            ShaderType::Fragment => {
+            ShaderType::Fragment
                 // Fragment shaders should have an output
-                if !source.contains("out ") && !source.contains("gl_FragColor") {
+                if !source.contains("out ") && !source.contains("gl_FragColor") => {
                     result.warnings.push(ShaderWarning {
                         message: "Fragment shader has no output variable".to_string(),
                         line: 0,
@@ -580,7 +580,6 @@ impl ShaderDebugger {
                         code: Some("W003".to_string()),
                     });
                 }
-            }
             _ => {}
         }
 

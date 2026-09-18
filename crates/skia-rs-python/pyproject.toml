@@ -26,8 +26,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/pegasusheavy/skia-rs"
-Repository = "https://github.com/pegasusheavy/skia-rs"
+Homepage = "https://github.com/quinnjr/skia-rs"
+Repository = "https://github.com/quinnjr/skia-rs"
 Documentation = "https://docs.rs/skia-rs"
 
 [tool.maturin]

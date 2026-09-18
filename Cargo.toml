@@ -47,31 +47,31 @@ default-members = [
 exclude = ["fuzz"]  # Fuzz crate uses different edition for libfuzzer compatibility
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pegasusheavy/skia-rs"
-homepage = "https://github.com/pegasusheavy/skia-rs"
+repository = "https://github.com/quinnjr/skia-rs"
+homepage = "https://github.com/quinnjr/skia-rs"
 documentation = "https://docs.rs/skia-rs-safe"
-authors = ["Pegasus Heavy Industries"]
+authors = ["Joseph R. Quinn"]
 rust-version = "1.85"
 keywords = ["graphics", "2d", "skia", "rendering", "canvas"]
 categories = ["graphics", "rendering::graphics-api", "multimedia::images"]
 
 [workspace.dependencies]
 # Internal crates - version is required for crates.io, path is for local dev
-skia-rs-core = { version = "0.3.0", path = "crates/skia-rs-core" }
-skia-rs-path = { version = "0.3.0", path = "crates/skia-rs-path" }
-skia-rs-paint = { version = "0.3.0", path = "crates/skia-rs-paint" }
-skia-rs-canvas = { version = "0.3.0", path = "crates/skia-rs-canvas" }
-skia-rs-text = { version = "0.3.0", path = "crates/skia-rs-text" }
-skia-rs-gpu = { version = "0.3.0", path = "crates/skia-rs-gpu" }
-skia-rs-codec = { version = "0.3.0", path = "crates/skia-rs-codec" }
-skia-rs-svg = { version = "0.3.0", path = "crates/skia-rs-svg" }
-skia-rs-pdf = { version = "0.3.0", path = "crates/skia-rs-pdf" }
-skia-rs-ffi = { version = "0.3.0", path = "crates/skia-rs-ffi" }
-skia-rs-safe = { version = "0.3.0", path = "crates/skia-rs-safe" }
-skia-rs-skottie = { version = "0.3.0", path = "crates/skia-rs-skottie" }
+skia-rs-core = { version = "0.4.0", path = "crates/skia-rs-core" }
+skia-rs-path = { version = "0.4.0", path = "crates/skia-rs-path" }
+skia-rs-paint = { version = "0.4.0", path = "crates/skia-rs-paint" }
+skia-rs-canvas = { version = "0.4.0", path = "crates/skia-rs-canvas" }
+skia-rs-text = { version = "0.4.0", path = "crates/skia-rs-text" }
+skia-rs-gpu = { version = "0.4.0", path = "crates/skia-rs-gpu" }
+skia-rs-codec = { version = "0.4.0", path = "crates/skia-rs-codec" }
+skia-rs-svg = { version = "0.4.0", path = "crates/skia-rs-svg" }
+skia-rs-pdf = { version = "0.4.0", path = "crates/skia-rs-pdf" }
+skia-rs-ffi = { version = "0.4.0", path = "crates/skia-rs-ffi" }
+skia-rs-safe = { version = "0.4.0", path = "crates/skia-rs-safe" }
+skia-rs-skottie = { version = "0.4.0", path = "crates/skia-rs-skottie" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

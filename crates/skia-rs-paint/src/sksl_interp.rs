@@ -306,7 +306,7 @@ impl Interp<'_> {
             None => return Value::Void,
         };
         self.push_scope();
-        for (param, val) in func.params.iter().zip(args.into_iter()) {
+        for (param, val) in func.params.iter().zip(args) {
             self.declare(&param.name, val);
         }
         let cf = self.run_stmt(&func.body);
@@ -961,7 +961,7 @@ fn mat_mul(l: &Value, r: &Value) -> Option<Value> {
                 for row in 0..2 {
                     let mut s = 0.0;
                     for k in 0..2 {
-                        s += a[k * 2 + row] * b[col * 2 + k];
+                        s = a[k * 2 + row].mul_add(b[col * 2 + k], s);
                     }
                     out[col * 2 + row] = s;
                 }
@@ -974,7 +974,7 @@ fn mat_mul(l: &Value, r: &Value) -> Option<Value> {
                 for row in 0..3 {
                     let mut s = 0.0;
                     for k in 0..3 {
-                        s += a[k * 3 + row] * b[col * 3 + k];
+                        s = a[k * 3 + row].mul_add(b[col * 3 + k], s);
                     }
                     out[col * 3 + row] = s;
                 }
@@ -987,7 +987,7 @@ fn mat_mul(l: &Value, r: &Value) -> Option<Value> {
                 for row in 0..4 {
                     let mut s = 0.0;
                     for k in 0..4 {
-                        s += a[k * 4 + row] * b[col * 4 + k];
+                        s = a[k * 4 + row].mul_add(b[col * 4 + k], s);
                     }
                     out[col * 4 + row] = s;
                 }
@@ -1329,7 +1329,7 @@ fn call_builtin(name: &str, args: &[Value]) -> Option<Value> {
                     let b = broadcast(&args[1], w);
                     let mut s = 0.0;
                     for i in 0..w {
-                        s += a[i] * b[i];
+                        s = a[i].mul_add(b[i], s);
                     }
                     Some(Value::Float(s))
                 }

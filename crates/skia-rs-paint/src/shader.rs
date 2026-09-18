@@ -1124,7 +1124,7 @@ impl Shader for TwoPointConicalGradient {
             // Linear case (d.d == dr^2): B*t + C = 0
             if b.abs() < 1e-7 { None } else { Some(-c / b) }
         } else {
-            let disc = b * b - 4.0 * a * c;
+            let disc = (4.0 * a).mul_add(-c, b * b);
             if disc < 0.0 {
                 None
             } else {
@@ -1673,7 +1673,7 @@ impl PerlinNoiseGenerator {
         let mut amp = 1.0_f32;
         let mut max_val = 0.0_f32;
         for _ in 0..octaves {
-            total += self.noise_2d(x * freq, y * freq) * amp;
+            total = self.noise_2d(x * freq, y * freq).mul_add(amp, total);
             max_val += amp;
             freq *= 2.0;
             amp *= 0.5;
@@ -1688,7 +1688,7 @@ impl PerlinNoiseGenerator {
         let mut amp = 1.0_f32;
         let mut max_val = 0.0_f32;
         for _ in 0..octaves {
-            total += self.noise_2d(x * freq, y * freq).abs() * amp;
+            total = self.noise_2d(x * freq, y * freq).abs().mul_add(amp, total);
             max_val += amp;
             freq *= 2.0;
             amp *= 0.5;

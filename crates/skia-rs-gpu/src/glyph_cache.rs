@@ -610,7 +610,7 @@ mod tests {
         let generation = 7;
         let batch = GlyphBatch::new(generation);
         assert_eq!(batch.validate(generation), BatchValidity::Current);
-        assert!(batch.validate(generation) == BatchValidity::Current);
+        assert_eq!(batch.validate(generation), BatchValidity::Current);
         assert_eq!(batch.validate(generation + 1), BatchValidity::Stale);
         assert!(!(batch.validate(generation + 1) == BatchValidity::Current));
     }

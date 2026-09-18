@@ -1,6 +1,6 @@
 # skia-rs-canvas
 
-Canvas, surface, and recording for [skia-rs](https://github.com/pegasusheavy/skia-rs), a pure Rust implementation of the Skia 2D graphics library.
+Canvas, surface, and recording for [skia-rs](https://github.com/quinnjr/skia-rs), a pure Rust implementation of the Skia 2D graphics library.
 
 ## Features
 
@@ -42,4 +42,4 @@ canvas.restore();
 
 MIT OR Apache-2.0
 
-See the [main repository](https://github.com/pegasusheavy/skia-rs) for more information.
+See the [main repository](https://github.com/quinnjr/skia-rs) for more information.
