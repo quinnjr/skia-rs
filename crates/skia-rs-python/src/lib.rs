@@ -230,7 +230,7 @@ impl Rect {
     }
 
     /// Get the center of the rectangle.
-    fn center(&self) -> Point {
+    const fn center(&self) -> Point {
         let c = self.inner.center();
         Point { inner: c }
     }

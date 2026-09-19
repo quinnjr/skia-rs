@@ -213,7 +213,7 @@ impl Value {
     }
 
     /// Build a vector from N scalar components.
-    pub fn from_components(components: &[f32]) -> Self {
+    pub const fn from_components(components: &[f32]) -> Self {
         match components.len() {
             0 => Self::Void,
             2 => Self::Vec2([components[0], components[1]]),

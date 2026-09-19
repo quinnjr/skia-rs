@@ -449,9 +449,9 @@ impl MsdfData {
         let mut data = Vec::with_capacity(size * 3);
 
         for i in 0..size {
-            let r = ((self.r[i] / spread + 1.0) * 0.5).clamp(0.0, 1.0);
-            let g = ((self.g[i] / spread + 1.0) * 0.5).clamp(0.0, 1.0);
-            let b = ((self.b[i] / spread + 1.0) * 0.5).clamp(0.0, 1.0);
+            let r = f32::midpoint(self.r[i] / spread, 1.0).clamp(0.0, 1.0);
+            let g = f32::midpoint(self.g[i] / spread, 1.0).clamp(0.0, 1.0);
+            let b = f32::midpoint(self.b[i] / spread, 1.0).clamp(0.0, 1.0);
 
             data.push(f32_to_u8_sat(r * 255.0));
             data.push(f32_to_u8_sat(g * 255.0));

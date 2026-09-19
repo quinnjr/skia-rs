@@ -82,52 +82,10 @@ impl ClipMask {
     /// Create a clip mask from a path with anti-aliased edges.
     #[must_use]
     pub fn from_path_aa(path: &Path, device_bounds: &IRect) -> Self {
-        use skia_rs_core::cast::scalar_from_i32;
-
         let width = device_bounds.width();
         let height = device_bounds.height();
         let mut mask = Self::new(width, height, 0);
-
-        // Use supersampling for path coverage (4x4 = 16 samples per pixel).
-        let sample_offsets: [(f32, f32); 16] = [
-            (0.125, 0.125),
-            (0.375, 0.125),
-            (0.625, 0.125),
-            (0.875, 0.125),
-            (0.125, 0.375),
-            (0.375, 0.375),
-            (0.625, 0.375),
-            (0.875, 0.375),
-            (0.125, 0.625),
-            (0.375, 0.625),
-            (0.625, 0.625),
-            (0.875, 0.625),
-            (0.125, 0.875),
-            (0.375, 0.875),
-            (0.625, 0.875),
-            (0.875, 0.875),
-        ];
-
-        for y in 0..height {
-            for x in 0..width {
-                let px = scalar_from_i32(x + device_bounds.left);
-                let py = scalar_from_i32(y + device_bounds.top);
-
-                // Count samples inside the path
-                let mut inside_count: u32 = 0;
-                for (ox, oy) in &sample_offsets {
-                    let sample_x = px + ox;
-                    let sample_y = py + oy;
-                    if path.contains(Point::new(sample_x, sample_y)) {
-                        inside_count += 1;
-                    }
-                }
-
-                let coverage = u8::try_from((inside_count * 255) / 16).unwrap_or(255);
-                mask.set_coverage(x, y, coverage);
-            }
-        }
-
+        mask.coverage = crate::raster::path_coverage_aa(path, device_bounds);
         mask.bounds = *device_bounds;
         mask
     }
@@ -714,6 +672,11 @@ impl ClipStack {
 
     /// Intersect the current clip with a path.
     pub fn clip_path(&mut self, path: &Path, device_bounds: &IRect, anti_alias: bool) {
+        if path.is_empty() {
+            self.current.intersect_rect(&Rect::EMPTY);
+            return;
+        }
+
         if anti_alias {
             let mask = ClipMask::from_path_aa(path, device_bounds);
             match &mut self.current {
@@ -735,6 +698,21 @@ impl ClipStack {
             let region = crate::raster::path_to_region(path, device_bounds);
             self.current.intersect_region(&region);
         }
+    }
+
+    /// Intersect the current clip with a rounded rectangle.
+    pub fn clip_round_rect(
+        &mut self,
+        rect: &Rect,
+        rx: skia_rs_core::Scalar,
+        ry: skia_rs_core::Scalar,
+        device_bounds: &IRect,
+        anti_alias: bool,
+    ) {
+        let mut builder = skia_rs_path::PathBuilder::new();
+        builder.add_round_rect(rect, rx, ry);
+        let path = builder.build();
+        self.clip_path(&path, device_bounds, anti_alias);
     }
 
     /// Apply a clip operation with a path, optionally anti-aliased.

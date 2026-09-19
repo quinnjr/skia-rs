@@ -1323,7 +1323,7 @@ fn f16_to_bytes(v: f32) -> [u8; 2] {
 }
 
 #[inline]
-fn f32_from_le(bytes: &[u8]) -> f32 {
+const fn f32_from_le(bytes: &[u8]) -> f32 {
     f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 

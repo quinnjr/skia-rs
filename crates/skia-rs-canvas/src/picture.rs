@@ -142,6 +142,19 @@ pub enum DrawCommand {
         /// Whether to antialias.
         anti_alias: bool,
     },
+    /// Clip to a rounded rectangle.
+    ClipRoundRect {
+        /// The rounded rectangle bounds.
+        rect: Rect,
+        /// The x radius.
+        rx: Scalar,
+        /// The y radius.
+        ry: Scalar,
+        /// The clip operation.
+        op: crate::ClipOp,
+        /// Whether to antialias.
+        anti_alias: bool,
+    },
     /// Clear the canvas.
     Clear {
         /// The color to clear with.
@@ -305,6 +318,15 @@ impl DrawCommand {
                 anti_alias,
             } => {
                 canvas.clip_path(path, *op, *anti_alias);
+            }
+            Self::ClipRoundRect {
+                rect,
+                rx,
+                ry,
+                op,
+                anti_alias,
+            } => {
+                canvas.clip_round_rect(rect, *rx, *ry, *op, *anti_alias);
             }
             Self::Clear { color } => {
                 canvas.clear(*color);
@@ -524,6 +546,29 @@ impl RecordingCanvas {
     pub fn clip_path_op(&mut self, path: &Path, op: crate::ClipOp, anti_alias: bool) {
         self.inner.commands.push(DrawCommand::ClipPath {
             path: path.clone(),
+            op,
+            anti_alias,
+        });
+    }
+
+    /// Record a rounded rectangle clip command.
+    pub fn clip_round_rect(&mut self, rect: &Rect, rx: Scalar, ry: Scalar, anti_alias: bool) {
+        self.clip_round_rect_op(rect, rx, ry, crate::ClipOp::Intersect, anti_alias);
+    }
+
+    /// Record a rounded rectangle clip command with an explicit clip op.
+    pub fn clip_round_rect_op(
+        &mut self,
+        rect: &Rect,
+        rx: Scalar,
+        ry: Scalar,
+        op: crate::ClipOp,
+        anti_alias: bool,
+    ) {
+        self.inner.commands.push(DrawCommand::ClipRoundRect {
+            rect: *rect,
+            rx,
+            ry,
             op,
             anti_alias,
         });
