@@ -1389,7 +1389,10 @@ impl Matrix {
     /// [`is_similarity`](Self::is_similarity) with an explicit tolerance
     /// for comparing the 2x2 linear part.
     ///
-    /// Corresponds to Skia's `SkMatrix::isSimilarity(SkScalar tol)`.
+    /// Corresponds to Skia's `SkMatrix::isSimilarity(SkScalar tol)`. As in
+    /// Skia, `tol` only applies to matrices with skew: a scale + translate
+    /// matrix compares `|sx|` and `|sy|` with the default near-zero
+    /// tolerance.
     #[must_use]
     #[allow(
         clippy::float_cmp,

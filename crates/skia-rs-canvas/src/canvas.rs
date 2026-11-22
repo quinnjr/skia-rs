@@ -847,8 +847,9 @@ impl<'a> Canvas<'a> {
 
     /// Whether the current clip covers every pixel either fully or not at
     /// all: a region (integer rectangles) or a rectangle with pixel-aligned
-    /// edges. Anti-aliased mask clips and fractional rectangles have
-    /// partial coverage.
+    /// edges. Anti-aliased mask clips have partial coverage. (Rect clips are
+    /// stored in device space; a fractional rect is treated conservatively
+    /// as partial.)
     #[cfg(feature = "text")]
     fn clip_has_binary_coverage(&self) -> bool {
         match self.clip_stack.current() {
