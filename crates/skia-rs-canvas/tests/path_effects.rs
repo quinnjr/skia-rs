@@ -71,3 +71,52 @@ fn recorded_dashed_path_plays_back_like_direct_drawing() {
         "playback must apply the dash exactly once"
     );
 }
+
+#[cfg(feature = "text")]
+#[test]
+fn recorded_emboldened_text_replays_per_command_at_the_right_place() {
+    // Executing recorded commands one by one on a canvas must give the same
+    // result as drawing directly, even with a CTM and fake bold.
+    use skia_rs_text::{Font, Typeface};
+
+    const DEMO_TTF: &[u8] = include_bytes!("fixtures/demo.ttf");
+    let tf = Typeface::from_data(DEMO_TTF.to_vec()).expect("parse demo.ttf");
+    let mut font = Font::new(Arc::new(tf), 30.0);
+    font.set_embolden(true);
+    let mut paint = Paint::new();
+    paint.set_color(Color::WHITE.into());
+
+    let draw = |canvas: &mut Canvas<'_>| {
+        canvas.translate(50.0, 0.0);
+        canvas.scale(2.0, 2.0);
+        canvas.draw_string("A", 5.0, 30.0, &font, &paint);
+    };
+
+    let (w, h) = (300, 100);
+    let mut direct = PixelBuffer::new(w, h);
+    draw(&mut Canvas::new_raster(&mut direct));
+
+    let mut commands: Vec<DrawCommand> = Vec::new();
+    draw(&mut Canvas::new_recording(&mut commands, w, h));
+    let mut replayed = PixelBuffer::new(w, h);
+    {
+        let mut canvas = Canvas::new_raster(&mut replayed);
+        for command in &commands {
+            command.execute(&mut canvas);
+        }
+    }
+
+    let painted = |b: &PixelBuffer| {
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| b.get_pixel(x, y).unwrap_or(Color::BLACK).red() > 100)
+            .collect::<Vec<_>>()
+    };
+    let expected = painted(&direct);
+    assert!(!expected.is_empty(), "direct drawing must paint the glyph");
+    assert_eq!(
+        painted(&replayed),
+        expected,
+        "replay must not apply the CTM twice"
+    );
+}

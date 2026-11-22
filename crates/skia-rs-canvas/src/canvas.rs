@@ -1470,7 +1470,12 @@ impl<'a> Canvas<'a> {
         // magnification. Any other CTM (non-uniform scale, skew,
         // perspective), and paints whose shader, filters, or path effect
         // depend on the local matrix, keep the local-space path below.
-        let device_safe = ctm.is_similarity()
+        // Recording canvases also stay in local space: the device-space path
+        // bakes the CTM into the geometry and resets the matrix, which only
+        // replays correctly through Picture::playback, not when individual
+        // DrawCommands are executed on a canvas that already has a CTM.
+        let device_safe = matches!(self.backing, Backing::Raster(_))
+            && ctm.is_similarity()
             && paint.shader().is_none()
             && paint.mask_filter().is_none()
             && paint.image_filter().is_none()
@@ -1498,14 +1503,18 @@ impl<'a> Canvas<'a> {
         self.reset_matrix();
         match paint.style() {
             Style::Fill
-                if paint.alpha() >= 1.0
+                if device_extra >= 2.0
+                    && paint.alpha() >= 1.0
                     && paint.blend_mode() == skia_rs_paint::BlendMode::SrcOver
                     && paint.color_filter().is_none() =>
             {
-                // Opaque SrcOver: filling the exact outline and then its
-                // stroke outline covers the same pixels as their union, with
-                // no visible double blend, and avoids a path-op union per
-                // glyph.
+                // Opaque SrcOver with an outset of at least 2 device px: the
+                // stroke (half-width >= 1px) fully covers every anti-aliased
+                // pixel along the original outline, so filling the exact
+                // outline and then its stroke outline yields the union's
+                // coverage without a path-op union per glyph. Thinner outsets
+                // (small text) would composite edge pixels twice at partial
+                // coverage, so they take the union path below.
                 self.draw_path(&device_path, paint);
                 let mut outset = paint.clone();
                 outset.set_style(Style::Stroke);
@@ -1513,8 +1522,9 @@ impl<'a> Canvas<'a> {
                 self.draw_path(&device_path, &outset);
             }
             Style::Fill => {
-                // Translucent or non-SrcOver: the overlap must be covered
-                // exactly once, so fill the union (StrokeAndFill).
+                // Translucent, non-SrcOver, or a sub-2px outset: the overlap
+                // must be covered exactly once, so fill the union
+                // (StrokeAndFill).
                 let mut bold = paint.clone();
                 bold.set_style(Style::StrokeAndFill);
                 bold.set_stroke_width(device_extra);
