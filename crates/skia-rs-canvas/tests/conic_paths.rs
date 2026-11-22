@@ -555,3 +555,69 @@ fn thin_stroke_keeps_the_paint_shader() {
         "right end follows the gradient: {right:?}"
     );
 }
+
+#[test]
+fn open_contours_fill_as_if_closed() {
+    // Skia fills every contour as implicitly closed: an unclosed triangle
+    // fills like a closed one, and a filled open arc fills its chord
+    // segment.
+    let fill = |closed: bool| {
+        let mut b = PathBuilder::new();
+        b.move_to(20.0, 20.0)
+            .line_to(180.0, 20.0)
+            .line_to(180.0, 180.0);
+        if closed {
+            b.close();
+        }
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        Canvas::new_raster(&mut buffer).draw_path(&b.build(), &white(Style::Fill));
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).unwrap_or(Color::BLACK).red())
+            .collect::<Vec<_>>()
+    };
+    let closed = fill(true);
+    assert!(closed.iter().any(|&v| v > 0));
+    assert_eq!(
+        fill(false),
+        closed,
+        "an open triangle must fill like a closed one"
+    );
+
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_arc(
+        &Rect::from_xywh(20.0, 20.0, 160.0, 160.0),
+        0.0,
+        90.0,
+        false,
+        &white(Style::Fill),
+    );
+    // Inside the chord segment between (180, 100) and (100, 180): beyond the
+    // chord (x + y > 280) and within the 80px radius of (100, 100).
+    assert!(
+        lit(&buffer, 150, 150),
+        "the open arc's chord segment must be filled"
+    );
+    assert!(
+        !lit(&buffer, 120, 120),
+        "the center side of the chord stays empty"
+    );
+}
+
+#[test]
+fn hairline_points_land_on_the_containing_pixel() {
+    // Pixel i spans [i, i+1) (Skia's bw_pt_hair_proc floors), the same rule
+    // as hairline lines: a point at (50.5, 50.5) or (50.9, 50.9) is pixel
+    // (50, 50).
+    use skia_rs_canvas::PointMode;
+    use skia_rs_core::Point;
+
+    for p in [Point::new(50.5, 50.5), Point::new(50.9, 50.9)] {
+        let mut paint = white(Style::Stroke);
+        paint.set_stroke_width(0.0);
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        Canvas::new_raster(&mut buffer).draw_points(PointMode::Points, &[p], &paint);
+        assert!(lit(&buffer, 50, 50), "{p:?} must light pixel (50, 50)");
+        assert!(!lit(&buffer, 51, 51), "{p:?} must not light pixel (51, 51)");
+    }
+}

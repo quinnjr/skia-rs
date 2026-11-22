@@ -579,9 +579,11 @@ impl<'a> Rasterizer<'a> {
     )]
     pub fn draw_point(&mut self, point: Point, paint: &Paint) {
         use skia_rs_core::cast::round_to_i32;
+        // The pixel containing the point (Skia's bw_pt_hair_proc floors):
+        // pixel i spans [i, i+1), matching the hairline line rasterizers.
         let transformed = self.matrix.map_point(point);
-        let x = round_to_i32(transformed.x);
-        let y = round_to_i32(transformed.y);
+        let x = round_to_i32(transformed.x - 0.5);
+        let y = round_to_i32(transformed.y - 0.5);
 
         let coverage = self.get_clip_coverage(x, y);
         if coverage > 0 {
@@ -1939,6 +1941,11 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
         };
         match element {
             PathElement::Move(p) => {
+                // Filling treats every open contour as closed (as Skia does):
+                // add the implicit closing edge before starting a new one.
+                if let Some(edge) = Edge::new(current, contour_start) {
+                    edges.push(edge);
+                }
                 current = matrix.map_point(p);
                 contour_start = current;
             }
@@ -1990,6 +1997,11 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
                 current = contour_start;
             }
         }
+    }
+    // Implicitly close the last contour (a Close already made this a
+    // zero-length edge, which Edge::new rejects).
+    if let Some(edge) = Edge::new(current, contour_start) {
+        edges.push(edge);
     }
 
     edges
