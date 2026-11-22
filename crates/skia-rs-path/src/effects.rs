@@ -1265,23 +1265,25 @@ impl PathEffect for Path2DEffect {
         // Sk2DPathEffect: a singular matrix fails the effect (the source is
         // drawn unchanged).
         let inverse = self.matrix.invert()?;
-        let spans = lattice_spans(src_path, &inverse)?;
+        let spans = lattice_spans(src_path, &inverse);
 
         // SkPath2DPathEffect::next: the stamp is *translated* to each covered
         // cell's center mapped through the lattice matrix.
         let mut builder = PathBuilder::new();
-        for (y, left, count) in spans {
-            for x in left..left + count {
-                let loc = self.matrix.map_point(Point::new(
-                    scalar_from_i32(x) + 0.5,
-                    scalar_from_i32(y) + 0.5,
-                ));
-                builder.add_path(
-                    &self
-                        .path
-                        .transformed(&skia_rs_core::Matrix::translate(loc.x, loc.y)),
-                );
-            }
+        let cells = spans
+            .into_iter()
+            .flat_map(|(y, left, count)| (left..left + count).map(move |x| (x, y)))
+            .take(MAX_LATTICE_STAMPS);
+        for (x, y) in cells {
+            let loc = self.matrix.map_point(Point::new(
+                scalar_from_i32(x) + 0.5,
+                scalar_from_i32(y) + 0.5,
+            ));
+            builder.add_path(
+                &self
+                    .path
+                    .transformed(&skia_rs_core::Matrix::translate(loc.x, loc.y)),
+            );
         }
         Some(builder.build())
     }
@@ -1295,9 +1297,14 @@ impl PathEffect for Path2DEffect {
 // Line2D Effect
 // =============================================================================
 
-/// Upper bound on lattice cells scanned by the 2D effects; a guard against
-/// pathological lattices (Skia applies a similar cap only in fuzzer builds).
-const MAX_LATTICE_CELLS: i64 = 1 << 22;
+/// Resource guards for the 2D effects against pathological lattices: at
+/// most this many lattice rows and columns are scanned, and
+/// [`Path2DEffect`] places at most [`MAX_LATTICE_STAMPS`] stamps. Beyond
+/// them the pattern is truncated (Skia has no limit outside fuzzer builds,
+/// where it caps spans at 100 cells).
+const MAX_LATTICE_EXTENT: i64 = 1 << 16;
+/// See [`MAX_LATTICE_EXTENT`].
+const MAX_LATTICE_STAMPS: usize = 1 << 20;
 
 /// The lattice cells covered by `src`, as `(row, first_column, count)`
 /// spans, following `Sk2DPathEffect::filterPath`: the source is mapped into
@@ -1306,19 +1313,23 @@ const MAX_LATTICE_CELLS: i64 = 1 << 22;
 /// is covered when its center `(x + 0.5, y + 0.5)` is inside, respecting the
 /// fill type). A source with no area covers no cells.
 ///
-/// Returns `None` only when the lattice rect is unreasonably large.
-fn lattice_spans(src: &Path, inverse: &skia_rs_core::Matrix) -> Option<Vec<(i32, i32, i32)>> {
+/// Rows and columns beyond [`MAX_LATTICE_EXTENT`] are not scanned.
+fn lattice_spans(src: &Path, inverse: &skia_rs_core::Matrix) -> Vec<(i32, i32, i32)> {
     let mapped = src.transformed(inverse);
     let b = mapped.bounds();
     // SkRect::round (sk_float_round2int: floor(x + 0.5)).
     let round = |v: Scalar| floor_to_i32(v + 0.5);
     let (left, top, right, bottom) = (round(b.left), round(b.top), round(b.right), round(b.bottom));
     if left >= right || top >= bottom {
-        return Some(Vec::new());
+        return Vec::new();
     }
-    if i64::from(right - left) * i64::from(bottom - top) > MAX_LATTICE_CELLS {
-        return None;
-    }
+    // Truncate in i64 (the rounded edges saturate, so `right - left` could
+    // overflow i32); the clamped extents then fit comfortably in i32.
+    let clamp_end = |lo: i32, hi: i32| {
+        i32::try_from((i64::from(hi) - i64::from(lo)).min(MAX_LATTICE_EXTENT) + i64::from(lo))
+            .unwrap_or(hi)
+    };
+    let (right, bottom) = (clamp_end(left, right), clamp_end(top, bottom));
 
     // Edges of the flattened path, with every contour implicitly closed.
     let flat = flatten_path_to_lines(&mapped, 0.1);
@@ -1414,7 +1425,7 @@ fn lattice_spans(src: &Path, inverse: &skia_rs_core::Matrix) -> Option<Vec<(i32,
             }
         }
     }
-    Some(spans)
+    spans
 }
 
 /// 2D line effect that fills a region with parallel lines.
@@ -1454,39 +1465,65 @@ impl Line2DEffect {
     }
 }
 
-impl PathEffect for Line2DEffect {
-    fn filter_path(&self, path: &Path, rec: &mut StrokeRec) -> Option<Path> {
-        // SkLine2DPathEffect::onFilterPath: on success,
-        // rec->setStrokeStyle(fWidth); a failure leaves the record alone.
-        let filtered = self.apply(path)?;
-        rec.set_stroke_style(self.width);
-        Some(filtered)
-    }
-
-    fn apply(&self, src_path: &Path) -> Option<Path> {
+impl Line2DEffect {
+    /// The hatch centerlines (`SkLine2DPathEffect::nextSpan`): one line per
+    /// span of more than one covered lattice cell, from the first cell's
+    /// center to one past the last, mapped through the lattice matrix.
+    /// `None` when the lattice matrix is singular.
+    fn hatch_lines(&self, src_path: &Path) -> Option<Vec<(Point, Point)>> {
         if src_path.is_empty() {
             return None;
         }
-        // Sk2DPathEffect: a singular matrix fails the effect (the source is
-        // drawn unchanged).
         let inverse = self.matrix.invert()?;
-        let spans = lattice_spans(src_path, &inverse)?;
-
-        // SkLine2DPathEffect::nextSpan: one line per span of more than one
-        // cell, from the first cell's center to one past the last, mapped
-        // through the lattice matrix. The width comes from the stroke
-        // record (filter_path sets it), not from the geometry.
-        let mut builder = PathBuilder::new();
-        for (v, u, count) in spans {
-            if count > 1 {
+        let lines = lattice_spans(src_path, &inverse)
+            .into_iter()
+            .filter(|&(_, _, count)| count > 1)
+            .map(|(v, u, count)| {
                 let y = scalar_from_i32(v) + 0.5;
-                let p0 = self
-                    .matrix
-                    .map_point(Point::new(scalar_from_i32(u) + 0.5, y));
-                let p1 = self
-                    .matrix
-                    .map_point(Point::new(scalar_from_i32(u + count) + 0.5, y));
-                builder.move_to(p0.x, p0.y).line_to(p1.x, p1.y);
+                (
+                    self.matrix
+                        .map_point(Point::new(scalar_from_i32(u) + 0.5, y)),
+                    self.matrix
+                        .map_point(Point::new(scalar_from_i32(u + count) + 0.5, y)),
+                )
+            })
+            .collect();
+        Some(lines)
+    }
+}
+
+impl PathEffect for Line2DEffect {
+    /// Skia's `SkLine2DPathEffect::onFilterPath`: the open hatch centerlines,
+    /// with the record set to stroke them at the effect's width
+    /// (`rec->setStrokeStyle(fWidth)`). A failure leaves the record alone.
+    fn filter_path(&self, path: &Path, rec: &mut StrokeRec) -> Option<Path> {
+        let lines = self.hatch_lines(path)?;
+        rec.set_stroke_style(self.width);
+        let mut builder = PathBuilder::new();
+        for (p0, p1) in lines {
+            builder.move_to(p0.x, p0.y).line_to(p1.x, p1.y);
+        }
+        Some(builder.build())
+    }
+
+    /// The hatch as fillable geometry: each centerline from
+    /// [`filter_path`](PathEffect::filter_path) outlined as a butt-ended band
+    /// of the effect's width (empty for a zero width, which is a hairline
+    /// hatch that only `filter_path`'s stroke record can express).
+    fn apply(&self, src_path: &Path) -> Option<Path> {
+        let lines = self.hatch_lines(src_path)?;
+        let half_width = self.width / 2.0;
+        let mut builder = PathBuilder::new();
+        for (p0, p1) in lines {
+            let (dx, dy) = (p1.x - p0.x, p1.y - p0.y);
+            let len = dx.hypot(dy);
+            if len > 0.0 && half_width > 0.0 {
+                let (nx, ny) = (-dy / len * half_width, dx / len * half_width);
+                builder.move_to(p0.x + nx, p0.y + ny);
+                builder.line_to(p1.x + nx, p1.y + ny);
+                builder.line_to(p1.x - nx, p1.y - ny);
+                builder.line_to(p0.x - nx, p0.y - ny);
+                builder.close();
             }
         }
         Some(builder.build())
@@ -1630,6 +1667,41 @@ mod tests {
             .count();
         assert_eq!(contours, 25);
     }
+    #[test]
+    fn huge_lattices_are_truncated_not_failed_or_overflowed() {
+        // A 2100 x 2100 source under a unit lattice (4.4M cells) still
+        // hatches (it used to fail, drawing the source as a solid fill).
+        let unit = Line2DEffect::new(1.0, skia_rs_core::Matrix::IDENTITY).unwrap();
+        assert!(!unit.apply(&square(2100.0)).expect("applies").is_empty());
+
+        // Lattice-space bounds beyond i32 (a 3e6-wide source under a 0.001
+        // lattice) must not overflow when measuring the lattice rect.
+        let tiny = skia_rs_core::Matrix::scale(0.001, 0.001);
+        let mut b = PathBuilder::new();
+        b.add_rect(&skia_rs_core::Rect::from_xywh(-1.5e6, 0.0, 3e6, 10.0));
+        let wide = b.build();
+        assert!(Line2DEffect::new(1.0, tiny).unwrap().apply(&wide).is_some());
+        let dot = square(0.0001);
+        assert!(Path2DEffect::new(tiny, dot).unwrap().apply(&wide).is_some());
+    }
+
+    #[test]
+    fn line2d_apply_is_fillable_and_filter_path_strokes_centerlines() {
+        let hatch = Line2DEffect::new(2.0, skia_rs_core::Matrix::scale(4.0, 4.0)).unwrap();
+        let closes = |p: &Path| p.iter().filter(|e| matches!(e, PathElement::Close)).count();
+
+        // apply: closed bands that draw when filled.
+        let bands = hatch.apply(&square(40.0)).expect("applies");
+        assert!(closes(&bands) > 0, "apply returns fillable bands");
+
+        // filter_path: open centerlines, stroked at the effect width.
+        let mut rec = StrokeRec::Fill;
+        let lines = hatch.filter_path(&square(40.0), &mut rec).expect("applies");
+        assert_eq!(closes(&lines), 0);
+        assert!(!lines.is_empty());
+        assert_eq!(rec, StrokeRec::Stroke(2.0));
+    }
+
     #[test]
     fn singular_2d_matrix_fails_before_the_empty_bounds_check() {
         // Sk2DPathEffect returns false for a non-invertible matrix first, so
