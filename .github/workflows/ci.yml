@@ -331,10 +331,11 @@ jobs:
           # Disable GPU for WGPU in CI (use CPU adapter)
           WGPU_BACKEND: ${{ matrix.backend == 'wgpu' && 'gl' || '' }}
 
-      # Generate test images for this backend
+      # Generate test images. Only the raster backend has a canvas renderer;
+      # the GPU backends are covered by the build and test steps above.
       - name: Generate test images
-        run: cargo run --example conformance_gen --features "${{ matrix.features }}" -- --backend ${{ matrix.backend }} --output-dir conformance_output
-        continue-on-error: true
+        if: matrix.backend == 'raster'
+        run: cargo run -p skia-rs-safe --example conformance_gen -- --backend raster --output-dir conformance_output
 
       # Compare against reference images
       - name: Compare with reference images
@@ -359,6 +360,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
+          if-no-files-found: ignore
           name: conformance-${{ matrix.backend }}-${{ matrix.os }}
           path: |
             conformance_output/
