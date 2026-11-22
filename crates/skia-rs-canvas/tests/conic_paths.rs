@@ -621,3 +621,41 @@ fn hairline_points_land_on_the_containing_pixel() {
         assert!(!lit(&buffer, 51, 51), "{p:?} must not light pixel (51, 51)");
     }
 }
+
+#[test]
+fn antialiased_hairline_in_the_top_row_is_drawn() {
+    // After the half-pixel shift, y = 0.25 becomes -0.25; a negative
+    // `fract()` would give row 0 negative coverage and drop it.
+    use skia_rs_core::Point;
+
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    paint.set_anti_alias(true);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_line(
+        Point::new(10.0, 0.25),
+        Point::new(150.0, 0.25),
+        &paint,
+    );
+    let red = buffer.get_pixel(80, 0).unwrap_or(Color::BLACK).red();
+    assert!(red > 100, "row 0 must carry most of the line, got {red}");
+}
+
+#[test]
+fn aliased_hairlines_are_half_open() {
+    // SkScan::HairLine excludes the last pixel: a hairline from x = 20 to
+    // x = 180 covers pixels 20..=179, and a zero-length hairline is empty.
+    use skia_rs_core::Point;
+
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_line(
+        Point::new(20.5, 50.5),
+        Point::new(180.5, 50.5),
+        &paint,
+    );
+    assert!(lit(&buffer, 20, 50), "first pixel drawn");
+    assert!(lit(&buffer, 179, 50), "second-to-last pixel drawn");
+    assert!(!lit(&buffer, 180, 50), "the end pixel is excluded");
+}

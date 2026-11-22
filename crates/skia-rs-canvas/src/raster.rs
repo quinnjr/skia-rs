@@ -646,7 +646,10 @@ impl<'a> Rasterizer<'a> {
         let color = premultiply_color(paint.color32());
         let blend_mode = paint.blend_mode();
 
-        loop {
+        // Half-open, like SkScan::HairLine: the last pixel is not drawn, so
+        // joined hairline segments do not overlap at shared vertices and a
+        // zero-length hairline draws nothing.
+        while x0 != x1 || y0 != y1 {
             let coverage = self.get_clip_coverage(x0, y0);
             if coverage > 0 {
                 if coverage == 255 {
@@ -655,10 +658,6 @@ impl<'a> Rasterizer<'a> {
                     let adjusted = apply_coverage(color, coverage);
                     self.buffer.blend_pixel(x0, y0, adjusted, blend_mode);
                 }
-            }
-
-            if x0 == x1 && y0 == y1 {
-                break;
             }
 
             let e2 = 2 * err;
@@ -676,6 +675,10 @@ impl<'a> Rasterizer<'a> {
     /// Draw line with anti-aliasing using Wu's algorithm.
     fn draw_line_aa(&mut self, p0: Point, p1: Point, paint: &Paint) {
         use skia_rs_core::cast::floor_to_i32;
+        // Fractional part in [0, 1) for negative values too
+        // (`f32::fract` is negative below zero, which the half-pixel
+        // shift below produces near the top/left edges).
+        let fpart = |v: Scalar| v - v.floor();
         // Wu's algorithm assumes pixel i is centered at i; Skia's pixel
         // centers are at i + 0.5. Shift by half a pixel so a line at
         // y = 50.5 lands entirely on row 50 (SkScan_Antihair).
@@ -709,16 +712,16 @@ impl<'a> Rasterizer<'a> {
         // Handle first endpoint
         let xend = x0.round();
         let yend = y0 + gradient * (xend - x0);
-        let xgap = 1.0 - (x0 + 0.5).fract();
+        let xgap = 1.0 - fpart(x0 + 0.5);
         let xpxl1 = floor_to_i32(xend);
         let ypxl1 = floor_to_i32(yend);
 
         if steep {
-            self.plot_aa(ypxl1, xpxl1, (1.0 - yend.fract()) * xgap, color, blend_mode);
-            self.plot_aa(ypxl1 + 1, xpxl1, yend.fract() * xgap, color, blend_mode);
+            self.plot_aa(ypxl1, xpxl1, (1.0 - fpart(yend)) * xgap, color, blend_mode);
+            self.plot_aa(ypxl1 + 1, xpxl1, fpart(yend) * xgap, color, blend_mode);
         } else {
-            self.plot_aa(xpxl1, ypxl1, (1.0 - yend.fract()) * xgap, color, blend_mode);
-            self.plot_aa(xpxl1, ypxl1 + 1, yend.fract() * xgap, color, blend_mode);
+            self.plot_aa(xpxl1, ypxl1, (1.0 - fpart(yend)) * xgap, color, blend_mode);
+            self.plot_aa(xpxl1, ypxl1 + 1, fpart(yend) * xgap, color, blend_mode);
         }
 
         let mut intery = yend + gradient;
@@ -726,31 +729,31 @@ impl<'a> Rasterizer<'a> {
         // Handle second endpoint
         let xend = x1.round();
         let yend = y1 + gradient * (xend - x1);
-        let xgap = (x1 + 0.5).fract();
+        let xgap = fpart(x1 + 0.5);
         let xpxl2 = floor_to_i32(xend);
         let ypxl2 = floor_to_i32(yend);
 
         if steep {
-            self.plot_aa(ypxl2, xpxl2, (1.0 - yend.fract()) * xgap, color, blend_mode);
-            self.plot_aa(ypxl2 + 1, xpxl2, yend.fract() * xgap, color, blend_mode);
+            self.plot_aa(ypxl2, xpxl2, (1.0 - fpart(yend)) * xgap, color, blend_mode);
+            self.plot_aa(ypxl2 + 1, xpxl2, fpart(yend) * xgap, color, blend_mode);
         } else {
-            self.plot_aa(xpxl2, ypxl2, (1.0 - yend.fract()) * xgap, color, blend_mode);
-            self.plot_aa(xpxl2, ypxl2 + 1, yend.fract() * xgap, color, blend_mode);
+            self.plot_aa(xpxl2, ypxl2, (1.0 - fpart(yend)) * xgap, color, blend_mode);
+            self.plot_aa(xpxl2, ypxl2 + 1, fpart(yend) * xgap, color, blend_mode);
         }
 
         // Main loop
         if steep {
             for x in (xpxl1 + 1)..xpxl2 {
                 let y = floor_to_i32(intery);
-                self.plot_aa(y, x, 1.0 - intery.fract(), color, blend_mode);
-                self.plot_aa(y + 1, x, intery.fract(), color, blend_mode);
+                self.plot_aa(y, x, 1.0 - fpart(intery), color, blend_mode);
+                self.plot_aa(y + 1, x, fpart(intery), color, blend_mode);
                 intery += gradient;
             }
         } else {
             for x in (xpxl1 + 1)..xpxl2 {
                 let y = floor_to_i32(intery);
-                self.plot_aa(x, y, 1.0 - intery.fract(), color, blend_mode);
-                self.plot_aa(x, y + 1, intery.fract(), color, blend_mode);
+                self.plot_aa(x, y, 1.0 - fpart(intery), color, blend_mode);
+                self.plot_aa(x, y + 1, fpart(intery), color, blend_mode);
                 intery += gradient;
             }
         }
