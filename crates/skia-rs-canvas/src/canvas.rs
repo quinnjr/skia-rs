@@ -893,8 +893,10 @@ impl<'a> Canvas<'a> {
     pub fn draw_rect(&mut self, rect: &Rect, paint: &Paint) {
         match &mut self.backing {
             Backing::Raster(_) if paint.path_effect().is_some() => {
+                // SkCanvas::drawRect sorts the rect first, which fixes the
+                // contour's start corner and direction for the effect.
                 let mut b = skia_rs_path::PathBuilder::new();
-                b.add_rect(rect);
+                b.add_rect(&sorted_rect(rect));
                 self.rasterize_path(&b.build(), paint);
             }
             Backing::Raster(_) => {
@@ -918,7 +920,7 @@ impl<'a> Canvas<'a> {
         match &mut self.backing {
             Backing::Raster(_) if paint.path_effect().is_some() => {
                 let mut b = skia_rs_path::PathBuilder::new();
-                b.add_oval(rect);
+                b.add_oval(&sorted_rect(rect));
                 self.rasterize_path(&b.build(), paint);
             }
             Backing::Raster(_) => {
@@ -2444,6 +2446,16 @@ impl Canvas<'_> {
             }
         }
     }
+}
+
+/// `rect` with its edges ordered (`SkRect::makeSorted`).
+const fn sorted_rect(rect: &Rect) -> Rect {
+    Rect::new(
+        rect.left.min(rect.right),
+        rect.top.min(rect.bottom),
+        rect.left.max(rect.right),
+        rect.top.max(rect.bottom),
+    )
 }
 
 /// The [`StrokeRec`](skia_rs_path::StrokeRec) a paint starts with when a

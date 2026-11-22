@@ -314,3 +314,29 @@ fn cubic_under_perspective_matches_the_projected_curve() {
         expected.len()
     );
 }
+#[test]
+fn dashed_inverted_rect_matches_the_sorted_rect() {
+    // SkCanvas::drawRect sorts the rect, so an inverted rect dashes from
+    // the same corner, in the same direction, as the sorted one.
+    use skia_rs_path::DashEffect;
+    use std::sync::Arc;
+
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(3.0);
+    paint.set_path_effect(Some(Arc::new(
+        DashEffect::new(vec![10.0, 5.0], 0.0).unwrap(),
+    )));
+
+    let render = |rect: Rect| {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        Canvas::new_raster(&mut buffer).draw_rect(&rect, &paint);
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).unwrap_or(Color::BLACK).red())
+            .collect::<Vec<_>>()
+    };
+    let sorted = render(Rect::new(20.0, 30.0, 170.0, 130.0));
+    let inverted = render(Rect::new(170.0, 130.0, 20.0, 30.0));
+    assert!(sorted.iter().any(|&v| v > 0));
+    assert_eq!(inverted, sorted);
+}
