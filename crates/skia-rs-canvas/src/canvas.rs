@@ -1416,11 +1416,43 @@ impl<'a> Canvas<'a> {
                 continue;
             }
             if let Some(path) = font.glyph_path(glyph) {
-                let m = skia_rs_core::Matrix::translate(at.x, at.y);
-                let transformed = path.transformed(&m);
-                self.draw_path(&transformed, paint);
+                self.draw_glyph_outline(&path, at.x, at.y, font, paint);
             }
         }
+    }
+
+    /// Draw one glyph outline translated to `(x, y)`, applying the font's
+    /// fake-bold (embolden) setting the way Skia's scaler context does
+    /// (`SkScalerContextRec::useStrokeForFakeBold`): the outline is outset by
+    /// a stroke whose width grows with the text size, added to the paint's
+    /// own stroke width, or applied as stroke-and-fill for filled text.
+    #[cfg(feature = "text")]
+    fn draw_glyph_outline(
+        &mut self,
+        outline: &Path,
+        x: Scalar,
+        y: Scalar,
+        font: &skia_rs_text::Font,
+        paint: &Paint,
+    ) {
+        let path = outline.transformed(&Matrix::translate(x, y));
+        if !font.is_embolden() {
+            self.draw_path(&path, paint);
+            return;
+        }
+
+        let extra = fake_bold_extra(font.size());
+        let mut bold = paint.clone();
+        match paint.style() {
+            skia_rs_paint::Style::Fill => {
+                bold.set_style(skia_rs_paint::Style::StrokeAndFill);
+                bold.set_stroke_width(extra);
+            }
+            skia_rs_paint::Style::Stroke | skia_rs_paint::Style::StrokeAndFill => {
+                bold.set_stroke_width(paint.stroke_width() + extra);
+            }
+        }
+        self.draw_path(&path, &bold);
     }
 
     /// Draw positioned text with alignment.
@@ -1473,12 +1505,10 @@ impl<'a> Canvas<'a> {
                     let glyph_x = pen_x + g.x_offset;
                     let glyph_y = pen_y + g.y_offset;
                     let at = Point::new(glyph_x, glyph_y);
-                    if !self.draw_color_glyph(g.glyph_id.0, at, font, paint) {
-                        if let Some(path) = font.glyph_path(g.glyph_id.0) {
-                            let m = skia_rs_core::Matrix::translate(glyph_x, glyph_y);
-                            let transformed = path.transformed(&m);
-                            self.draw_path(&transformed, paint);
-                        }
+                    if !self.draw_color_glyph(g.glyph_id.0, at, font, paint)
+                        && let Some(path) = font.glyph_path(g.glyph_id.0)
+                    {
+                        self.draw_glyph_outline(&path, glyph_x, glyph_y, font, paint);
                     }
                     pen_x += g.x_advance;
                     pen_y += g.y_advance;
@@ -1493,12 +1523,10 @@ impl<'a> Canvas<'a> {
         for c in text.chars() {
             let glyph = font.char_to_glyph(c);
             let at = Point::new(pen_x, y);
-            if !self.draw_color_glyph(glyph, at, font, paint) {
-                if let Some(path) = font.glyph_path(glyph) {
-                    let m = skia_rs_core::Matrix::translate(pen_x, y);
-                    let transformed = path.transformed(&m);
-                    self.draw_path(&transformed, paint);
-                }
+            if !self.draw_color_glyph(glyph, at, font, paint)
+                && let Some(path) = font.glyph_path(glyph)
+            {
+                self.draw_glyph_outline(&path, pen_x, y, font, paint);
             }
             pen_x += font.glyph_advance(glyph);
         }
@@ -2218,13 +2246,37 @@ impl Canvas<'_> {
                 if let Some(path) = font.glyph_path(glyph) {
                     let gx = x + run.origin.x + pos.x;
                     let gy = y + run.origin.y + pos.y;
-                    let m = skia_rs_core::Matrix::translate(gx, gy);
-                    let transformed = path.transformed(&m);
-                    self.draw_path(&transformed, paint);
+                    self.draw_glyph_outline(&path, gx, gy, font, paint);
                 }
             }
         }
     }
+}
+
+/// Extra outline width Skia adds to emboldened ("fake bold") glyphs.
+///
+/// Port of `kStdFakeBoldInterpKeys` / `kStdFakeBoldInterpValues`
+/// (`src/core/SkTextFormatParams.h`) evaluated with `SkFloatInterpFunc`:
+/// the scale is `1/24` at 9pt and below, `1/32` at 36pt and above, and
+/// linearly interpolated in between; the result is `text_size * scale`.
+#[cfg(feature = "text")]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of SkFloatInterpFunc's fma-free arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+fn fake_bold_extra(text_size: Scalar) -> Scalar {
+    const KEYS: [Scalar; 2] = [9.0, 36.0];
+    const VALUES: [Scalar; 2] = [1.0 / 24.0, 1.0 / 32.0];
+
+    let scale = if text_size <= KEYS[0] {
+        VALUES[0]
+    } else if text_size >= KEYS[1] {
+        VALUES[1]
+    } else {
+        let t = (text_size - KEYS[0]) / (KEYS[1] - KEYS[0]);
+        VALUES[0] + (VALUES[1] - VALUES[0]) * t
+    };
+    text_size * scale
 }
 
 /// Vertex drawing mode.
@@ -2557,6 +2609,20 @@ mod tests {
     use super::*;
     use skia_rs_core::{Color, Rect};
     use skia_rs_paint::Style;
+
+    #[cfg(feature = "text")]
+    #[test]
+    fn fake_bold_extra_matches_skia_interpolation() {
+        // SkTextFormatParams.h: 1/24 at <= 9pt, 1/32 at >= 36pt, linear
+        // in between (SkFloatInterpFunc), times the text size.
+        let close = |a: Scalar, b: Scalar| (a - b).abs() < 1e-5;
+        assert!(close(fake_bold_extra(4.0), 4.0 / 24.0));
+        assert!(close(fake_bold_extra(9.0), 9.0 / 24.0));
+        assert!(close(fake_bold_extra(36.0), 36.0 / 32.0));
+        assert!(close(fake_bold_extra(100.0), 100.0 / 32.0));
+        let mid_scale = f32::midpoint(1.0 / 24.0, 1.0 / 32.0);
+        assert!(close(fake_bold_extra(22.5), 22.5 * mid_scale));
+    }
 
     #[test]
     fn test_null_canvas_discards_draws() {

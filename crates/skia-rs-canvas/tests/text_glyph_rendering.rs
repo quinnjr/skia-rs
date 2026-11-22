@@ -149,3 +149,68 @@ fn draw_text_blob_renders_non_rectangular_glyph() {
         "text_blob must have unfilled pixels within its bbox"
     );
 }
+
+/// Count pixels with a non-zero red channel in the whole buffer.
+fn lit_pixels(buffer: &PixelBuffer, width: i32, height: i32) -> usize {
+    let mut lit = 0;
+    for y in 0..height {
+        for x in 0..width {
+            if buffer.get_pixel(x, y).unwrap_or(Color::BLACK).red() > 0 {
+                lit += 1;
+            }
+        }
+    }
+    lit
+}
+
+#[test]
+fn embolden_thickens_glyphs_in_every_draw_path() {
+    use skia_rs_core::Point;
+    use skia_rs_text::TextBlob;
+
+    // Render the same glyph regular and emboldened through each public text
+    // entry point; fake bold (Skia's stroke-and-fill outset) must strictly
+    // increase coverage, and for a stroked paint it must widen the stroke.
+    let render = |embolden: bool, stroke: bool, entry: u8| {
+        let mut font = demo_font(120.0);
+        font.set_embolden(embolden);
+        let mut paint = Paint::new();
+        paint.set_color(Color::WHITE.into());
+        if stroke {
+            paint.set_style(skia_rs_paint::Style::Stroke);
+            paint.set_stroke_width(2.0);
+        }
+        let mut buffer = PixelBuffer::new(300, 300);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            match entry {
+                0 => canvas.draw_string("A", 60.0, 220.0, &font, &paint),
+                1 => {
+                    let blob = TextBlob::from_text("A", &font, Point::zero());
+                    canvas.draw_text_blob(&blob, 60.0, 220.0, &paint);
+                }
+                _ => canvas.draw_glyphs(
+                    &[1],
+                    &[Point::zero()],
+                    Point::new(60.0, 220.0),
+                    &font,
+                    &paint,
+                ),
+            }
+        }
+        lit_pixels(&buffer, 300, 300)
+    };
+
+    for entry in 0..3 {
+        for stroke in [false, true] {
+            let regular = render(false, stroke, entry);
+            let bold = render(true, stroke, entry);
+            assert!(regular > 0, "entry {entry}: regular glyph must paint");
+            assert!(
+                bold > regular,
+                "entry {entry} stroke={stroke}: embolden must add coverage \
+                 (regular={regular}, bold={bold})"
+            );
+        }
+    }
+}
