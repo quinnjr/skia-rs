@@ -4,7 +4,7 @@
 //! to create dashed lines, rounded corners, jittery edges, and more.
 
 use crate::{
-    Path, PathBuilder, PathElement,
+    FillType, Path, PathBuilder, PathElement,
     flatten::{flatten_conic_adaptive, flatten_cubic_adaptive, flatten_quad_adaptive},
 };
 use skia_rs_core::cast::{ceil_to_i32, floor_to_i32, scalar_from_i32};
@@ -1262,55 +1262,27 @@ impl PathEffect for Path2DEffect {
         if src_path.is_empty() {
             return None;
         }
-
-        // Skia checks invertibility first: a singular matrix fails the effect
-        // (the source is drawn unchanged) even when the bounds are empty.
+        // Sk2DPathEffect: a singular matrix fails the effect (the source is
+        // drawn unchanged).
         let inverse = self.matrix.invert()?;
+        let spans = lattice_spans(src_path, &inverse)?;
 
-        // Sk2DPathEffect::filterPath maps the source into lattice space and
-        // rounds its bounds to integers; only an empty *lattice* rect means
-        // no tiles (it then succeeds with an empty result). A zero-area
-        // source can still span lattice cells (e.g. a horizontal line under
-        // a rotated lattice).
-        let bounds = src_path.bounds();
-        let lattice = inverse.map_rect(&bounds);
-        if lattice.left.round() >= lattice.right.round()
-            || lattice.top.round() >= lattice.bottom.round()
-        {
-            return Some(Path::new());
-        }
+        // SkPath2DPathEffect::next: the stamp is *translated* to each covered
+        // cell's center mapped through the lattice matrix.
         let mut builder = PathBuilder::new();
-
-        // Transform bounds to tile space
-        let transformed_bounds = inverse.map_rect(&bounds);
-
-        // Compute tile range
-        let start_x = floor_to_i32(transformed_bounds.left) - 1;
-        let end_x = ceil_to_i32(transformed_bounds.right) + 1;
-        let start_y = floor_to_i32(transformed_bounds.top) - 1;
-        let end_y = ceil_to_i32(transformed_bounds.bottom) + 1;
-
-        // Limit iterations for safety
-        let max_tiles = 1000;
-        let mut tile_count = 0;
-
-        for y in start_y..=end_y {
-            for x in start_x..=end_x {
-                if tile_count >= max_tiles {
-                    break;
-                }
-
-                // Transform tile to world space
-                let tile_offset =
-                    skia_rs_core::Matrix::translate(scalar_from_i32(x), scalar_from_i32(y));
-                let tile_matrix = self.matrix.concat(&tile_offset);
-                let transformed_path = self.path.transformed(&tile_matrix);
-
-                builder.add_path(&transformed_path);
-                tile_count += 1;
+        for (y, left, count) in spans {
+            for x in left..left + count {
+                let loc = self.matrix.map_point(Point::new(
+                    scalar_from_i32(x) + 0.5,
+                    scalar_from_i32(y) + 0.5,
+                ));
+                builder.add_path(
+                    &self
+                        .path
+                        .transformed(&skia_rs_core::Matrix::translate(loc.x, loc.y)),
+                );
             }
         }
-
         Some(builder.build())
     }
 
@@ -1322,6 +1294,128 @@ impl PathEffect for Path2DEffect {
 // =============================================================================
 // Line2D Effect
 // =============================================================================
+
+/// Upper bound on lattice cells scanned by the 2D effects; a guard against
+/// pathological lattices (Skia applies a similar cap only in fuzzer builds).
+const MAX_LATTICE_CELLS: i64 = 1 << 22;
+
+/// The lattice cells covered by `src`, as `(row, first_column, count)`
+/// spans, following `Sk2DPathEffect::filterPath`: the source is mapped into
+/// lattice space by `inverse`, its bounds are rounded to an integer rect, and
+/// the mapped path is scan-converted like `SkRegion::setPath` (non-AA, a cell
+/// is covered when its center `(x + 0.5, y + 0.5)` is inside, respecting the
+/// fill type). A source with no area covers no cells.
+///
+/// Returns `None` only when the lattice rect is unreasonably large.
+fn lattice_spans(src: &Path, inverse: &skia_rs_core::Matrix) -> Option<Vec<(i32, i32, i32)>> {
+    let mapped = src.transformed(inverse);
+    let b = mapped.bounds();
+    // SkRect::round (sk_float_round2int: floor(x + 0.5)).
+    let round = |v: Scalar| floor_to_i32(v + 0.5);
+    let (left, top, right, bottom) = (round(b.left), round(b.top), round(b.right), round(b.bottom));
+    if left >= right || top >= bottom {
+        return Some(Vec::new());
+    }
+    if i64::from(right - left) * i64::from(bottom - top) > MAX_LATTICE_CELLS {
+        return None;
+    }
+
+    // Edges of the flattened path, with every contour implicitly closed.
+    let flat = flatten_path_to_lines(&mapped, 0.1);
+    let mut edges: Vec<(Point, Point)> = Vec::new();
+    let (mut start, mut current) = (Point::zero(), Point::zero());
+    for element in &flat {
+        match element {
+            PathElement::Move(p) => {
+                if current != start {
+                    edges.push((current, start));
+                }
+                start = p;
+                current = p;
+            }
+            PathElement::Line(p)
+            | PathElement::Quad(_, p)
+            | PathElement::Conic(_, p, _)
+            | PathElement::Cubic(_, _, p) => {
+                edges.push((current, p));
+                current = p;
+            }
+            PathElement::Close => {
+                if current != start {
+                    edges.push((current, start));
+                }
+                current = start;
+            }
+        }
+    }
+    if current != start {
+        edges.push((current, start));
+    }
+
+    let fill_type = mapped.fill_type();
+    let even_odd = matches!(fill_type, FillType::EvenOdd | FillType::InverseEvenOdd);
+    let inverse_fill = matches!(
+        fill_type,
+        FillType::InverseWinding | FillType::InverseEvenOdd
+    );
+
+    let mut spans = Vec::new();
+    let mut crossings: Vec<(Scalar, i32)> = Vec::new();
+    for y in top..bottom {
+        let yc = scalar_from_i32(y) + 0.5;
+        crossings.clear();
+        for &(a, b) in &edges {
+            let (lo, hi, dir) = if a.y < b.y { (a, b, 1) } else { (b, a, -1) };
+            if lo.y <= yc && yc < hi.y {
+                let x = ((yc - lo.y) / (hi.y - lo.y)).mul_add(hi.x - lo.x, lo.x);
+                crossings.push((x, dir));
+            }
+        }
+        crossings.sort_by(|p, q| p.0.total_cmp(&q.0));
+
+        // Inside intervals along the row, per the fill rule.
+        let mut intervals: Vec<(Scalar, Scalar)> = Vec::new();
+        let mut winding = 0;
+        let mut entered: Option<Scalar> = None;
+        for &(x, dir) in &crossings {
+            winding += dir;
+            let inside = if even_odd {
+                winding % 2 != 0
+            } else {
+                winding != 0
+            };
+            match (inside, entered) {
+                (true, None) => entered = Some(x),
+                (false, Some(x0)) => {
+                    intervals.push((x0, x));
+                    entered = None;
+                }
+                _ => {}
+            }
+        }
+        if inverse_fill {
+            // The complement of the inside intervals within the lattice rect.
+            let mut complement = Vec::new();
+            let mut cursor = scalar_from_i32(left);
+            for &(x0, x1) in &intervals {
+                complement.push((cursor, x0));
+                cursor = x1;
+            }
+            complement.push((cursor, scalar_from_i32(right)));
+            intervals = complement;
+        }
+
+        // A cell x is covered when its center x + 0.5 lies in [x0, x1).
+        for (x0, x1) in intervals {
+            let first = ceil_to_i32(x0 - 0.5).max(left);
+            let end = ceil_to_i32(x1 - 0.5).min(right);
+            if first < end {
+                spans.push((y, first, end - first));
+            }
+        }
+    }
+    Some(spans)
+}
 
 /// 2D line effect that fills a region with parallel lines.
 ///
@@ -1373,67 +1467,28 @@ impl PathEffect for Line2DEffect {
         if src_path.is_empty() {
             return None;
         }
-
-        // Skia checks invertibility first: a singular matrix fails the effect
-        // (the source is drawn unchanged) even when the bounds are empty.
+        // Sk2DPathEffect: a singular matrix fails the effect (the source is
+        // drawn unchanged).
         let inverse = self.matrix.invert()?;
+        let spans = lattice_spans(src_path, &inverse)?;
 
-        // Sk2DPathEffect::filterPath maps the source into lattice space and
-        // rounds its bounds to integers; only an empty *lattice* rect means
-        // no tiles (it then succeeds with an empty result). A zero-area
-        // source can still span lattice cells (e.g. a horizontal line under
-        // a rotated lattice).
-        let bounds = src_path.bounds();
-        let lattice = inverse.map_rect(&bounds);
-        if lattice.left.round() >= lattice.right.round()
-            || lattice.top.round() >= lattice.bottom.round()
-        {
-            return Some(Path::new());
-        }
+        // SkLine2DPathEffect::nextSpan: one line per span of more than one
+        // cell, from the first cell's center to one past the last, mapped
+        // through the lattice matrix. The width comes from the stroke
+        // record (filter_path sets it), not from the geometry.
         let mut builder = PathBuilder::new();
-
-        // Transform bounds to line space
-        let transformed_bounds = inverse.map_rect(&bounds);
-
-        // Generate horizontal lines in transformed space
-        let start_y = floor_to_i32(transformed_bounds.top) - 1;
-        let end_y = ceil_to_i32(transformed_bounds.bottom) + 1;
-
-        // Limit iterations for safety
-        let max_lines = 500;
-
-        for (line_count, y) in (start_y..=end_y).enumerate() {
-            if line_count >= max_lines {
-                break;
-            }
-
-            // Create a line from left to right
-            let y_pos = scalar_from_i32(y);
-            let p0 = Point::new(transformed_bounds.left - 10.0, y_pos);
-            let p1 = Point::new(transformed_bounds.right + 10.0, y_pos);
-
-            // Transform back to world space
-            let world_p0 = self.matrix.map_point(p0);
-            let world_p1 = self.matrix.map_point(p1);
-
-            // Create a rectangle for the line (with width)
-            let half_width = self.width / 2.0;
-            let dx = world_p1.x - world_p0.x;
-            let dy = world_p1.y - world_p0.y;
-            let len = dx.hypot(dy);
-
-            if len > 0.0 {
-                let nx = -dy / len * half_width;
-                let ny = dx / len * half_width;
-
-                builder.move_to(world_p0.x + nx, world_p0.y + ny);
-                builder.line_to(world_p1.x + nx, world_p1.y + ny);
-                builder.line_to(world_p1.x - nx, world_p1.y - ny);
-                builder.line_to(world_p0.x - nx, world_p0.y - ny);
-                builder.close();
+        for (v, u, count) in spans {
+            if count > 1 {
+                let y = scalar_from_i32(v) + 0.5;
+                let p0 = self
+                    .matrix
+                    .map_point(Point::new(scalar_from_i32(u) + 0.5, y));
+                let p1 = self
+                    .matrix
+                    .map_point(Point::new(scalar_from_i32(u + count) + 0.5, y));
+                builder.move_to(p0.x, p0.y).line_to(p1.x, p1.y);
             }
         }
-
         Some(builder.build())
     }
 
@@ -1546,17 +1601,35 @@ mod tests {
     }
 
     #[test]
-    fn line2d_hatches_a_zero_area_source_under_a_rotated_lattice() {
-        // Emptiness is decided in lattice space (Sk2DPathEffect): a
-        // horizontal line has zero-area bounds, but under a 45-degree
-        // lattice it spans several cells and must be hatched.
-        let lattice = skia_rs_core::Matrix::rotate(std::f32::consts::FRAC_PI_4)
+    fn two_d_effects_only_cover_cells_inside_the_source() {
+        // Sk2DPathEffect scan-converts the source into lattice cells
+        // (SkRegion::setPath at cell centers): a zero-area source covers no
+        // cells, so nothing is drawn even under a rotated lattice...
+        let rotated = skia_rs_core::Matrix::rotate(std::f32::consts::FRAC_PI_4)
             .concat(&skia_rs_core::Matrix::scale(4.0, 4.0));
-        let hatch = Line2DEffect::new(1.0, lattice).unwrap();
-        let produced = hatch.apply(&flat_line()).expect("line 2D effect applies");
-        assert!(!produced.is_empty(), "rotated lattice must hatch the line");
-    }
+        let hatch = Line2DEffect::new(1.0, rotated).unwrap();
+        assert!(hatch.apply(&flat_line()).expect("applies").is_empty());
 
+        // ...while a source with area is hatched under the same lattice.
+        assert!(!hatch.apply(&square(40.0)).expect("applies").is_empty());
+
+        // Path2D stamps exactly the covered cells: a 20x20 square under a
+        // 4x4 lattice covers 5 x 5 cell centers.
+        let mut stamp = PathBuilder::new();
+        stamp
+            .move_to(0.0, 0.0)
+            .line_to(1.0, 0.0)
+            .line_to(0.0, 1.0)
+            .close();
+        let stamp = stamp.build();
+        let tile = Path2DEffect::new(skia_rs_core::Matrix::scale(4.0, 4.0), stamp).unwrap();
+        let produced = tile.apply(&square(20.0)).expect("applies");
+        let contours = produced
+            .iter()
+            .filter(|e| matches!(e, PathElement::Move(_)))
+            .count();
+        assert_eq!(contours, 25);
+    }
     #[test]
     fn singular_2d_matrix_fails_before_the_empty_bounds_check() {
         // Sk2DPathEffect returns false for a non-invertible matrix first, so
