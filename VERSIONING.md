@@ -151,13 +151,13 @@ pub fn internal_helper(...) { ... }
 
 ## MSRV (Minimum Supported Rust Version)
 
-- Current MSRV: **1.85**
+- Current MSRV: **1.94**
 - MSRV bumps are considered **minor** version changes
 - MSRV is specified in `Cargo.toml`:
 
 ```toml
 [workspace.package]
-rust-version = "1.85"
+rust-version = "1.94"
 ```
 
 ## Version Compatibility Matrix

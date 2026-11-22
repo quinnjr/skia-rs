@@ -272,7 +272,7 @@ Applies to: `["**/*.rs"]`
 ## Rust Edition & Version
 
 - **Edition**: 2024
-- **MSRV**: 1.85
+- **MSRV**: 1.94
 - All code must compile on stable Rust
 
 ## Naming Conventions

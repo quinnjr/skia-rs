@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/skia-rs-core",
     "crates/skia-rs-path",
@@ -54,7 +54,7 @@ repository = "https://github.com/quinnjr/skia-rs"
 homepage = "https://github.com/quinnjr/skia-rs"
 documentation = "https://docs.rs/skia-rs-safe"
 authors = ["Joseph R. Quinn"]
-rust-version = "1.85"
+rust-version = "1.94"
 keywords = ["graphics", "2d", "skia", "rendering", "canvas"]
 categories = ["graphics", "rendering::graphics-api", "multimedia::images"]
 

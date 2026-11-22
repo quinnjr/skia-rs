@@ -103,9 +103,8 @@ jobs:
   # MSRV Check (Minimum Supported Rust Version)
   # ==========================================================================
   msrv:
-    name: MSRV (1.85)
+    name: MSRV (1.94)
     runs-on: ubuntu-latest
-    continue-on-error: true  # MSRV check is advisory
     steps:
       - uses: actions/checkout@v4
         with:
@@ -116,10 +115,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
-        continue-on-error: true
+      - run: cargo check --workspace --all-targets
 
   # ==========================================================================
   # Documentation
