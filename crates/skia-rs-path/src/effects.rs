@@ -1259,11 +1259,10 @@ impl Path2DEffect {
 
 impl PathEffect for Path2DEffect {
     fn apply(&self, src_path: &Path) -> Option<Path> {
-        if src_path.is_empty() {
-            return None;
-        }
         // Sk2DPathEffect: a singular matrix fails the effect (the source is
-        // drawn unchanged).
+        // drawn unchanged). An empty source succeeds with nothing (its
+        // lattice rect is empty), so an inverse-filled empty path does not
+        // flood the clip.
         let inverse = self.matrix.invert()?;
         let spans = lattice_spans(src_path, &inverse);
 
@@ -1402,6 +1401,9 @@ fn row_intervals(
 ///
 /// Rows and columns beyond [`MAX_LATTICE_EXTENT`] are not scanned.
 fn lattice_spans(src: &Path, inverse: &skia_rs_core::Matrix) -> Vec<(i32, i32, i32)> {
+    if src.is_empty() {
+        return Vec::new();
+    }
     let mapped = src.transformed(inverse);
     let b = mapped.bounds();
     // SkRect::round (sk_float_round2int: floor(x + 0.5)).
@@ -1530,9 +1532,8 @@ impl Line2DEffect {
     /// center to one past the last, mapped through the lattice matrix.
     /// `None` when the lattice matrix is singular.
     fn hatch_lines(&self, src_path: &Path) -> Option<Vec<(Point, Point)>> {
-        if src_path.is_empty() {
-            return None;
-        }
+        // As in Sk2DPathEffect, only a singular matrix fails; an empty
+        // source succeeds with no lines.
         let inverse = self.matrix.invert()?;
         let lines = lattice_spans(src_path, &inverse)
             .into_iter()
@@ -1780,6 +1781,26 @@ mod tests {
             .map(|p| p.x)
             .fold(Scalar::INFINITY, Scalar::min);
         assert!((min_x - 2.0).abs() < 1e-4, "hatch starts at x = {min_x}");
+    }
+
+    #[test]
+    fn two_d_effects_succeed_with_nothing_on_an_empty_source() {
+        // Sk2DPathEffect::onFilterPath succeeds for an empty source (and
+        // Line2D still sets the stroke record), so an inverse-filled empty
+        // path is not drawn unchanged (which would flood the clip).
+        let mut b = PathBuilder::new();
+        b.fill_type(FillType::InverseWinding);
+        let empty = b.build();
+        let lattice = skia_rs_core::Matrix::scale(4.0, 4.0);
+
+        let hatch = Line2DEffect::new(1.0, lattice).unwrap();
+        let mut rec = StrokeRec::Fill;
+        let lines = hatch.filter_path(&empty, &mut rec).expect("succeeds");
+        assert!(lines.is_empty());
+        assert_eq!(rec, StrokeRec::Stroke(1.0));
+
+        let tile = Path2DEffect::new(lattice, square(1.0)).unwrap();
+        assert!(tile.apply(&empty).expect("succeeds").is_empty());
     }
 
     #[test]
