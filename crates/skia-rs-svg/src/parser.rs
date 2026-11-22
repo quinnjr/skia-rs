@@ -122,10 +122,10 @@ fn ns_to_prefix(ns: &str) -> &'static str {
 fn collect_text(node: roxmltree::Node) -> String {
     let mut out = String::new();
     for desc in node.descendants() {
-        if desc.is_text() {
-            if let Some(t) = desc.text() {
-                out.push_str(t);
-            }
+        if desc.is_text()
+            && let Some(t) = desc.text()
+        {
+            out.push_str(t);
         }
     }
     out
@@ -388,10 +388,10 @@ fn apply_common_attrs(node: &mut SvgNode, attrs: &HashMap<String, String>) {
         node.visible = visibility != "hidden";
     }
 
-    if let Some(display) = attrs.get("display") {
-        if display == "none" {
-            node.visible = false;
-        }
+    if let Some(display) = attrs.get("display")
+        && display == "none"
+    {
+        node.visible = false;
     }
 
     // Preserve `style="..."` so css::apply_stylesheet can reapply inline

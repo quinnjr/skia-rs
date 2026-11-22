@@ -23,6 +23,11 @@
 //! runner.run();
 //! ```
 
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -739,10 +744,10 @@ impl DmRunner {
 
         for source in &self.sources {
             // Apply filter
-            if let Some(filter) = &self.filter {
-                if !source.name().contains(filter) {
-                    continue;
-                }
+            if let Some(filter) = &self.filter
+                && !source.name().contains(filter)
+            {
+                continue;
             }
 
             for renderer in &self.renderers {
@@ -902,7 +907,7 @@ mod tests {
         for gm in gms {
             let (w, h) = gm.size();
             assert!(w > 0 && h > 0);
-            assert!(!gm.name().is_empty());
+            assert_ne!(gm.name(), "");
         }
     }
 
@@ -915,6 +920,6 @@ mod tests {
         gm.draw(&mut surface);
 
         let pixels = surface.pixels();
-        assert!(!pixels.is_empty());
+        assert_ne!(pixels, []);
     }
 }

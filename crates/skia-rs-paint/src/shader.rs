@@ -87,8 +87,8 @@ fn serialize_gradient_common(
     // Local matrix (1 byte present flag + 36 bytes if present)
     if let Some(matrix) = local_matrix {
         buf.push(1);
-        for i in 0..9 {
-            buf.extend_from_slice(&matrix.values[i].to_le_bytes());
+        for v in &matrix.values {
+            buf.extend_from_slice(&v.to_le_bytes());
         }
     } else {
         buf.push(0);
@@ -1469,8 +1469,8 @@ impl Shader for ImageShader {
         // Local matrix (1 byte present flag + 36 bytes if present)
         if let Some(matrix) = &self.local_matrix {
             buf.push(1);
-            for i in 0..9 {
-                buf.extend_from_slice(&matrix.values[i].to_le_bytes());
+            for v in &matrix.values {
+                buf.extend_from_slice(&v.to_le_bytes());
             }
         } else {
             buf.push(0);
@@ -1953,8 +1953,8 @@ impl Shader for LocalMatrixShader {
         buf.push(SHADER_KIND_LOCAL_MATRIX);
 
         // Matrix (36 bytes)
-        for i in 0..9 {
-            buf.extend_from_slice(&self.matrix.values[i].to_le_bytes());
+        for v in &self.matrix.values {
+            buf.extend_from_slice(&v.to_le_bytes());
         }
 
         // Inner shader (recursive)
@@ -2261,8 +2261,8 @@ fn deserialize_gradient_common(bytes: &[u8], offset: &mut usize) -> Option<Gradi
             return None;
         }
         let mut m = Matrix::identity();
-        for i in 0..9 {
-            m.values[i] = f32::from_le_bytes([
+        for v in &mut m.values {
+            *v = f32::from_le_bytes([
                 bytes[*offset],
                 bytes[*offset + 1],
                 bytes[*offset + 2],
@@ -2630,8 +2630,8 @@ fn deserialize_image_shader(bytes: &[u8], offset: &mut usize) -> Option<ShaderRe
             return None;
         }
         let mut m = Matrix::identity();
-        for i in 0..9 {
-            m.values[i] = f32::from_le_bytes([
+        for v in &mut m.values {
+            *v = f32::from_le_bytes([
                 bytes[*offset],
                 bytes[*offset + 1],
                 bytes[*offset + 2],
@@ -2862,8 +2862,8 @@ fn deserialize_local_matrix_shader(bytes: &[u8], offset: &mut usize) -> Option<S
         return None;
     }
     let mut matrix = Matrix::identity();
-    for i in 0..9 {
-        matrix.values[i] = f32::from_le_bytes([
+    for v in &mut matrix.values {
+        *v = f32::from_le_bytes([
             bytes[*offset],
             bytes[*offset + 1],
             bytes[*offset + 2],

@@ -803,10 +803,10 @@ impl Rect {
     /// Returns the center point.
     #[inline]
     #[must_use]
-    pub fn center(&self) -> Point {
+    pub const fn center(&self) -> Point {
         Point {
-            x: (self.left + self.right) * 0.5,
-            y: (self.top + self.bottom) * 0.5,
+            x: f32::midpoint(self.left, self.right),
+            y: f32::midpoint(self.top, self.bottom),
         }
     }
 

@@ -698,17 +698,15 @@ impl<'a> Canvas<'a> {
                 scalar_from_i32(self.width),
                 scalar_from_i32(self.height),
             );
-            if let crate::clip::ClipState::Rect(r) = self.clip_stack.current() {
-                if r.left <= full.left
-                    && r.top <= full.top
-                    && r.right >= full.right
-                    && r.bottom >= full.bottom
-                {
-                    if let Backing::Raster(buffer) = &mut self.backing {
-                        buffer.clear(color);
-                        return;
-                    }
-                }
+            if let crate::clip::ClipState::Rect(r) = self.clip_stack.current()
+                && r.left <= full.left
+                && r.top <= full.top
+                && r.right >= full.right
+                && r.bottom >= full.bottom
+                && let Backing::Raster(buffer) = &mut self.backing
+            {
+                buffer.clear(color);
+                return;
             }
         }
 
@@ -801,7 +799,7 @@ impl<'a> Canvas<'a> {
             }
             PointMode::Lines => {
                 // Consecutive pairs form lines
-                for chunk in points.chunks_exact(2) {
+                for chunk in points.as_chunks::<2>().0 {
                     self.draw_line(chunk[0], chunk[1], paint);
                 }
             }
@@ -1572,15 +1570,15 @@ impl<'a> Canvas<'a> {
         outline = outline.transformed(&place);
 
         // Clip the outline by clip_glyph's outline if set.
-        if let Some(clip_id) = layer.clip_glyph {
-            if let Some(clip_path) = font.glyph_path(clip_id) {
-                let clip = clip_path.transformed(&layer.transform).transformed(&place);
-                self.save();
-                self.clip_path(&clip, ClipOp::Intersect, base_paint.is_anti_alias());
-                self.fill_colr_layer(&outline, &layer.paint, layer.composite_mode, base_paint);
-                self.restore();
-                return;
-            }
+        if let Some(clip_id) = layer.clip_glyph
+            && let Some(clip_path) = font.glyph_path(clip_id)
+        {
+            let clip = clip_path.transformed(&layer.transform).transformed(&place);
+            self.save();
+            self.clip_path(&clip, ClipOp::Intersect, base_paint.is_anti_alias());
+            self.fill_colr_layer(&outline, &layer.paint, layer.composite_mode, base_paint);
+            self.restore();
+            return;
         }
 
         self.fill_colr_layer(&outline, &layer.paint, layer.composite_mode, base_paint);

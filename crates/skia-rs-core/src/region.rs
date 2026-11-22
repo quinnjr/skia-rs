@@ -63,21 +63,21 @@ impl Region {
     /// Returns true if the region is empty.
     #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.rects.is_empty()
     }
 
     /// Returns true if the region is a single rectangle.
     #[inline]
     #[must_use]
-    pub fn is_rect(&self) -> bool {
+    pub const fn is_rect(&self) -> bool {
         self.rects.len() == 1
     }
 
     /// Returns true if the region is complex (more than one rectangle).
     #[inline]
     #[must_use]
-    pub fn is_complex(&self) -> bool {
+    pub const fn is_complex(&self) -> bool {
         self.rects.len() > 1
     }
 
@@ -98,7 +98,7 @@ impl Region {
     /// Returns the number of rectangles in the region.
     #[inline]
     #[must_use]
-    pub fn rect_count(&self) -> usize {
+    pub const fn rect_count(&self) -> usize {
         self.rects.len()
     }
 

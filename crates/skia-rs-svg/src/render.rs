@@ -327,7 +327,7 @@ fn dom_has_inline_styles(node: &SvgNode) -> bool {
 /// True when a node draws a single atomic shape and has no descendants —
 /// the condition under which `opacity` can be applied as paint alpha rather
 /// than an offscreen layer (`SkSVGRenderContext::applyOpacity`, kLeaf).
-fn is_leaf_shape(node: &SvgNode) -> bool {
+const fn is_leaf_shape(node: &SvgNode) -> bool {
     node.children.is_empty()
         && matches!(
             node.kind,
@@ -368,16 +368,14 @@ fn render_node(
 
     // clip-path reference applied before drawing the node contents.
     let clip_ref = node.attributes.get("clip-path").cloned();
-    if let Some(href) = clip_ref.as_deref() {
-        if let Some(id) = extract_url_id(href) {
-            if let Some(clip_node) = ctx.lookup(id) {
-                if let SvgNodeKind::ClipPath(_) = &clip_node.kind {
-                    let path = build_clip_path(clip_node);
-                    if !path.is_empty() {
-                        canvas.clip_path(&path, ClipOp::Intersect, true);
-                    }
-                }
-            }
+    if let Some(href) = clip_ref.as_deref()
+        && let Some(id) = extract_url_id(href)
+        && let Some(clip_node) = ctx.lookup(id)
+        && let SvgNodeKind::ClipPath(_) = &clip_node.kind
+    {
+        let path = build_clip_path(clip_node);
+        if !path.is_empty() {
+            canvas.clip_path(&path, ClipOp::Intersect, true);
         }
     }
 
@@ -564,10 +562,10 @@ fn render_node(
             render_image(img, canvas, opacity);
         }
         SvgNodeKind::Use(href) => {
-            if depth < MAX_USE_DEPTH {
-                if let Some(referenced) = ctx.lookup(href) {
-                    render_node(referenced, canvas, ctx, &state, depth + 1);
-                }
+            if depth < MAX_USE_DEPTH
+                && let Some(referenced) = ctx.lookup(href)
+            {
+                render_node(referenced, canvas, ctx, &state, depth + 1);
             }
         }
         SvgNodeKind::Group | SvgNodeKind::Svg => {

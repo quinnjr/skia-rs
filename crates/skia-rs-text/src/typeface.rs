@@ -115,7 +115,7 @@ struct ParsedTypeface {
 /// callers fall back to a bbox-derived estimate. ttf-parser does not
 /// surface this field, hence the manual offset read.
 #[inline]
-fn os2_avg_char_width(table: &[u8]) -> Option<i16> {
+const fn os2_avg_char_width(table: &[u8]) -> Option<i16> {
     if table.len() >= 4 {
         Some(i16::from_be_bytes([table[2], table[3]]))
     } else {
@@ -399,10 +399,10 @@ impl Typeface {
     /// Falls back to returning the character code for ASCII when no font
     /// data is available (the default typeface has no backing font).
     pub fn char_to_glyph(&self, c: char) -> u16 {
-        if let Some(data) = self.font_data() {
-            if let Ok(face) = ttf_parser::Face::parse(data, 0) {
-                return face.glyph_index(c).map_or(0, |g| g.0);
-            }
+        if let Some(data) = self.font_data()
+            && let Ok(face) = ttf_parser::Face::parse(data, 0)
+        {
+            return face.glyph_index(c).map_or(0, |g| g.0);
         }
         // Fallback for the dataless default typeface — just use the codepoint
         // for ASCII so existing non-data tests continue to produce non-zero

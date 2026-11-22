@@ -53,7 +53,7 @@ impl PathMeasure {
     /// Get the number of contours.
     #[inline]
     #[must_use]
-    pub fn contour_count(&self) -> usize {
+    pub const fn contour_count(&self) -> usize {
         self.contour_lengths.len()
     }
 
@@ -251,12 +251,12 @@ impl PathMeasure {
         for elem in path {
             match elem {
                 PathElement::Move(p) => {
-                    if let Some(c) = current_contour.take() {
-                        if c.length > 0.0 {
-                            self.contour_lengths.push(c.length);
-                            self.total_length += c.length;
-                            self.contours.push(c);
-                        }
+                    if let Some(c) = current_contour.take()
+                        && c.length > 0.0
+                    {
+                        self.contour_lengths.push(c.length);
+                        self.total_length += c.length;
+                        self.contours.push(c);
                     }
                     current_contour = Some(Contour {
                         segments: Vec::new(),
@@ -328,22 +328,22 @@ impl PathMeasure {
                     current_pt = end;
                 }
                 PathElement::Close => {
-                    if let Some(c) = current_contour.as_mut() {
-                        if current_pt != contour_start {
-                            push_segment(c, current_pt, contour_start);
-                        }
+                    if let Some(c) = current_contour.as_mut()
+                        && current_pt != contour_start
+                    {
+                        push_segment(c, current_pt, contour_start);
                     }
                     current_pt = contour_start;
                 }
             }
         }
 
-        if let Some(c) = current_contour.take() {
-            if c.length > 0.0 {
-                self.contour_lengths.push(c.length);
-                self.total_length += c.length;
-                self.contours.push(c);
-            }
+        if let Some(c) = current_contour.take()
+            && c.length > 0.0
+        {
+            self.contour_lengths.push(c.length);
+            self.total_length += c.length;
+            self.contours.push(c);
         }
     }
 }

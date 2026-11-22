@@ -1,5 +1,10 @@
 //! Path builder for constructing paths.
 
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+
 use crate::{FillType, Path, Verb};
 use skia_rs_core::cast::{ceil_to_i32, scalar_from_i32};
 use skia_rs_core::{Point, Rect, Scalar};
@@ -127,10 +132,10 @@ impl PathBuilder {
     /// A repeated `close()` is a no-op (upstream `SkPathBuilder::close`).
     #[inline]
     pub fn close(&mut self) -> &mut Self {
-        if let Some(&last) = self.path.verbs.last() {
-            if last != Verb::Close {
-                self.path.verbs.push(Verb::Close);
-            }
+        if let Some(&last) = self.path.verbs.last()
+            && last != Verb::Close
+        {
+            self.path.verbs.push(Verb::Close);
         }
         self
     }
@@ -420,10 +425,10 @@ impl PathBuilder {
     /// After a `close()`, the current point returns to the subpath's initial
     /// (last move) point, matching Skia's `case 'Z': c = first`.
     pub fn current_point(&self) -> Point {
-        if self.path.verbs.last() == Some(&Verb::Close) {
-            if let Some(mv) = self.last_move {
-                return mv;
-            }
+        if self.path.verbs.last() == Some(&Verb::Close)
+            && let Some(mv) = self.last_move
+        {
+            return mv;
         }
         self.path.points.last().copied().unwrap_or(Point::zero())
     }

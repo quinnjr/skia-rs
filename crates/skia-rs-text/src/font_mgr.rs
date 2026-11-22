@@ -172,10 +172,10 @@ impl FontMgr for DefaultFontMgr {
     ) -> Option<TypefaceRef> {
         // 1. Preferred: look for a typeface in the requested family whose
         //    cmap contains `character`.
-        if let Some(family) = self.families.iter().find(|f| f.name == family_name) {
-            if let Some(tf) = best_covering_typeface(family, style, character) {
-                return Some(tf);
-            }
+        if let Some(family) = self.families.iter().find(|f| f.name == family_name)
+            && let Some(tf) = best_covering_typeface(family, style, character)
+        {
+            return Some(tf);
         }
 
         // 2. Scan every registered family for coverage, picking the

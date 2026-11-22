@@ -199,7 +199,7 @@ impl Polygon {
         self.points.push(p);
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.points.len() < 3
     }
 

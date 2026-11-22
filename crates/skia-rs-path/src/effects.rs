@@ -131,12 +131,12 @@ impl DashEffect {
         }
 
         // Ensure even number of intervals
-        let intervals = if intervals.len() % 2 != 0 {
+        let intervals = if intervals.len().is_multiple_of(2) {
+            intervals
+        } else {
             let mut doubled = intervals.clone();
             doubled.extend(intervals.iter().copied());
             doubled
-        } else {
-            intervals
         };
 
         // Validate intervals are positive
@@ -224,7 +224,7 @@ impl DashEffect {
                     builder.line_to(mid.x, mid.y);
                 }
                 *interval_idx = (*interval_idx + 1) % self.intervals.len();
-                *is_on = *interval_idx % 2 == 0;
+                *is_on = (*interval_idx).is_multiple_of(2);
                 *remaining_in_interval = self.intervals[*interval_idx];
                 if *is_on {
                     builder.move_to(mid.x, mid.y);
@@ -816,54 +816,54 @@ impl PathEffect for TrimEffect {
                     return Some(path.clone());
                 }
                 let mut builder = PathBuilder::new();
-                if start_dist > 0.0 {
-                    if let Some(before) = measure.get_segment(0.0, start_dist) {
-                        for elem in &before {
-                            match elem {
-                                PathElement::Move(p) => {
-                                    builder.move_to(p.x, p.y);
-                                }
-                                PathElement::Line(p) => {
-                                    builder.line_to(p.x, p.y);
-                                }
-                                PathElement::Quad(p1, p2) => {
-                                    builder.quad_to(p1.x, p1.y, p2.x, p2.y);
-                                }
-                                PathElement::Cubic(p1, p2, p3) => {
-                                    builder.cubic_to(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y);
-                                }
-                                PathElement::Conic(p1, p2, w) => {
-                                    builder.conic_to(p1.x, p1.y, p2.x, p2.y, w);
-                                }
-                                PathElement::Close => {
-                                    builder.close();
-                                }
+                if start_dist > 0.0
+                    && let Some(before) = measure.get_segment(0.0, start_dist)
+                {
+                    for elem in &before {
+                        match elem {
+                            PathElement::Move(p) => {
+                                builder.move_to(p.x, p.y);
+                            }
+                            PathElement::Line(p) => {
+                                builder.line_to(p.x, p.y);
+                            }
+                            PathElement::Quad(p1, p2) => {
+                                builder.quad_to(p1.x, p1.y, p2.x, p2.y);
+                            }
+                            PathElement::Cubic(p1, p2, p3) => {
+                                builder.cubic_to(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y);
+                            }
+                            PathElement::Conic(p1, p2, w) => {
+                                builder.conic_to(p1.x, p1.y, p2.x, p2.y, w);
+                            }
+                            PathElement::Close => {
+                                builder.close();
                             }
                         }
                     }
                 }
-                if end_dist < total {
-                    if let Some(after) = measure.get_segment(end_dist, total) {
-                        for elem in &after {
-                            match elem {
-                                PathElement::Move(p) => {
-                                    builder.move_to(p.x, p.y);
-                                }
-                                PathElement::Line(p) => {
-                                    builder.line_to(p.x, p.y);
-                                }
-                                PathElement::Quad(p1, p2) => {
-                                    builder.quad_to(p1.x, p1.y, p2.x, p2.y);
-                                }
-                                PathElement::Cubic(p1, p2, p3) => {
-                                    builder.cubic_to(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y);
-                                }
-                                PathElement::Conic(p1, p2, w) => {
-                                    builder.conic_to(p1.x, p1.y, p2.x, p2.y, w);
-                                }
-                                PathElement::Close => {
-                                    builder.close();
-                                }
+                if end_dist < total
+                    && let Some(after) = measure.get_segment(end_dist, total)
+                {
+                    for elem in &after {
+                        match elem {
+                            PathElement::Move(p) => {
+                                builder.move_to(p.x, p.y);
+                            }
+                            PathElement::Line(p) => {
+                                builder.line_to(p.x, p.y);
+                            }
+                            PathElement::Quad(p1, p2) => {
+                                builder.quad_to(p1.x, p1.y, p2.x, p2.y);
+                            }
+                            PathElement::Cubic(p1, p2, p3) => {
+                                builder.cubic_to(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y);
+                            }
+                            PathElement::Conic(p1, p2, w) => {
+                                builder.conic_to(p1.x, p1.y, p2.x, p2.y, w);
+                            }
+                            PathElement::Close => {
+                                builder.close();
                             }
                         }
                     }

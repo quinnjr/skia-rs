@@ -557,7 +557,7 @@ impl Bitmap {
     /// Returns true if the bitmap has no pixels.
     #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.pixels.is_empty()
     }
 
@@ -863,7 +863,11 @@ fn convert_row(
 
         // Gray8 -> RGBA8888
         (Gray8, Rgba8888) => {
-            for (&gray, out) in src.iter().zip(dst.chunks_exact_mut(4)).take(width) {
+            for (&gray, out) in src
+                .iter()
+                .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                .take(width)
+            {
                 out[0] = gray;
                 out[1] = gray;
                 out[2] = gray;
@@ -873,7 +877,13 @@ fn convert_row(
 
         // RGBA8888 -> Gray8 (luminance)
         (Rgba8888, Gray8) => {
-            for (chunk, out) in src.chunks_exact(4).zip(dst.iter_mut()).take(width) {
+            for (chunk, out) in src
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(dst.iter_mut())
+                .take(width)
+            {
                 let r = f32::from(chunk[0]);
                 let g = f32::from(chunk[1]);
                 let b = f32::from(chunk[2]);
@@ -885,7 +895,11 @@ fn convert_row(
 
         // Alpha8 -> RGBA8888 (white with alpha)
         (Alpha8, Rgba8888) => {
-            for (&alpha, out) in src.iter().zip(dst.chunks_exact_mut(4)).take(width) {
+            for (&alpha, out) in src
+                .iter()
+                .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                .take(width)
+            {
                 out[0] = 255;
                 out[1] = 255;
                 out[2] = 255;
@@ -1323,7 +1337,7 @@ fn f16_to_bytes(v: f32) -> [u8; 2] {
 }
 
 #[inline]
-fn f32_from_le(bytes: &[u8]) -> f32 {
+const fn f32_from_le(bytes: &[u8]) -> f32 {
     f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
@@ -1417,7 +1431,7 @@ fn unpremultiply_in_place_f32(row: &mut [u8], width: usize) {
 /// RGBA and BGRA formats.
 #[inline]
 pub fn swizzle_rb_in_place(pixels: &mut [u8]) {
-    for chunk in pixels.chunks_exact_mut(4) {
+    for chunk in pixels.as_chunks_mut::<4>().0 {
         chunk.swap(0, 2);
     }
 }
@@ -1427,7 +1441,7 @@ pub fn swizzle_rb_in_place(pixels: &mut [u8]) {
 /// Uses Skia's rounded `SkUnPreMultiply::ApplyScale` semantics (round to
 /// nearest), matching the rounding already used by `premultiply_in_place`.
 pub fn unpremultiply_in_place(pixels: &mut [u8]) {
-    for chunk in pixels.chunks_exact_mut(4) {
+    for chunk in pixels.as_chunks_mut::<4>().0 {
         let a = chunk[3];
         if a == 0 {
             chunk[0] = 0;
@@ -1447,7 +1461,7 @@ pub fn unpremultiply_in_place(pixels: &mut [u8]) {
 /// Uses Skia's rounded `SkMulDiv255Round` semantics (round to nearest), so
 /// e.g. `r=3, a=128` yields 2, not 1.
 pub fn premultiply_in_place(pixels: &mut [u8]) {
-    for chunk in pixels.chunks_exact_mut(4) {
+    for chunk in pixels.as_chunks_mut::<4>().0 {
         let a = u32::from(chunk[3]);
         if a == 0 {
             chunk[0] = 0;

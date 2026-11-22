@@ -1,5 +1,10 @@
 //! Blend modes for compositing.
 
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+
 use skia_rs_core::Color4f;
 
 /// Porter-Duff and other blend modes.

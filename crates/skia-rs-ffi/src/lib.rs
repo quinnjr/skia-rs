@@ -4443,7 +4443,7 @@ mod tests {
             // BGRA on little-endian RGBA8888 surfaces in this repo; accept
             // either order by looking for a high red/blue somewhere.
             let mut saw_colored = false;
-            for px in buf.chunks_exact(4) {
+            for px in buf.as_chunks::<4>().0 {
                 if px[0] > 150 || px[2] > 150 {
                     saw_colored = true;
                     break;

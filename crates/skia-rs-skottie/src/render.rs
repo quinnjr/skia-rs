@@ -196,16 +196,15 @@ impl<'a> RenderContext<'a> {
         if let Some(mode) = layer
             .matte_mode
             .filter(|m| *m != crate::layers::MatteMode::None)
+            && let Some(source) = resolve_matte_source(layer, siblings)
         {
-            if let Some(source) = resolve_matte_source(layer, siblings) {
-                // Always composite through the matte, even when the source
-                // is not visible at this frame: per sksg::MaskEffect, an
-                // empty mask layer means zero coverage — the consumer is
-                // masked out entirely (or fully shown, for inverted modes)
-                // rather than rendered unmasked.
-                self.render_matte_composite(layer, source, mode, frame, assets, siblings);
-                return;
-            }
+            // Always composite through the matte, even when the source
+            // is not visible at this frame: per sksg::MaskEffect, an
+            // empty mask layer means zero coverage — the consumer is
+            // masked out entirely (or fully shown, for inverted modes)
+            // rather than rendered unmasked.
+            self.render_matte_composite(layer, source, mode, frame, assets, siblings);
+            return;
         }
 
         self.render_layer_content(layer, frame, assets, siblings);
@@ -234,10 +233,10 @@ impl<'a> RenderContext<'a> {
 
         // Apply masks: Add unions, Subtract subtracts, Intersect
         // intersects (see `mask::build_clip`).
-        if layer.has_masks() {
-            if let Some(clip) = mask::build_clip(&layer.masks, frame, self.bounds) {
-                self.clip_path(&clip);
-            }
+        if layer.has_masks()
+            && let Some(clip) = mask::build_clip(&layer.masks, frame, self.bounds)
+        {
+            self.clip_path(&clip);
         }
 
         // Render content
@@ -652,15 +651,15 @@ fn trim_path(path: &Path, start: Scalar, stop: Scalar, inverted: bool) -> Path {
 
     if inverted {
         let mut builder = skia_rs_path::PathBuilder::new();
-        if start > 0.0 {
-            if let Some(seg) = measure.get_segment(0.0, start * len) {
-                builder.add_path(&seg);
-            }
+        if start > 0.0
+            && let Some(seg) = measure.get_segment(0.0, start * len)
+        {
+            builder.add_path(&seg);
         }
-        if stop < 1.0 {
-            if let Some(seg) = measure.get_segment(stop * len, len) {
-                builder.add_path(&seg);
-            }
+        if stop < 1.0
+            && let Some(seg) = measure.get_segment(stop * len, len)
+        {
+            builder.add_path(&seg);
         }
         builder.build()
     } else {

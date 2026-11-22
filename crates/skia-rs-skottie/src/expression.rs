@@ -6,6 +6,11 @@
 //! - Time-based functions
 //! - Simple conditionals
 
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+
 use skia_rs_core::Scalar;
 use std::collections::HashMap;
 
@@ -228,14 +233,14 @@ impl ExpressionEvaluator {
     /// Evaluate function calls.
     fn evaluate_function(source: &str, ctx: &ExpressionContext) -> Option<Value> {
         // Parse function call: name(args)
-        if let Some(paren_pos) = source.find('(') {
-            if source.ends_with(')') {
-                let name = &source[..paren_pos];
-                let args_str = &source[paren_pos + 1..source.len() - 1];
-                let args: Vec<&str> = args_str.split(',').map(str::trim).collect();
+        if let Some(paren_pos) = source.find('(')
+            && source.ends_with(')')
+        {
+            let name = &source[..paren_pos];
+            let args_str = &source[paren_pos + 1..source.len() - 1];
+            let args: Vec<&str> = args_str.split(',').map(str::trim).collect();
 
-                return Self::call_function(name, &args, ctx);
-            }
+            return Self::call_function(name, &args, ctx);
         }
 
         None

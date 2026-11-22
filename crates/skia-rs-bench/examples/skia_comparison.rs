@@ -9,6 +9,10 @@
     clippy::cast_precision_loss,
     reason = "loop indices are bounded by small fixed ranges (5, 100); precision loss cannot occur in practice"
 )]
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
 
 use skia_rs_bench::skia_comparison::{
     BenchmarkRunner, ComparisonReport, ComparisonResult, reference_timings,

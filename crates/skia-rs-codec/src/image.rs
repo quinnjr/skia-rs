@@ -2,6 +2,11 @@
 //!
 //! Images represent immutable pixel data that can be drawn to a canvas.
 
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+
 use skia_rs_core::cast::{floor_to_i32, scalar_from_i32};
 use skia_rs_core::{AlphaType, ColorSpace, ColorType, Rect, Scalar};
 use std::sync::Arc;

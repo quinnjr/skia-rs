@@ -514,7 +514,7 @@ impl ClipStack {
 
     /// Get the current save count.
     #[must_use]
-    pub fn save_count(&self) -> usize {
+    pub const fn save_count(&self) -> usize {
         self.stack.len()
     }
 

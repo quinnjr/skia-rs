@@ -261,16 +261,16 @@ impl TextBlobBuilder {
 
     /// Flush the current run.
     fn flush_run(&mut self) {
-        if let Some(font) = self.current_font.take() {
-            if !self.current_glyphs.is_empty() {
-                let run = GlyphRun::new(
-                    font,
-                    std::mem::take(&mut self.current_glyphs),
-                    std::mem::take(&mut self.current_positions),
-                    self.current_origin,
-                );
-                self.runs.push(run);
-            }
+        if let Some(font) = self.current_font.take()
+            && !self.current_glyphs.is_empty()
+        {
+            let run = GlyphRun::new(
+                font,
+                std::mem::take(&mut self.current_glyphs),
+                std::mem::take(&mut self.current_positions),
+                self.current_origin,
+            );
+            self.runs.push(run);
         }
         self.current_glyphs.clear();
         self.current_positions.clear();

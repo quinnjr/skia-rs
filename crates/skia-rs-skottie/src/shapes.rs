@@ -13,6 +13,11 @@
 //! - Merge paths
 //! - Repeater
 
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+
 use crate::keyframe::{AnimatedProperty, KeyframeValue, PathData};
 use crate::model::ShapeModel;
 use crate::transform::Transform;

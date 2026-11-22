@@ -502,20 +502,18 @@ impl<'a> Validator<'a> {
         args: &[Expr],
     ) -> Result<SkslType, ValidationError> {
         // `child.eval(coord)` on a child shader/colorFilter/blender.
-        if method == "eval" {
-            if let Expr::Var(name) = receiver {
-                if let Some(ty) = self.uniforms.get(name).cloned() {
-                    if matches!(
-                        ty,
-                        SkslType::Shader | SkslType::ColorFilter | SkslType::Blender
-                    ) {
-                        for a in args {
-                            self.validate_expr(a)?;
-                        }
-                        return Ok(SkslType::Half4);
-                    }
-                }
+        if method == "eval"
+            && let Expr::Var(name) = receiver
+            && let Some(ty) = self.uniforms.get(name).cloned()
+            && matches!(
+                ty,
+                SkslType::Shader | SkslType::ColorFilter | SkslType::Blender
+            )
+        {
+            for a in args {
+                self.validate_expr(a)?;
             }
+            return Ok(SkslType::Half4);
         }
         Err(ValidationError::InvalidOperator {
             op: format!(".{method}()"),
@@ -699,20 +697,19 @@ impl<'a> Validator<'a> {
         }
 
         // `sample(child, coord)` style calls on child shaders.
-        if args.len() == 2 {
-            if let Some(ty) = self.uniforms.get(name).cloned() {
-                if matches!(
-                    ty,
-                    SkslType::Shader | SkslType::ColorFilter | SkslType::Blender
-                ) {
-                    // Treat `child(coord)` style call — accepted with
-                    // a vec4 result.
-                    for a in args {
-                        self.validate_expr(a)?;
-                    }
-                    return Ok(SkslType::Vec4);
-                }
+        if args.len() == 2
+            && let Some(ty) = self.uniforms.get(name).cloned()
+            && matches!(
+                ty,
+                SkslType::Shader | SkslType::ColorFilter | SkslType::Blender
+            )
+        {
+            // Treat `child(coord)` style call — accepted with
+            // a vec4 result.
+            for a in args {
+                self.validate_expr(a)?;
             }
+            return Ok(SkslType::Vec4);
         }
 
         Err(ValidationError::UndeclaredVariable(name.to_string()))

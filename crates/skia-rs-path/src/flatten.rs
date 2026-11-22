@@ -4,6 +4,15 @@
 //! adaptive tolerance based on chord-midpoint deviation. Used by `PathMeasure`,
 //! `DashEffect`, `stroke_to_fill`, and boolean ops.
 
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+#![allow(
+    clippy::manual_midpoint,
+    reason = "faithful port of Skia's f32 averaging (SkScalarAve); f32::midpoint rounds via f64 and diverges from Skia"
+)]
+
 use skia_rs_core::{Point, Scalar};
 
 const MAX_SUBDIVISION_DEPTH: u32 = 12;
@@ -204,7 +213,7 @@ mod tests {
             Point::new(100.0, 0.0),
             0.5,
         );
-        assert!(!output.is_empty());
+        assert_ne!(output, [] as [skia_rs_core::Point; 0]);
         assert_eq!(*output.last().unwrap(), Point::new(100.0, 0.0));
     }
 
@@ -236,7 +245,7 @@ mod tests {
             Point::new(100.0, 0.0),
             0.5,
         );
-        assert!(!output.is_empty());
+        assert_ne!(output, [] as [skia_rs_core::Point; 0]);
         assert_eq!(*output.last().unwrap(), Point::new(100.0, 0.0));
     }
 

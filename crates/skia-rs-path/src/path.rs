@@ -366,8 +366,7 @@ impl Path {
         }
 
         let bounds = self.bounds();
-        let cx = (bounds.left + bounds.right) * 0.5;
-        let cy = (bounds.top + bounds.bottom) * 0.5;
+        let Point { x: cx, y: cy } = bounds.center();
         if bounds.right - bounds.left <= 0.0 || bounds.bottom - bounds.top <= 0.0 {
             return false;
         }

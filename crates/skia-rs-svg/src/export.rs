@@ -454,14 +454,14 @@ fn export_node(output: &mut String, node: &SvgNode, options: &SvgExportOptions, 
                 output.push('>');
                 output.push_str(newline);
 
-                if let Some(css) = text_content {
-                    if !css.is_empty() {
-                        if options.pretty_print {
-                            output.push_str(&options.indent.repeat(depth + 1));
-                        }
-                        write!(output, "<![CDATA[{css}]]>").unwrap();
-                        output.push_str(newline);
+                if let Some(css) = text_content
+                    && !css.is_empty()
+                {
+                    if options.pretty_print {
+                        output.push_str(&options.indent.repeat(depth + 1));
                     }
+                    write!(output, "<![CDATA[{css}]]>").unwrap();
+                    output.push_str(newline);
                 }
 
                 for child in &node.children {
@@ -478,13 +478,13 @@ fn export_node(output: &mut String, node: &SvgNode, options: &SvgExportOptions, 
 
 fn export_common_attrs(output: &mut String, node: &SvgNode, options: &SvgExportOptions) {
     // ID (but not for gradients, which handle it specially)
-    if let Some(ref id) = node.id {
-        if !matches!(
+    if let Some(ref id) = node.id
+        && !matches!(
             node.kind,
             SvgNodeKind::LinearGradient(_) | SvgNodeKind::RadialGradient(_)
-        ) {
-            write!(output, " id=\"{}\"", escape_xml(id)).unwrap();
-        }
+        )
+    {
+        write!(output, " id=\"{}\"", escape_xml(id)).unwrap();
     }
 
     // Classes

@@ -220,10 +220,10 @@ impl Shaper {
         }
 
         // Set language
-        if let Some(lang) = language {
-            if let Ok(rb_lang) = lang.0.parse::<rustybuzz::Language>() {
-                buffer.set_language(rb_lang);
-            }
+        if let Some(lang) = language
+            && let Ok(rb_lang) = lang.0.parse::<rustybuzz::Language>()
+        {
+            buffer.set_language(rb_lang);
         }
 
         // Shape the text

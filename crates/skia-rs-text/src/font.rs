@@ -1,5 +1,14 @@
 //! Font configuration for text rendering.
 
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+#![allow(
+    clippy::manual_midpoint,
+    reason = "faithful port of Skia's f32 averaging (SkScalarAve); f32::midpoint rounds via f64 and diverges from Skia"
+)]
+
 use crate::typeface::{Typeface, TypefaceRef};
 use skia_rs_core::{Matrix, Point, Scalar};
 use std::sync::Arc;
@@ -633,14 +642,14 @@ impl Font {
         // Glyph 0 (.notdef) is a real glyph: it carries an `hmtx` advance
         // like any other and Skia advances the pen by it (a tofu box takes
         // up space). Do not special-case it to zero.
-        if let Some(data) = self.typeface.font_data() {
-            if let Ok(face) = ttf_parser::Face::parse(data, 0) {
-                let upem = face.units_per_em();
-                if upem > 0 {
-                    if let Some(adv) = face.glyph_hor_advance(ttf_parser::GlyphId(glyph)) {
-                        return Scalar::from(adv) * self.size / Scalar::from(upem) * self.scale_x;
-                    }
-                }
+        if let Some(data) = self.typeface.font_data()
+            && let Ok(face) = ttf_parser::Face::parse(data, 0)
+        {
+            let upem = face.units_per_em();
+            if upem > 0
+                && let Some(adv) = face.glyph_hor_advance(ttf_parser::GlyphId(glyph))
+            {
+                return Scalar::from(adv) * self.size / Scalar::from(upem) * self.scale_x;
             }
         }
         self.size * 0.5 * self.scale_x
@@ -666,22 +675,22 @@ impl Font {
     pub fn glyph_bounds(&self, glyph: u16) -> skia_rs_core::Rect {
         // Glyph 0 (.notdef) has a real outline (the tofu box) and real
         // bounds; treat it like any other glyph.
-        if let Some(data) = self.typeface.font_data() {
-            if let Ok(face) = ttf_parser::Face::parse(data, 0) {
-                let upem = face.units_per_em();
-                if upem > 0 {
-                    if let Some(bbox) = face.glyph_bounding_box(ttf_parser::GlyphId(glyph)) {
-                        let scale = self.size / Scalar::from(upem);
-                        let left = Scalar::from(bbox.x_min) * scale * self.scale_x;
-                        let right = Scalar::from(bbox.x_max) * scale * self.scale_x;
-                        let top = -Scalar::from(bbox.y_max) * scale;
-                        let bottom = -Scalar::from(bbox.y_min) * scale;
-                        return skia_rs_core::Rect::new(left, top, right, bottom);
-                    }
-                    // No outline — still report a zero-sized rect rather
-                    // than the old ascent×descent approximation.
-                    return skia_rs_core::Rect::EMPTY;
+        if let Some(data) = self.typeface.font_data()
+            && let Ok(face) = ttf_parser::Face::parse(data, 0)
+        {
+            let upem = face.units_per_em();
+            if upem > 0 {
+                if let Some(bbox) = face.glyph_bounding_box(ttf_parser::GlyphId(glyph)) {
+                    let scale = self.size / Scalar::from(upem);
+                    let left = Scalar::from(bbox.x_min) * scale * self.scale_x;
+                    let right = Scalar::from(bbox.x_max) * scale * self.scale_x;
+                    let top = -Scalar::from(bbox.y_max) * scale;
+                    let bottom = -Scalar::from(bbox.y_min) * scale;
+                    return skia_rs_core::Rect::new(left, top, right, bottom);
                 }
+                // No outline — still report a zero-sized rect rather
+                // than the old ascent×descent approximation.
+                return skia_rs_core::Rect::EMPTY;
             }
         }
 
@@ -1199,10 +1208,9 @@ fn path_band_intercepts(path: &skia_rs_path::Path, y_top: Scalar, y_bottom: Scal
     // outline occupies the band.
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mut merged: Vec<Scalar> = Vec::with_capacity(xs.len());
-    let mut iter = xs.chunks_exact(2);
     let mut cur: Option<(Scalar, Scalar)> = None;
-    for pair in &mut iter {
-        let (lo, hi) = (pair[0], pair[1]);
+    for pair in xs.as_chunks::<2>().0 {
+        let [lo, hi] = *pair;
         cur = match cur {
             Some((a, b)) if lo <= b + tolerance => Some((a, b.max(hi))),
             Some((a, b)) => {

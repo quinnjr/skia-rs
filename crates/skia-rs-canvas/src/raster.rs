@@ -23,6 +23,11 @@
 //! - **Region-based clip**: Complex clips composed of multiple rectangles
 //! - **Anti-aliased clip**: Smooth clip edges using coverage masks
 
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+
 use skia_rs_core::premultiply_color;
 use skia_rs_core::{Color, Color4f, IRect, Matrix, Point, Rect, Region, Scalar};
 use skia_rs_paint::{BlendMode, Paint, Style};
@@ -80,7 +85,7 @@ impl PixelBuffer {
 
         // Create a 4-byte pattern and fill using chunks
         let pattern = [r, g, b, a];
-        for chunk in self.pixels.chunks_exact_mut(4) {
+        for chunk in self.pixels.as_chunks_mut::<4>().0 {
             chunk.copy_from_slice(&pattern);
         }
     }
@@ -1048,6 +1053,10 @@ impl<'a> Rasterizer<'a> {
                     for px in min_x..=max_x {
                         let dx = scalar_from_i32(px) + 0.5 - cx;
                         let dy = scalar_from_i32(py) + 0.5 - cy;
+                        #[allow(
+                            clippy::imprecise_flops,
+                            reason = "per-pixel hot loop: hypot is markedly slower and its overflow guarding is unnecessary for pixel-space distances"
+                        )]
                         let dist = dx.mul_add(dx, dy * dy).sqrt();
 
                         let outer_coverage = if dist <= outer_r - 0.5 {
@@ -1704,11 +1713,12 @@ impl ActiveEdgeTable {
 
                     if !was_inside && is_inside {
                         span_start = Some(edge.x);
-                    } else if was_inside && !is_inside {
-                        if let Some(start) = span_start {
-                            spans.push((start, edge.x));
-                            span_start = None;
-                        }
+                    } else if was_inside
+                        && !is_inside
+                        && let Some(start) = span_start
+                    {
+                        spans.push((start, edge.x));
+                        span_start = None;
                     }
                 }
             }
@@ -1733,7 +1743,7 @@ impl ActiveEdgeTable {
     }
 
     /// Check if the AET is empty.
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.edges.is_empty()
     }
 }

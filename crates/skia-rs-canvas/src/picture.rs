@@ -60,13 +60,13 @@ impl Picture {
 
     /// Get the approximate byte size of this picture.
     #[must_use]
-    pub fn approximate_bytes_used(&self) -> usize {
+    pub const fn approximate_bytes_used(&self) -> usize {
         std::mem::size_of::<Self>() + self.commands.len() * std::mem::size_of::<DrawCommand>()
     }
 
     /// Get the number of operations in this picture.
     #[must_use]
-    pub fn approximate_op_count(&self) -> usize {
+    pub const fn approximate_op_count(&self) -> usize {
         self.commands.len()
     }
 }
