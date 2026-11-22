@@ -1540,10 +1540,17 @@ impl GpuImageBackend for WgpuGpuImageBackend {
         let bpp = u32::try_from(format.bytes_per_pixel())
             .map_err(|_| GpuImageError::ReadBackFailed("bytes per pixel exceed u32::MAX".into()))?;
         // wgpu requires buffer rows to be aligned to COPY_BYTES_PER_ROW_ALIGNMENT (256).
-        let unpadded_bpr = width * bpp;
+        // Row sizes must fit wgpu's u32 `bytes_per_row`; the total size is
+        // computed in u64 (e.g. 16384 rows of 256 KiB is exactly 2^32 bytes).
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded_bpr = unpadded_bpr.div_ceil(align) * align;
-        let buffer_size = u64::from(padded_bpr * height);
+        let (unpadded_bpr, padded_bpr) = width
+            .checked_mul(bpp)
+            .and_then(|unpadded| {
+                let padded = unpadded.div_ceil(align).checked_mul(align)?;
+                Some((unpadded, padded))
+            })
+            .ok_or_else(|| GpuImageError::ReadBackFailed("row size exceeds u32::MAX".into()))?;
+        let buffer_size = u64::from(padded_bpr) * u64::from(height);
 
         let textures = self.textures.lock();
         let texture = textures.get(&handle.id).ok_or_else(|| {
