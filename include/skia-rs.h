@@ -73,6 +73,21 @@
 // Perspective 2 index.
 #define Matrix_PERSP_2 8
 
+// Filter mode for image sampling.
+enum FilterMode
+#ifdef __cplusplus
+  : uint8_t
+#endif // __cplusplus
+ {
+    // Nearest neighbor sampling.
+    FilterMode_Nearest = 0,
+    // Bilinear interpolation.
+    FilterMode_Linear,
+};
+#ifndef __cplusplus
+typedef uint8_t FilterMode;
+#endif // __cplusplus
+
 // Mipmap mode for image sampling.
 enum MipmapMode
 #ifdef __cplusplus
@@ -88,21 +103,6 @@ enum MipmapMode
 };
 #ifndef __cplusplus
 typedef uint8_t MipmapMode;
-#endif // __cplusplus
-
-// Filter mode for image sampling.
-enum FilterMode
-#ifdef __cplusplus
-  : uint8_t
-#endif // __cplusplus
- {
-    // Nearest neighbor sampling.
-    FilterMode_Nearest = 0,
-    // Bilinear interpolation.
-    FilterMode_Linear,
-};
-#ifndef __cplusplus
-typedef uint8_t FilterMode;
 #endif // __cplusplus
 
 // Describes the color space for interpreting colors.
@@ -1175,6 +1175,10 @@ void sk_recording_canvas_release(struct sk_recording_canvas_t *canvas);
 sk_picture_t *sk_picture_recorder_finish_recording(struct sk_picture_recorder_t *r);
 
 // Push a save onto the recording canvas's state.
+//
+// Like `SkPicture`, the recording stores the save and later transform ops
+// as commands and keeps geometry in local coordinates, so playback composes
+// with the target canvas's own matrix and path effects see local geometry.
 int32_t sk_recording_canvas_save(struct sk_recording_canvas_t *canvas);
 
 // Pop a save on the recording canvas's state.
@@ -1185,9 +1189,9 @@ void sk_recording_canvas_translate(struct sk_recording_canvas_t *canvas,
                                    float dx,
                                    float dy);
 
-// Draw a rect into the recording canvas. The rect is captured in the
-// caller-space coordinates (post-transform) so playback can place it on
-// any target canvas.
+// Draw a rect into the recording canvas. The rect is recorded in local
+// coordinates; the transform ops recorded before it are replayed on top of
+// the playback canvas's matrix, as with `SkPicture`.
 void sk_recording_canvas_draw_rect(struct sk_recording_canvas_t *canvas,
                                    const struct sk_rect_t *rect,
                                    const sk_paint_t *paint);

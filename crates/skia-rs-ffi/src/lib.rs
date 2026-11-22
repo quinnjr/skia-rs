@@ -3116,12 +3116,17 @@ pub unsafe extern "C" fn sk_picture_recorder_finish_recording(
 }
 
 /// Push a save onto the recording canvas's state.
+///
+/// Like `SkPicture`, the recording stores the save and later transform ops
+/// as commands and keeps geometry in local coordinates, so playback composes
+/// with the target canvas's own matrix and path effects see local geometry.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_recording_canvas_save(canvas: *mut sk_recording_canvas_t) -> i32 {
     catch_panic(|| {
-        let Some((_, state)) = resolve_recording_canvas(canvas) else {
+        let Some((rec, state)) = resolve_recording_canvas(canvas) else {
             return 0;
         };
+        rec.commands.push(skia_rs_canvas::DrawCommand::Save);
         let frame = CanvasSaveFrame {
             matrix: state.matrix,
             clip_len: state.clips.len(),
@@ -3136,10 +3141,11 @@ pub unsafe extern "C" fn sk_recording_canvas_save(canvas: *mut sk_recording_canv
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_recording_canvas_restore(canvas: *mut sk_recording_canvas_t) {
     catch_panic_void(|| {
-        let Some((_, state)) = resolve_recording_canvas(canvas) else {
+        let Some((rec, state)) = resolve_recording_canvas(canvas) else {
             return;
         };
         if let Some(frame) = state.stack.pop() {
+            rec.commands.push(skia_rs_canvas::DrawCommand::Restore);
             state.matrix = frame.matrix;
             state.clips.truncate(frame.clip_len);
             state.save_count = state.save_count.saturating_sub(1);
@@ -3155,16 +3161,18 @@ pub unsafe extern "C" fn sk_recording_canvas_translate(
     dy: f32,
 ) {
     catch_panic_void(|| {
-        let Some((_, state)) = resolve_recording_canvas(canvas) else {
+        let Some((rec, state)) = resolve_recording_canvas(canvas) else {
             return;
         };
+        rec.commands
+            .push(skia_rs_canvas::DrawCommand::Translate { dx, dy });
         state.matrix = state.matrix.concat(&Matrix::translate(dx, dy));
     });
 }
 
-/// Draw a rect into the recording canvas. The rect is captured in the
-/// caller-space coordinates (post-transform) so playback can place it on
-/// any target canvas.
+/// Draw a rect into the recording canvas. The rect is recorded in local
+/// coordinates; the transform ops recorded before it are replayed on top of
+/// the playback canvas's matrix, as with `SkPicture`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_recording_canvas_draw_rect(
     canvas: *mut sk_recording_canvas_t,
@@ -3172,16 +3180,15 @@ pub unsafe extern "C" fn sk_recording_canvas_draw_rect(
     paint: *const sk_paint_t,
 ) {
     catch_panic_void(|| {
-        let Some((rec, state)) = resolve_recording_canvas(canvas) else {
+        let Some((rec, _)) = resolve_recording_canvas(canvas) else {
             return;
         };
         let Some(r) = rect.as_ref() else { return };
         let Some(p) = RefCounted::get_ref(paint).cloned() else {
             return;
         };
-        let transformed = state.matrix.map_rect(&Rect::from(*r));
         rec.commands.push(skia_rs_canvas::DrawCommand::DrawRect {
-            rect: transformed,
+            rect: Rect::from(*r),
             paint: p,
         });
     });
@@ -3195,7 +3202,7 @@ pub unsafe extern "C" fn sk_recording_canvas_draw_path(
     paint: *const sk_paint_t,
 ) {
     catch_panic_void(|| {
-        let Some((rec, state)) = resolve_recording_canvas(canvas) else {
+        let Some((rec, _)) = resolve_recording_canvas(canvas) else {
             return;
         };
         let Some(path_ref) = RefCounted::get_ref(path).cloned() else {
@@ -3204,9 +3211,8 @@ pub unsafe extern "C" fn sk_recording_canvas_draw_path(
         let Some(p) = RefCounted::get_ref(paint).cloned() else {
             return;
         };
-        let transformed = path_ref.transformed(&state.matrix);
         rec.commands.push(skia_rs_canvas::DrawCommand::DrawPath {
-            path: transformed,
+            path: path_ref,
             paint: p,
         });
     });
@@ -4390,6 +4396,73 @@ mod tests {
             sk_textblob_unref(blob);
             sk_font_unref(font);
             sk_typeface_unref(tf);
+        }
+    }
+
+    #[test]
+    fn test_recording_canvas_records_transforms_and_local_geometry() {
+        // Like SkPicture: transform ops are recorded as commands and geometry
+        // stays local, so path effects see local coordinates at playback.
+        unsafe {
+            let rec = sk_picture_recorder_new();
+            let cull = sk_rect_t {
+                left: 0.0,
+                top: 0.0,
+                right: 32.0,
+                bottom: 32.0,
+            };
+            let rcanvas = sk_picture_recorder_begin_recording(rec, &raw const cull);
+            let paint = sk_paint_new();
+            let r = sk_rect_t {
+                left: 0.0,
+                top: 0.0,
+                right: 4.0,
+                bottom: 4.0,
+            };
+            sk_recording_canvas_save(rcanvas);
+            sk_recording_canvas_translate(rcanvas, 8.0, 0.0);
+            sk_recording_canvas_draw_rect(rcanvas, &raw const r, paint);
+            sk_recording_canvas_restore(rcanvas);
+
+            let commands = &(*rec).commands;
+            assert!(matches!(commands[0], skia_rs_canvas::DrawCommand::Save));
+            match commands[1] {
+                skia_rs_canvas::DrawCommand::Translate { dx, dy } => {
+                    assert!((dx - 8.0).abs() < f32::EPSILON && dy.abs() < f32::EPSILON);
+                }
+                ref other => panic!("expected Translate, got {other:?}"),
+            }
+            match &commands[2] {
+                skia_rs_canvas::DrawCommand::DrawRect { rect, .. } => {
+                    assert_eq!(
+                        *rect,
+                        Rect::from_xywh(0.0, 0.0, 4.0, 4.0),
+                        "rect stays local"
+                    );
+                }
+                other => panic!("expected DrawRect, got {other:?}"),
+            }
+            assert!(matches!(commands[3], skia_rs_canvas::DrawCommand::Restore));
+
+            sk_paint_unref(paint);
+            sk_recording_canvas_release(rcanvas);
+
+            // Playback still lands the rect at x = 8..12.
+            let picture = sk_picture_recorder_finish_recording(rec);
+            let surface = sk_surface_new_raster(32, 32);
+            let canvas = sk_surface_lock_canvas(surface);
+            sk_canvas_clear(canvas, 0xFFFF_FFFF);
+            assert!(sk_picture_playback(picture, canvas));
+            sk_canvas_release(canvas);
+            let mut buf = vec![0u8; 32 * 32 * 4];
+            sk_surface_read_pixels(surface, buf.as_mut_ptr(), buf.len());
+            let px = |x: usize, y: usize| buf[(y * 32 + x) * 4];
+            assert!(px(10, 2) < 100, "rect drawn at its translated position");
+            assert!(px(2, 2) > 200, "nothing drawn at the untranslated position");
+
+            sk_surface_unref(surface);
+            sk_picture_unref(picture);
+            sk_picture_recorder_delete(rec);
         }
     }
 
