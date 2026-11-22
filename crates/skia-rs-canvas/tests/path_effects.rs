@@ -406,3 +406,30 @@ fn round_rects_that_are_ovals_or_rects_dash_like_draw_oval_and_draw_rect() {
         "oval-type round rect dashes like draw_oval"
     );
 }
+
+#[test]
+fn perspective_does_not_cull_visible_hatching() {
+    // Under a perspective CTM whose horizon crosses the canvas (device
+    // x = 32, where the inverse's w is 0), the clip's far corners map
+    // through w < 0 to negative local x, so a mapped clip box would miss
+    // most of the visible source (it keeps only lattice columns 0..1). The
+    // source (local 0..30 x 0..60) lands at device x 0..15.5, and its hatch
+    // must reach its far side (device x 10..15), not stop near x = 6.
+    use skia_rs_core::{Matrix, Rect};
+
+    let perspective = Matrix {
+        values: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0 / 32.0, 0.0, 1.0],
+    };
+    let mut paint = Paint::new();
+    paint.set_color32(Color::WHITE);
+    paint.set_path_effect(skia_rs_path::make_line_2d(1.0, Matrix::scale(3.0, 3.0)));
+    let mut buffer = PixelBuffer::new(64, 64);
+    let mut canvas = Canvas::new_raster(&mut buffer);
+    canvas.concat(&perspective);
+    canvas.draw_rect(&Rect::new(0.0, 0.0, 30.0, 60.0), &paint);
+    let lit = (10..16)
+        .flat_map(|x| (0..64).map(move |y| (x, y)))
+        .filter(|&(x, y)| buffer.get_pixel(x, y).is_some_and(|c| c.red() > 0))
+        .count();
+    assert!(lit > 10, "hatching reaches the far side: {lit} pixels");
+}

@@ -868,8 +868,14 @@ impl<'a> Canvas<'a> {
 
     /// The clip bounds mapped into local space, outset for the paint's
     /// stroke, as the cull rect for path effects (`SkCanvas` passes the
-    /// local clip bounds as `cullRect`). `None` when the matrix is singular.
+    /// local clip bounds as `cullRect`). `None` (no culling) when the matrix
+    /// is singular or has perspective: mapping the clip's corners through a
+    /// perspective inverse can cross the horizon (w <= 0), and their
+    /// bounding box then no longer covers the visible area.
     fn local_cull(&self, paint: &Paint) -> Option<Rect> {
+        if self.total_matrix().has_perspective() {
+            return None;
+        }
         let inverse = self.total_matrix().invert()?;
         // Like computeConservativeLocalClipBounds: outset the device clip
         // by a pixel (AA fringe, hairlines) before mapping it to local
