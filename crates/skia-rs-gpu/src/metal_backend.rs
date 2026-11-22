@@ -640,10 +640,10 @@ impl MetalContext {
     /// Detect the highest supported feature set.
     fn detect_feature_set(device: &DeviceRef) -> MetalFeatureSet {
         // `supportsFamily:` needs macOS 10.15 / iOS 13; older systems get
-        // the lowest common feature set instead of an unrecognized-selector
-        // exception.
+        // the platform's baseline feature set instead of an
+        // unrecognized-selector exception.
         if !device_responds_to(device, "supportsFamily:") {
-            return MetalFeatureSet::CommonFamily1;
+            return Self::legacy_feature_set();
         }
 
         // Check from highest to lowest
@@ -676,6 +676,15 @@ impl MetalContext {
             return MetalFeatureSet::AppleFamily1;
         }
 
+        // macOS families before the Common ones: every Mac GPU also reports
+        // Common3, which would otherwise hide its (larger) Mac limits.
+        if device.supports_family(metal::MTLGPUFamily::Mac2) {
+            return MetalFeatureSet::MacosGpuFamily2V1;
+        }
+        if device.supports_family(metal::MTLGPUFamily::Mac1) {
+            return MetalFeatureSet::MacosGpuFamily1V4;
+        }
+
         // Common families
         if device.supports_family(metal::MTLGPUFamily::Common3) {
             return MetalFeatureSet::CommonFamily3;
@@ -687,16 +696,19 @@ impl MetalContext {
             return MetalFeatureSet::CommonFamily1;
         }
 
-        // macOS families (legacy)
-        if device.supports_family(metal::MTLGPUFamily::Mac2) {
-            return MetalFeatureSet::MacosGpuFamily2V1;
-        }
-        if device.supports_family(metal::MTLGPUFamily::Mac1) {
-            return MetalFeatureSet::MacosGpuFamily1V4;
-        }
+        Self::legacy_feature_set()
+    }
 
-        // Default to lowest common
-        MetalFeatureSet::CommonFamily1
+    /// Feature set assumed when `MTLGPUFamily` queries are unavailable or
+    /// match nothing: every Metal-capable Mac is at least macOS GPU family
+    /// 1 (16384-texel textures); on iOS the conservative lowest family
+    /// applies.
+    const fn legacy_feature_set() -> MetalFeatureSet {
+        if cfg!(target_os = "macos") {
+            MetalFeatureSet::MacosGpuFamily1V1
+        } else {
+            MetalFeatureSet::CommonFamily1
+        }
     }
 
     /// Get texture limits for a feature set.
