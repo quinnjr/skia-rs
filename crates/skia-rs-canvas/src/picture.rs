@@ -55,10 +55,15 @@ impl Picture {
     /// Like `SkPicturePlayback` (via `SkAutoCanvasRestore`), playback is
     /// wrapped in a save/restore, so a recording with unbalanced saves or a
     /// leftover transform cannot leak state into the caller's later draws.
+    /// Restores that would pop below that save are dropped, as `SkRecorder`
+    /// drops unbalanced restores, so the caller's own saves are never undone.
     pub fn playback(&self, canvas: &mut Canvas) {
         let restore_count = canvas.save();
         let initial = *canvas.total_matrix();
         for command in &self.commands {
+            if matches!(command, DrawCommand::Restore) && canvas.save_count() <= restore_count + 1 {
+                continue;
+            }
             command.execute_with_base(canvas, &initial);
         }
         canvas.restore_to_count(restore_count);
@@ -644,6 +649,26 @@ impl RecordingCanvas {
 mod tests {
     use super::*;
     use crate::raster::PixelBuffer;
+
+    #[test]
+    fn playback_ignores_unbalanced_restores() {
+        // Extra Restores in a picture must not pop the caller's own saves.
+        let picture = Picture::from_parts(
+            vec![DrawCommand::Restore, DrawCommand::Restore],
+            Rect::from_xywh(0.0, 0.0, 16.0, 16.0),
+        );
+        let mut buffer = PixelBuffer::new(16, 16);
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.save();
+        canvas.translate(10.0, 10.0);
+        let matrix_before = *canvas.total_matrix();
+        let saves_before = canvas.save_count();
+
+        picture.playback(&mut canvas);
+
+        assert_eq!(canvas.save_count(), saves_before);
+        assert_eq!(*canvas.total_matrix(), matrix_before);
+    }
 
     #[test]
     fn playback_does_not_leak_unbalanced_state() {
