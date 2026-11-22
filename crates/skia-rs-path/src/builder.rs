@@ -198,7 +198,12 @@ impl PathBuilder {
             return self;
         }
 
-        // SkRRect::setRectXY (on the sorted rect).
+        // SkRRect::setRectXY: initializeRect turns a non-finite rect into the
+        // empty rrect at the origin; otherwise it works on the sorted rect.
+        let finite = [rect.left, rect.top, rect.right, rect.bottom]
+            .iter()
+            .all(|v| v.is_finite());
+        let rect = if finite { *rect } else { Rect::EMPTY };
         let (l, r) = (rect.left.min(rect.right), rect.left.max(rect.right));
         let (t, b) = (rect.top.min(rect.bottom), rect.top.max(rect.bottom));
         let (width, height) = (r - l, b - t);
@@ -730,6 +735,24 @@ mod tests {
 
         // Negative radii add nothing (SkPath::addRoundRect).
         assert_eq!(first(-1.0, 5.0), None);
+
+        // A non-finite rect becomes Skia's empty rrect at the origin
+        // (SkRRect::initializeRect) instead of NaN/inf-derived geometry.
+        for bad in [
+            Rect::new(Scalar::NAN, 0.0, 10.0, 10.0),
+            Rect::new(0.0, 0.0, Scalar::INFINITY, 10.0),
+        ] {
+            let mut b = PathBuilder::new();
+            b.add_round_rect(&bad, 2.0, 2.0);
+            let path = b.build();
+            assert!(
+                path.iter().all(|e| match e {
+                    PathElement::Move(p) | PathElement::Line(p) => p == Point::zero(),
+                    _ => true,
+                }),
+                "non-finite rect must collapse to the origin: {bad:?}"
+            );
+        }
 
         // Non-finite radii become 0: a rect from the bottom-left corner,
         // with finite coordinates.
