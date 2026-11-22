@@ -55,10 +55,30 @@ jobs:
       # for the Skia port carry narrow `#[allow(..., reason = "...")]`.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # Feature-gated GPU backend code is invisible to the default build, so
-      # lint it explicitly (Metal is macOS-only; it is covered by the
-      # conformance build on macos-latest).
+      # lint it explicitly. Metal only compiles on macOS; see `clippy-macos`.
       - name: Clippy (GPU backends)
         run: cargo clippy --workspace --all-targets --features "wgpu-backend,vulkan,opengl" -- -D warnings
+
+  clippy-macos:
+    name: Clippy (macOS, Metal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Lints the Metal backend and the aarch64 (NEON) code paths, neither of
+      # which the Linux clippy job compiles.
+      - run: cargo clippy --workspace --all-targets --features metal -- -D warnings
 
   # ==========================================================================
   # Build & Test Matrix
