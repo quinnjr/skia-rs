@@ -338,3 +338,42 @@ fn glyph_path_effects_do_not_depend_on_glyph_position() {
     }
     assert!(painted > 0, "the hatched glyph must paint something");
 }
+
+#[test]
+fn effects_on_non_finite_or_overflowing_geometry_terminate() {
+    // SkCanvas rejects non-finite geometry, and SkDashPath gives up past
+    // kMaxDashCount dashes, so none of these hang or exhaust memory.
+    use skia_rs_core::Rect;
+
+    let mut paint = Paint::new();
+    paint.set_color32(Color::WHITE);
+    paint.set_style(Style::Stroke);
+    paint.set_stroke_width(1.0);
+    paint.set_path_effect(Some(Arc::new(
+        DashEffect::new(vec![5.0, 5.0], 0.0).unwrap(),
+    )));
+    let mut buffer = PixelBuffer::new(64, 64);
+    let mut canvas = Canvas::new_raster(&mut buffer);
+    canvas.draw_rect(&Rect::new(0.0, 0.0, f32::INFINITY, 10.0), &paint);
+    canvas.draw_oval(&Rect::new(0.0, f32::NAN, 10.0, 10.0), &paint);
+    canvas.draw_circle(Point::new(f32::NAN, 0.0), 5.0, &paint);
+    // Finite endpoints whose length overflows to infinity.
+    canvas.draw_line(Point::new(0.0, 0.0), Point::new(3e38, 3e38), &paint);
+    // A finite but enormous dash count.
+    canvas.draw_line(Point::new(0.0, 0.0), Point::new(1e9, 0.0), &paint);
+}
+
+#[test]
+fn line_2d_hatches_the_visible_part_of_a_huge_source() {
+    // The lattice is culled to the clip before the size guard applies, so
+    // a +-1e6 background still gets hatch lines on screen.
+    use skia_rs_core::{Matrix, Rect};
+
+    let mut paint = Paint::new();
+    paint.set_color32(Color::WHITE);
+    paint.set_path_effect(skia_rs_path::make_line_2d(1.0, Matrix::scale(8.0, 8.0)));
+    let mut buffer = PixelBuffer::new(64, 64);
+    Canvas::new_raster(&mut buffer).draw_rect(&Rect::new(-1e6, -1e6, 1e6, 1e6), &paint);
+    let lit = (0..64).filter(|&y| buffer.get_pixel(32, y).is_some_and(|c| c.red() > 128));
+    assert!(lit.count() >= 4, "hatch lines cross the visible column");
+}

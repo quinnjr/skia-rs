@@ -866,17 +866,39 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// The clip bounds mapped into local space, outset for the paint's
+    /// stroke, as the cull rect for path effects (`SkCanvas` passes the
+    /// local clip bounds as `cullRect`). `None` when the matrix is singular.
+    fn local_cull(&self, paint: &Paint) -> Option<Rect> {
+        let inverse = self.total_matrix().invert()?;
+        let local = inverse.map_rect(&self.clip_bounds());
+        // Room for the stroke's miter/cap extent and AA fringe.
+        let stroke_extent = paint.stroke_width() * paint.stroke_miter().max(1.0);
+        let outset = stroke_extent + 1.0;
+        Some(local.inset(-outset, -outset))
+    }
+
     /// Rasterize `path`, applying the paint's path effect the way Skia's
     /// `skpathutils::FillPathWithPaint` does: filter through the paint's
     /// stroke record, and draw the result (or the source, if the effect
     /// fails) with the record as the effect left it.
     fn rasterize_path(&mut self, path: &Path, paint: &Paint) {
+        // SkCanvas::drawPath: a path with non-finite points draws nothing
+        // (effects would otherwise loop on infinite or NaN lengths).
+        if !path
+            .points()
+            .iter()
+            .all(|p| p.x.is_finite() && p.y.is_finite())
+        {
+            return;
+        }
         let Some(effect) = paint.path_effect() else {
             self.with_rasterizer(|raster| raster.draw_path(path, paint));
             return;
         };
         let mut rec = stroke_rec_from_paint(paint);
-        let filtered = effect.filter_path(path, &mut rec);
+        let cull = self.local_cull(paint);
+        let filtered = effect.filter_path_culled(path, &mut rec, cull.as_ref());
         let final_path = filtered.as_ref().unwrap_or(path);
         let styled = paint_with_stroke_rec(paint, rec);
         let styled = styled.as_ref().unwrap_or(paint);
