@@ -800,8 +800,11 @@ impl VulkanContext {
             return -1; // Not suitable
         }
 
-        // Bonus for higher max texture size
-        score += i32::try_from(props.limits.max_image_dimension2_d / 1024).unwrap_or(i32::MAX);
+        // Bonus for higher max texture size. u32::MAX / 1024 always fits in
+        // an i32, but saturate anyway so the score can never overflow.
+        score = score.saturating_add(
+            i32::try_from(props.limits.max_image_dimension2_d / 1024).unwrap_or(i32::MAX),
+        );
 
         score
     }
