@@ -806,8 +806,10 @@ impl<'a> Canvas<'a> {
             PointMode::Polygon => {
                 // SkDraw::drawPoints: the polyline is one open path
                 // (addPoly) stroked once, so vertices get joins rather than
-                // caps, translucent paints blend once, and a dash keeps its
-                // phase across vertices.
+                // caps, a dash keeps its phase across vertices, and a
+                // translucent wide stroke blends once. (A hairline is drawn
+                // segment by segment, so its shared vertex pixels can still
+                // be blended twice.)
                 if points.len() < 2 {
                     return;
                 }
