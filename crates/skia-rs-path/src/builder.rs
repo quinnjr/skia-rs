@@ -181,7 +181,9 @@ impl PathBuilder {
     /// scaled down together (`SkRRect::setRectXY`). Corners are exact
     /// quarter-ellipse conics (weight `sqrt(2)/2`), and the contour starts at
     /// `(left, bottom - ry)` going clockwise (`SkPath::addRRect`'s default
-    /// start index 6), so dashes and trims line up with Skia.
+    /// start index 6), so dashes and trims line up with Skia. When the radii
+    /// cover the whole rect, the result is an oval starting at the
+    /// left-middle point, as `addRRect` emits for an oval-type rrect.
     pub fn add_round_rect(&mut self, rect: &Rect, rx: Scalar, ry: Scalar) -> &mut Self {
         const W: Scalar = std::f32::consts::FRAC_1_SQRT_2;
 
@@ -195,6 +197,19 @@ impl PathBuilder {
         let rx = rx * scale;
         let ry = ry * scale;
         let (l, t, r, b) = (rect.left, rect.top, rect.right, rect.bottom);
+
+        if 2.0 * rx >= rect.width() && 2.0 * ry >= rect.height() {
+            // An oval-type rrect: SkPath::addRRect emits addOval with start
+            // index 6 / 2 = 3, i.e. from the left-middle point, clockwise.
+            let (cx, cy) = (f32::midpoint(l, r), f32::midpoint(t, b));
+            return self
+                .move_to(l, cy)
+                .conic_to(l, t, cx, t, W)
+                .conic_to(r, t, r, cy, W)
+                .conic_to(r, b, cx, b, W)
+                .conic_to(l, b, l, cy, W)
+                .close();
+        }
 
         self.move_to(l, b - ry)
             .line_to(l, t + ry)
@@ -640,6 +655,30 @@ mod tests {
                 Verb::Line,
                 Verb::Conic,
                 Verb::Line,
+                Verb::Conic,
+                Verb::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn add_round_rect_with_full_radii_is_an_oval_from_the_left() {
+        // An oval-type rrect becomes addOval(start index 3): four conics from
+        // the left-middle point, clockwise, with no zero-length edges.
+        let mut b = PathBuilder::new();
+        b.add_round_rect(&Rect::from_xywh(0.0, 0.0, 40.0, 40.0), 20.0, 20.0);
+        let path = b.build();
+        assert_eq!(
+            path.iter().next(),
+            Some(PathElement::Move(Point::new(0.0, 20.0)))
+        );
+        assert_eq!(
+            path.verbs(),
+            [
+                Verb::Move,
+                Verb::Conic,
+                Verb::Conic,
+                Verb::Conic,
                 Verb::Conic,
                 Verb::Close,
             ]
