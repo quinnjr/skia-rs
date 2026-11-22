@@ -659,11 +659,19 @@ impl MetalContext {
 
     /// Get texture limits for a feature set.
     ///
-    /// Apple3+ GPUs and every macOS family support 16384-texel 2D/cube
-    /// textures; older iOS families are limited to 8192.
+    /// Apple3+ GPUs (including the legacy iOS GPU family 3+ feature sets)
+    /// and every macOS family support 16384-texel 2D/cube textures; older
+    /// iOS families (A7/A8) are limited to 8192.
     const fn get_texture_limits(feature_set: MetalFeatureSet) -> (u32, u32, u32, u32) {
         match feature_set {
-            MetalFeatureSet::AppleFamily3
+            MetalFeatureSet::IosGpuFamily3V1
+            | MetalFeatureSet::IosGpuFamily3V2
+            | MetalFeatureSet::IosGpuFamily4V1
+            | MetalFeatureSet::IosGpuFamily5V1
+            | MetalFeatureSet::MacosGpuFamily1V1
+            | MetalFeatureSet::MacosGpuFamily1V2
+            | MetalFeatureSet::MacosGpuFamily1V3
+            | MetalFeatureSet::AppleFamily3
             | MetalFeatureSet::AppleFamily4
             | MetalFeatureSet::AppleFamily5
             | MetalFeatureSet::AppleFamily6
