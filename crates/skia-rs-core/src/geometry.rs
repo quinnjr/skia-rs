@@ -1175,6 +1175,10 @@ impl Default for Matrix {
     }
 }
 
+/// Skia's `SK_ScalarNearlyZero` (`1 / (1 << 12)`): the default tolerance for
+/// near-zero scalar comparisons in matrix classification.
+const SCALAR_NEARLY_ZERO: Scalar = 1.0 / 4096.0;
+
 impl Matrix {
     /// The identity matrix constant.
     pub const IDENTITY: Self = Self {
@@ -1304,6 +1308,77 @@ impl Matrix {
             && self.values[Self::PERSP_0] == 0.0
             && self.values[Self::PERSP_1] == 0.0
             && self.values[Self::PERSP_2] == 1.0
+    }
+
+    /// Returns true if the matrix has a perspective component.
+    ///
+    /// Corresponds to Skia's `SkMatrix::hasPerspective`.
+    #[inline]
+    #[must_use]
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact comparison is intentional and matches Skia's exact SkScalar comparison"
+    )]
+    pub fn has_perspective(&self) -> bool {
+        self.values[Self::PERSP_0] != 0.0
+            || self.values[Self::PERSP_1] != 0.0
+            || self.values[Self::PERSP_2] != 1.0
+    }
+
+    /// Returns true if the matrix contains only translation, rotation,
+    /// reflection, and uniform scale, so it preserves angles and maps
+    /// circles to circles.
+    ///
+    /// Corresponds to Skia's `SkMatrix::isSimilarity()` with the default
+    /// tolerance (`SK_ScalarNearlyZero`).
+    ///
+    /// # Examples
+    /// ```
+    /// use skia_rs_core::Matrix;
+    /// assert!(Matrix::scale(2.0, 2.0).is_similarity());
+    /// assert!(Matrix::rotate(0.5).is_similarity());
+    /// assert!(!Matrix::scale(4.0, 1.0).is_similarity());
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn is_similarity(&self) -> bool {
+        self.is_similarity_with_tolerance(SCALAR_NEARLY_ZERO)
+    }
+
+    /// [`is_similarity`](Self::is_similarity) with an explicit tolerance
+    /// for comparing the 2x2 linear part.
+    ///
+    /// Corresponds to Skia's `SkMatrix::isSimilarity(SkScalar tol)`.
+    #[must_use]
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact zero tests mirror Skia's type-mask classification"
+    )]
+    pub fn is_similarity_with_tolerance(&self, tol: Scalar) -> bool {
+        if self.has_perspective() {
+            return false;
+        }
+        let mx = self.values[Self::SCALE_X];
+        let my = self.values[Self::SCALE_Y];
+        let sx = self.values[Self::SKEW_X];
+        let sy = self.values[Self::SKEW_Y];
+
+        if sx == 0.0 && sy == 0.0 {
+            // Scale + translate only: uniform (possibly mirrored) scale.
+            return mx.abs() > SCALAR_NEARLY_ZERO
+                && (mx.abs() - my.abs()).abs() <= SCALAR_NEARLY_ZERO;
+        }
+
+        // A degenerate 2x2 collapses the plane; it is not a similarity.
+        let perp_dot = mx * my - sx * sy;
+        if perp_dot.abs() <= SCALAR_NEARLY_ZERO * SCALAR_NEARLY_ZERO {
+            return false;
+        }
+
+        // Rotation (+ uniform scale) or reflection (+ uniform scale): the
+        // basis vectors are 90-degree rotations of each other.
+        ((mx - my).abs() <= tol && (sx + sy).abs() <= tol)
+            || ((mx + my).abs() <= tol && (sx - sy).abs() <= tol)
     }
 
     /// Returns the translation component.
@@ -1497,6 +1572,43 @@ mod tests {
         reason = "tests assert exact expected f32 results; exact equality is intentional here"
     )]
     use super::*;
+
+    #[test]
+    fn test_matrix_is_similarity() {
+        // Similarities: translate, uniform scale, mirror, rotation, and
+        // combinations of them.
+        assert!(Matrix::IDENTITY.is_similarity());
+        assert!(Matrix::translate(5.0, -3.0).is_similarity());
+        assert!(Matrix::scale(3.0, 3.0).is_similarity());
+        assert!(Matrix::scale(-2.0, 2.0).is_similarity());
+        assert!(Matrix::rotate(0.7).is_similarity());
+        assert!(
+            Matrix::rotate(1.1)
+                .concat(&Matrix::scale(2.5, 2.5))
+                .concat(&Matrix::translate(4.0, 1.0))
+                .is_similarity()
+        );
+        assert!(
+            Matrix::rotate(0.4)
+                .concat(&Matrix::scale(-1.5, 1.5))
+                .is_similarity()
+        );
+
+        // Not similarities: non-uniform scale, skew, perspective, degenerate.
+        assert!(!Matrix::scale(4.0, 1.0).is_similarity());
+        assert!(!Matrix::skew(0.3, 0.0).is_similarity());
+        assert!(
+            !Matrix::rotate(0.5)
+                .concat(&Matrix::scale(2.0, 1.0))
+                .is_similarity()
+        );
+        assert!(!Matrix::scale(0.0, 0.0).is_similarity());
+        let mut persp = Matrix::IDENTITY;
+        persp.values[Matrix::PERSP_0] = 0.001;
+        assert!(persp.has_perspective());
+        assert!(!persp.is_similarity());
+        assert!(!Matrix::rotate(0.3).has_perspective());
+    }
 
     #[test]
     fn test_point_operations() {
