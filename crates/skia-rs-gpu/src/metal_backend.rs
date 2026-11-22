@@ -529,12 +529,12 @@ impl MetalContext {
         let device = if config.prefer_low_power {
             Device::all()
                 .into_iter()
-                .find(|d| d.is_low_power())
+                .find(|d| device_responds_to(d, "isLowPower") && d.is_low_power())
                 .or_else(Device::system_default)
         } else if config.prefer_headless {
             Device::all()
                 .into_iter()
-                .find(|d| d.is_headless())
+                .find(|d| device_responds_to(d, "isHeadless") && d.is_headless())
                 .or_else(Device::system_default)
         } else {
             Device::system_default()
@@ -769,7 +769,7 @@ impl MetalContext {
     /// Build adapter info from device.
     fn build_adapter_info(device: &DeviceRef, caps: &MetalCaps) -> GpuAdapterInfo {
         // Apple Silicon GPUs are integrated even when not flagged low-power.
-        let device_type = if device.is_low_power() || caps.is_apple_silicon {
+        let device_type = if caps.is_low_power || caps.is_apple_silicon {
             GpuDeviceType::Integrated
         } else {
             GpuDeviceType::Discrete
