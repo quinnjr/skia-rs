@@ -1224,10 +1224,11 @@ impl<'a> Rasterizer<'a> {
                     current = end;
                 }
                 PathElement::Conic(ctrl, end, weight) => {
-                    flatten_conic_device_error(
+                    let start = current;
+                    flatten_curve_device_error(
                         &mut conic_points,
-                        [current, ctrl, end],
-                        weight,
+                        |t| conic_point(start, ctrl, end, weight, t),
+                        end,
                         &self.matrix,
                     );
                     let mut prev = current;
@@ -1791,18 +1792,32 @@ fn cubic_point(t: Scalar, mt: Scalar, p0: Point, p1: Point, p2: Point, p3: Point
     )
 }
 
-/// Flatten one conic segment (`[start, ctrl, end]` in local space) into
-/// device-space edges, starting from the already-mapped `current` point, and
-/// return the new current point.
-fn push_conic_edges(
+/// The point at `t` on the conic `[start, ctrl, end]` with `weight`, in its
+/// exact rational form.
+fn conic_point(start: Point, ctrl: Point, end: Point, weight: Scalar, t: Scalar) -> Point {
+    let mt = 1.0 - t;
+    let (a, b, c) = (mt * mt, 2.0 * weight * t * mt, t * t);
+    let denom = a + b + c;
+    Point::new(
+        (start.x * a + ctrl.x * b + end.x * c) / denom,
+        (start.y * a + ctrl.y * b + end.y * c) / denom,
+    )
+}
+
+/// Flatten one curve segment into device-space edges, starting from the
+/// already-mapped `current` point, and return the new current point.
+///
+/// `eval` gives the curve's local-space point at `t` in `[0, 1]` and `end`
+/// is its exact local end point (see [`flatten_curve_device_error`]).
+fn push_curve_edges(
     edges: &mut Vec<Edge>,
     scratch: &mut Vec<Point>,
     mut current: Point,
-    conic: [Point; 3],
-    weight: Scalar,
+    eval: impl Fn(Scalar) -> Point,
+    end: Point,
     matrix: &Matrix,
 ) -> Point {
-    flatten_conic_device_error(scratch, conic, weight, matrix);
+    flatten_curve_device_error(scratch, eval, end, matrix);
     for &p in scratch.iter() {
         let p = matrix.map_point(p);
         if let Some(edge) = Edge::new(current, p) {
@@ -1813,36 +1828,26 @@ fn push_conic_edges(
     current
 }
 
-/// Flatten a conic (`[start, ctrl, end]` in local space) into local-space
-/// polyline points (excluding `start`), replacing the contents of `out`
-/// (a reusable buffer, so hot paths do not allocate per conic), subdividing
-/// until every piece
-/// deviates from the true curve by at most [`CONIC_FLATTEN_TOLERANCE`]
-/// *device* pixels under `matrix`.
+/// Flatten a curve into local-space polyline points (excluding its start),
+/// replacing the contents of `out` (a reusable buffer, so hot paths do not
+/// allocate per segment), subdividing until every piece deviates from the
+/// true curve by at most [`CONIC_FLATTEN_TOLERANCE`] *device* pixels under
+/// `matrix`.
 ///
-/// The conic is evaluated in its exact rational form (honoring the weight;
-/// circles, ovals and round-rect corners are weight-sqrt(2)/2 conics and
-/// bulge ~6% if treated as quads) in local space, and the error is measured
-/// after mapping through the full matrix. That is correct for any CTM:
-/// scale, skew, and perspective (which changes a projected conic's weight,
-/// so mapping control points alone would draw the wrong curve).
-fn flatten_conic_device_error(
+/// `eval` gives the local-space point at `t` in `[0, 1]`; `end` is the exact
+/// local end point. The curve is evaluated in local space and the error is
+/// measured after mapping through the full matrix, which is correct for any
+/// CTM, including perspective (where mapping control points alone would draw
+/// the wrong curve, and would change a conic's weight). Subdivision depth is
+/// capped (as Skia caps conic subdivision) so a hugely magnified curve
+/// costs at most 2^8 segments.
+fn flatten_curve_device_error(
     out: &mut Vec<Point>,
-    [start, ctrl, end]: [Point; 3],
-    weight: Scalar,
+    eval: impl Fn(Scalar) -> Point,
+    end: Point,
     matrix: &Matrix,
 ) {
-    const MAX_DEPTH: u32 = 12;
-
-    let eval = |t: Scalar| -> Point {
-        let mt = 1.0 - t;
-        let (a, b, c) = (mt * mt, 2.0 * weight * t * mt, t * t);
-        let denom = a + b + c;
-        Point::new(
-            (start.x * a + ctrl.x * b + end.x * c) / denom,
-            (start.y * a + ctrl.y * b + end.y * c) / denom,
-        )
-    };
+    const MAX_DEPTH: u32 = 8;
 
     out.clear();
     // Iterative depth-first subdivision over [t0, t1] intervals, in curve
@@ -1877,13 +1882,7 @@ fn flatten_conic_device_error(
 const CONIC_FLATTEN_TOLERANCE: Scalar = 0.25;
 
 /// Collect edges from a path.
-#[allow(
-    clippy::similar_names,
-    reason = "t/mt (Bezier parameter and its complement) is the standard flattening naming"
-)]
 fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
-    use skia_rs_core::cast::scalar_from_i32;
-
     let mut edges = Vec::new();
     let mut current = Point::zero();
     let mut contour_start = Point::zero();
@@ -1891,8 +1890,8 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
     // perspective projection.
     let mut local_current = Point::zero();
     let mut local_contour_start = Point::zero();
-    // Reused by every conic in the path (no per-segment allocation).
-    let mut conic_scratch: Vec<Point> = Vec::new();
+    // Reused by every curve in the path (no per-segment allocation).
+    let mut curve_scratch: Vec<Point> = Vec::new();
 
     for element in path {
         let local_start = local_current;
@@ -1919,48 +1918,39 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
                 }
                 current = end;
             }
-            PathElement::Quad(ctrl, end) => {
-                let ctrl = matrix.map_point(ctrl);
-                let end = matrix.map_point(end);
-                // Flatten to lines
-                let steps = 8;
-                let start = current;
-                for i in 1..=steps {
-                    let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                    let mt = 1.0 - t;
-                    let p = quad_point(t, mt, start, ctrl, end);
-                    if let Some(edge) = Edge::new(current, p) {
-                        edges.push(edge);
-                    }
-                    current = p;
-                }
-            }
             PathElement::Conic(ctrl, end, weight) => {
-                let conic = [local_start, ctrl, end];
-                current = push_conic_edges(
+                current = push_curve_edges(
                     &mut edges,
-                    &mut conic_scratch,
+                    &mut curve_scratch,
                     current,
-                    conic,
-                    weight,
+                    |t| conic_point(local_start, ctrl, end, weight, t),
+                    end,
+                    matrix,
+                );
+            }
+            // Every curve is evaluated in local space and flattened against
+            // a device-pixel error bound: correct under any CTM (mapping
+            // control points is wrong under perspective) and as fine as
+            // the curve's on-screen size needs.
+            PathElement::Quad(ctrl, end) => {
+                current = push_curve_edges(
+                    &mut edges,
+                    &mut curve_scratch,
+                    current,
+                    |t| quad_point(t, 1.0 - t, local_start, ctrl, end),
+                    end,
                     matrix,
                 );
             }
             PathElement::Cubic(c1, c2, end) => {
-                let c1 = matrix.map_point(c1);
-                let c2 = matrix.map_point(c2);
-                let end = matrix.map_point(end);
-                let steps = 12;
-                let start = current;
-                for i in 1..=steps {
-                    let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                    let mt = 1.0 - t;
-                    let p = cubic_point(t, mt, start, c1, c2, end);
-                    if let Some(edge) = Edge::new(current, p) {
-                        edges.push(edge);
-                    }
-                    current = p;
-                }
+                current = push_curve_edges(
+                    &mut edges,
+                    &mut curve_scratch,
+                    current,
+                    |t| cubic_point(t, 1.0 - t, local_start, c1, c2, end),
+                    end,
+                    matrix,
+                );
             }
             PathElement::Close => {
                 if let Some(edge) = Edge::new(current, contour_start) {

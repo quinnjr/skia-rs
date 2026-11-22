@@ -243,3 +243,74 @@ fn magnified_circle_under_perspective_stays_smooth() {
         expected.len()
     );
 }
+
+#[test]
+fn cubic_under_perspective_matches_the_projected_curve() {
+    // Quads and cubics are also wrong under perspective if only their
+    // control points are mapped (a projected Bezier is a rational curve).
+    // Fill a long S-shaped cubic across a strong perspective gradient and
+    // compare with its exact projected samples: ~8 pixels differ when the
+    // curve is evaluated locally and projected, ~500 with mapped controls.
+    use skia_rs_core::{Matrix, Point};
+
+    let mut persp = Matrix::IDENTITY;
+    persp.values[Matrix::PERSP_0] = 0.006;
+
+    let (p0, p1, p2, p3) = (
+        Point::new(0.0, 100.0),
+        Point::new(30.0, -150.0),
+        Point::new(140.0, 250.0),
+        Point::new(170.0, 20.0),
+    );
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "plain Bernstein-form reference evaluation"
+    )]
+    let at = |t: f32| {
+        let mt = 1.0 - t;
+        let (a, b, c, d) = (mt * mt * mt, 3.0 * mt * mt * t, 3.0 * mt * t * t, t * t * t);
+        Point::new(
+            a * p0.x + b * p1.x + c * p2.x + d * p3.x,
+            a * p0.y + b * p1.y + c * p2.y + d * p3.y,
+        )
+    };
+
+    let mut cubic = PathBuilder::new();
+    cubic
+        .move_to(p0.x, p0.y)
+        .cubic_to(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y)
+        .line_to(170.0, 190.0)
+        .line_to(0.0, 190.0)
+        .close();
+    let mut polygon = PathBuilder::new();
+    polygon.move_to(p0.x, p0.y);
+    let steps = 4000;
+    for i in 1..=steps {
+        #[allow(clippy::cast_precision_loss, reason = "small loop index")]
+        let q = at(i as f32 / steps as f32);
+        polygon.line_to(q.x, q.y);
+    }
+    polygon.line_to(170.0, 190.0).line_to(0.0, 190.0).close();
+
+    let render = |path: &skia_rs_path::Path| {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            canvas.set_matrix(&persp);
+            canvas.draw_path(path, &white(Style::Fill));
+        }
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .filter(|&(x, y)| lit(&buffer, x, y))
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let actual = render(&cubic.build());
+    let expected = render(&polygon.build());
+    let differing = actual.symmetric_difference(&expected).count();
+    assert!(expected.len() > 1000);
+    assert!(
+        differing * 100 <= expected.len(),
+        "{differing} pixels differ from the projected cubic ({} expected)",
+        expected.len()
+    );
+}
