@@ -255,7 +255,10 @@ fn system_default_font_candidates() -> Vec<std::path::PathBuf> {
             .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
         let fonts = windir.join("Fonts");
         paths.extend(["segoeui.ttf", "arial.ttf", "tahoma.ttf"].map(|f| fonts.join(f)));
-    } else if cfg!(any(target_os = "macos", target_os = "ios")) {
+    } else if cfg!(target_os = "ios") {
+        // iOS system fonts are not at stable paths, and sandboxed apps cannot
+        // read them by path; load bundled fonts with Typeface::from_data.
+    } else if cfg!(target_os = "macos") {
         paths.extend(
             [
                 "/System/Library/Fonts/Helvetica.ttc",
@@ -330,8 +333,10 @@ impl Typeface {
     /// and shared font bytes), so per-typeface caches keep hitting.
     ///
     /// Returns `None` when none of the well-known font files exists, e.g. in
-    /// a minimal container without fonts installed. A failed lookup is not
-    /// cached, so each such call re-probes the (few) candidate paths.
+    /// a minimal container without fonts installed, and always on iOS, where
+    /// system fonts cannot be read by path (bundle a font and use
+    /// [`from_data`](Self::from_data)). A failed lookup is not cached, so
+    /// each such call re-probes the (few) candidate paths.
     #[must_use]
     pub fn system_default() -> Option<Self> {
         // Only a successful load is cached: a font installed or mounted after
