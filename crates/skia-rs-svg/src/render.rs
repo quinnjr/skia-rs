@@ -485,20 +485,13 @@ fn render_node(
         }
         SvgNodeKind::Line(line) => {
             if let Some(paint) = &stroke_paint {
-                // `draw_line` does not run path effects; route dashed strokes
-                // through a path so stroke-dasharray takes effect.
-                if paint.path_effect().is_some() {
-                    let mut b = PathBuilder::new();
-                    b.move_to(line.x1, line.y1);
-                    b.line_to(line.x2, line.y2);
-                    canvas.draw_path(&b.build(), paint);
-                } else {
-                    canvas.draw_line(
-                        Point::new(line.x1, line.y1),
-                        Point::new(line.x2, line.y2),
-                        paint,
-                    );
-                }
+                // `draw_line` applies the paint's path effect, so
+                // stroke-dasharray needs no special handling here.
+                canvas.draw_line(
+                    Point::new(line.x1, line.y1),
+                    Point::new(line.x2, line.y2),
+                    paint,
+                );
             }
         }
         SvgNodeKind::Polyline(points) => {

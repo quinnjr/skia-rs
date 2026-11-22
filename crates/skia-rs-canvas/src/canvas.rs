@@ -953,11 +953,23 @@ impl<'a> Canvas<'a> {
         match &mut self.backing {
             Backing::Raster(_) => {
                 // If the paint carries a path effect, apply it first and
-                // rasterize the effected path. Fall back to the input path if
-                // the effect produces nothing.
-                let effected = paint.path_effect().and_then(|e| e.apply(path));
-                let final_path: &Path = effected.as_ref().unwrap_or(path);
-                self.with_rasterizer(|raster| raster.draw_path(final_path, paint));
+                // rasterize the effected path with the style the effect
+                // requests (SkStrokeRec): e.g. Path1D stamps are filled and
+                // Line2D strokes at its own width. If the effect cannot apply,
+                // draw the input path unchanged, like a failed filterPath.
+                let effected = paint
+                    .path_effect()
+                    .and_then(|e| e.apply(path).map(|p| (p, e.style_override())));
+                match effected {
+                    Some((effected_path, style)) => {
+                        let styled = paint_with_effect_style(paint, style);
+                        let styled = styled.as_ref().unwrap_or(paint);
+                        self.with_rasterizer(|raster| raster.draw_path(&effected_path, styled));
+                    }
+                    None => {
+                        self.with_rasterizer(|raster| raster.draw_path(path, paint));
+                    }
+                }
             }
             Backing::Recording(commands) => {
                 // Record the original path, like SkPicture: the paint still
@@ -2333,6 +2345,30 @@ impl Canvas<'_> {
                     self.draw_glyph_outline(&path, gx, gy, font, paint);
                 }
             }
+        }
+    }
+}
+
+/// The paint to draw a path effect's output with, after applying the
+/// effect's [`EffectStyle`](skia_rs_path::EffectStyle) the way Skia's
+/// `filterPath` rewrites the `SkStrokeRec`. Returns `None` when the paint is
+/// used unchanged.
+fn paint_with_effect_style(paint: &Paint, style: skia_rs_path::EffectStyle) -> Option<Paint> {
+    use skia_rs_paint::Style;
+    use skia_rs_path::EffectStyle;
+
+    match style {
+        EffectStyle::Inherit => None,
+        EffectStyle::Fill => {
+            let mut fill = paint.clone();
+            fill.set_style(Style::Fill);
+            Some(fill)
+        }
+        EffectStyle::Stroke(width) => {
+            let mut stroke = paint.clone();
+            stroke.set_style(Style::Stroke);
+            stroke.set_stroke_width(width);
+            Some(stroke)
         }
     }
 }

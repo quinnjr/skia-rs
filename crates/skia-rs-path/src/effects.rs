@@ -11,6 +11,36 @@ use skia_rs_core::cast::{ceil_to_i32, floor_to_i32, scalar_from_i32};
 use skia_rs_core::{Point, Scalar};
 use std::sync::Arc;
 
+/// How a path effect rewrites the paint's stroke style for its output.
+///
+/// Corresponds to the `SkStrokeRec` changes Skia's effects make in
+/// `filterPath`: `Sk1DPathEffect` switches to fill (its stamps are shapes),
+/// `SkLine2DPathEffect` strokes at its own width, and most effects leave the
+/// paint's style alone.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum EffectStyle {
+    /// Keep the paint's style (fill, stroke, or stroke-and-fill).
+    #[default]
+    Inherit,
+    /// Fill the effect's output (`SkStrokeRec::setFillStyle`).
+    Fill,
+    /// Stroke the effect's output at this width, ignoring the paint's
+    /// stroke width (`SkStrokeRec::setStrokeStyle(width)`). Zero is a
+    /// hairline.
+    Stroke(Scalar),
+}
+
+impl EffectStyle {
+    /// This override, or `fallback` if this one inherits.
+    #[must_use]
+    pub const fn or(self, fallback: Self) -> Self {
+        match self {
+            Self::Inherit => fallback,
+            other => other,
+        }
+    }
+}
+
 /// A path effect that modifies how a path is stroked or filled.
 ///
 /// Corresponds to Skia's `SkPathEffect`.
@@ -24,6 +54,13 @@ pub trait PathEffect: Send + Sync + std::fmt::Debug {
     /// - `None`: the effect could not apply (`filterPath` returned false),
     ///   so callers draw the source path unchanged.
     fn apply(&self, path: &Path) -> Option<Path>;
+
+    /// How the paint's style must change when drawing the output of a
+    /// successful [`apply`](Self::apply). Defaults to
+    /// [`EffectStyle::Inherit`].
+    fn style_override(&self) -> EffectStyle {
+        EffectStyle::Inherit
+    }
 
     /// Get the kind of path effect for debugging.
     fn effect_kind(&self) -> PathEffectKind;
@@ -805,7 +842,9 @@ impl PathEffect for TrimEffect {
         let measure = crate::measure::PathMeasure::new(path);
         let total = measure.length();
         if total <= 0.0 {
-            return Some(path.clone());
+            // SkTrimPE adds no segments for a zero-length source and still
+            // succeeds, so nothing is drawn (not even a capped dot).
+            return Some(Path::new());
         }
 
         let start_dist = self.start * total;
@@ -912,6 +951,11 @@ impl ComposeEffect {
 }
 
 impl PathEffect for ComposeEffect {
+    fn style_override(&self) -> EffectStyle {
+        // SkComposePathEffect runs inner then outer on one SkStrokeRec.
+        self.outer.style_override().or(self.inner.style_override())
+    }
+
     fn apply(&self, path: &Path) -> Option<Path> {
         let intermediate = self.inner.apply(path)?;
         self.outer.apply(&intermediate)
@@ -943,6 +987,11 @@ impl SumEffect {
 }
 
 impl PathEffect for SumEffect {
+    fn style_override(&self) -> EffectStyle {
+        // SkSumPathEffect runs first then second on one SkStrokeRec.
+        self.second.style_override().or(self.first.style_override())
+    }
+
     fn apply(&self, path: &Path) -> Option<Path> {
         let path1 = self.first.apply(path);
         let path2 = self.second.apply(path);
@@ -1079,6 +1128,11 @@ impl Path1DEffect {
 }
 
 impl PathEffect for Path1DEffect {
+    fn style_override(&self) -> EffectStyle {
+        // SkPath1DPathEffect::onFilterPath: rec->setFillStyle().
+        EffectStyle::Fill
+    }
+
     fn apply(&self, src_path: &Path) -> Option<Path> {
         use crate::PathMeasure;
 
@@ -1175,6 +1229,10 @@ impl PathEffect for Path2DEffect {
             return None;
         }
 
+        // Skia checks invertibility first: a singular matrix fails the effect
+        // (the source is drawn unchanged) even when the bounds are empty.
+        let inverse = self.matrix.invert()?;
+
         let bounds = src_path.bounds();
         if bounds.is_empty() {
             // Sk2DPathEffect::filterPath succeeds with an empty result here
@@ -1182,9 +1240,6 @@ impl PathEffect for Path2DEffect {
             return Some(Path::new());
         }
         let mut builder = PathBuilder::new();
-
-        // Compute the inverse matrix to find tile positions
-        let inverse = self.matrix.invert()?;
 
         // Transform bounds to tile space
         let transformed_bounds = inverse.map_rect(&bounds);
@@ -1266,10 +1321,19 @@ impl Line2DEffect {
 }
 
 impl PathEffect for Line2DEffect {
+    fn style_override(&self) -> EffectStyle {
+        // SkLine2DPathEffect::onFilterPath: rec->setStrokeStyle(fWidth).
+        EffectStyle::Stroke(self.width)
+    }
+
     fn apply(&self, src_path: &Path) -> Option<Path> {
         if src_path.is_empty() {
             return None;
         }
+
+        // Skia checks invertibility first: a singular matrix fails the effect
+        // (the source is drawn unchanged) even when the bounds are empty.
+        let inverse = self.matrix.invert()?;
 
         let bounds = src_path.bounds();
         if bounds.is_empty() {
@@ -1278,9 +1342,6 @@ impl PathEffect for Line2DEffect {
             return Some(Path::new());
         }
         let mut builder = PathBuilder::new();
-
-        // Compute the inverse matrix
-        let inverse = self.matrix.invert()?;
 
         // Transform bounds to line space
         let transformed_bounds = inverse.map_rect(&bounds);
@@ -1433,6 +1494,53 @@ mod tests {
         let stamp = Path1DEffect::new(square(2.0), 5.0, 0.0, Path1DStyle::Translate).unwrap();
         let produced = stamp.apply(&zero_length()).expect("1D effect applies");
         assert!(produced.is_empty(), "zero-length source gets no stamps");
+    }
+
+    #[test]
+    fn singular_2d_matrix_fails_before_the_empty_bounds_check() {
+        // Sk2DPathEffect returns false for a non-invertible matrix first, so
+        // the source is drawn unchanged even when its bounds are empty.
+        let singular = skia_rs_core::Matrix::scale(0.0, 0.0);
+        let tile = Path2DEffect::new(singular, square(2.0)).unwrap();
+        assert!(tile.apply(&flat_line()).is_none());
+        let lines = Line2DEffect::new(1.0, singular).unwrap();
+        assert!(lines.apply(&flat_line()).is_none());
+    }
+
+    #[test]
+    fn trim_of_zero_length_source_draws_nothing() {
+        let trim = TrimEffect::new(0.2, 0.8, TrimMode::Normal).unwrap();
+        let produced = trim.apply(&zero_length()).expect("trim applies");
+        assert!(
+            produced.is_empty(),
+            "no capped dot for a zero-length source"
+        );
+    }
+
+    #[test]
+    fn style_overrides_match_skia_stroke_rec_changes() {
+        let stamp: PathEffectRef =
+            Arc::new(Path1DEffect::new(square(2.0), 5.0, 0.0, Path1DStyle::Translate).unwrap());
+        let hatch: PathEffectRef =
+            Arc::new(Line2DEffect::new(3.0, skia_rs_core::Matrix::scale(4.0, 4.0)).unwrap());
+        let dash: PathEffectRef = Arc::new(DashEffect::new(vec![4.0, 2.0], 0.0).unwrap());
+
+        assert_eq!(stamp.style_override(), EffectStyle::Fill);
+        assert_eq!(hatch.style_override(), EffectStyle::Stroke(3.0));
+        assert_eq!(dash.style_override(), EffectStyle::Inherit);
+
+        // Compose runs inner then outer: outer's override wins, otherwise
+        // inner's carries through.
+        let outer_wins = ComposeEffect::new(Arc::clone(&hatch), Arc::clone(&stamp));
+        assert_eq!(outer_wins.style_override(), EffectStyle::Stroke(3.0));
+        let inner_carries = ComposeEffect::new(Arc::clone(&dash), Arc::clone(&stamp));
+        assert_eq!(inner_carries.style_override(), EffectStyle::Fill);
+
+        // Sum runs first then second: second's override wins.
+        let second_wins = SumEffect::new(Arc::clone(&stamp), Arc::clone(&hatch));
+        assert_eq!(second_wins.style_override(), EffectStyle::Stroke(3.0));
+        let first_carries = SumEffect::new(stamp, dash);
+        assert_eq!(first_carries.style_override(), EffectStyle::Fill);
     }
 
     #[test]

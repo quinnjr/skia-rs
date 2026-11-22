@@ -72,6 +72,37 @@ fn recorded_dashed_path_plays_back_like_direct_drawing() {
     );
 }
 
+#[test]
+fn draw_line_fills_path1d_stamps() {
+    // Sk1DPathEffect switches the stroke rec to fill: stamping 6x6 squares
+    // along a hairline must paint solid squares, not 1px outlines.
+    use skia_rs_core::Rect;
+    use skia_rs_path::{Path1DEffect, Path1DStyle};
+
+    let mut stamp = PathBuilder::new();
+    stamp.add_rect(&Rect::from_xywh(-3.0, -3.0, 6.0, 6.0));
+    let mut paint = Paint::new();
+    paint.set_color(Color::WHITE.into());
+    paint.set_style(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    paint.set_path_effect(Some(Arc::new(
+        Path1DEffect::new(stamp.build(), 20.0, 0.0, Path1DStyle::Translate).unwrap(),
+    )));
+
+    let mut buffer = PixelBuffer::new(W, H);
+    Canvas::new_raster(&mut buffer).draw_line(
+        Point::new(10.0, 10.0),
+        Point::new(110.0, 10.0),
+        &paint,
+    );
+
+    // A stamp is centred on (30, 10): its interior must be filled.
+    assert!(lit(&buffer, 30, 10), "stamp interior must be filled");
+    assert!(lit(&buffer, 29, 9), "stamp interior must be filled");
+    // Between stamps nothing is drawn (the source line itself is replaced).
+    assert!(!lit(&buffer, 40, 10), "gap between stamps must stay empty");
+}
+
 #[cfg(feature = "text")]
 #[test]
 fn recorded_emboldened_text_replays_per_command_at_the_right_place() {
