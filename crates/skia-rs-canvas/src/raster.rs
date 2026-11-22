@@ -623,52 +623,52 @@ impl<'a> Rasterizer<'a> {
         }
     }
 
-    /// Draw line without anti-aliasing (Bresenham).
+    /// Draw an aliased hairline, as Skia's `SkScan::HairLine` does.
+    ///
+    /// Along the major axis the span is half-open, `[round(a0), round(a1))`
+    /// (`SkFDot6Round`), so joined segments do not overlap at shared
+    /// vertices and a hairline shorter than a pixel draws nothing. Along the
+    /// minor axis a DDA is sampled at each pixel's center and floored
+    /// (`horiline` / `vertline`).
     fn draw_line_aliased(&mut self, p0: Point, p1: Point, paint: &Paint) {
-        use skia_rs_core::cast::round_to_i32;
-        // Pixel (i, j) covers [i, i+1) x [j, j+1) with its center at
-        // (i + 0.5, j + 0.5), as in Skia, so the pixel containing a point is
-        // round(coordinate - 0.5): a line at y = 50.5 lies on row 50.
-        let t0 = self.matrix.map_point(p0);
-        let t1 = self.matrix.map_point(p1);
+        use skia_rs_core::cast::{floor_to_i32, scalar_from_i32};
 
-        let mut x0 = round_to_i32(t0.x - 0.5);
-        let mut y0 = round_to_i32(t0.y - 0.5);
-        let x1 = round_to_i32(t1.x - 0.5);
-        let y1 = round_to_i32(t1.y - 0.5);
-
-        let dx = (x1 - x0).abs();
-        let dy = -(y1 - y0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
-
+        let (mut start, mut end) = (self.matrix.map_point(p0), self.matrix.map_point(p1));
         let color = premultiply_color(paint.color32());
         let blend_mode = paint.blend_mode();
-
-        // Half-open, like SkScan::HairLine: the last pixel is not drawn, so
-        // joined hairline segments do not overlap at shared vertices and a
-        // zero-length hairline draws nothing.
-        while x0 != x1 || y0 != y1 {
-            let coverage = self.get_clip_coverage(x0, y0);
-            if coverage > 0 {
-                if coverage == 255 {
-                    self.buffer.blend_pixel(x0, y0, color, blend_mode);
-                } else {
-                    let adjusted = apply_coverage(color, coverage);
-                    self.buffer.blend_pixel(x0, y0, adjusted, blend_mode);
-                }
+        let horizontal = (end.x - start.x).abs() > (end.y - start.y).abs();
+        if !horizontal {
+            // Treat the mostly-vertical case as horizontal with x and y
+            // swapped, swapping back when plotting.
+            std::mem::swap(&mut start.x, &mut start.y);
+            std::mem::swap(&mut end.x, &mut end.y);
+        }
+        if start.x > end.x {
+            std::mem::swap(&mut start, &mut end);
+        }
+        let round = |v: Scalar| floor_to_i32(v + 0.5);
+        let (first, past_last) = (round(start.x), round(end.x));
+        if first >= past_last {
+            return; // too short to draw
+        }
+        let slope = (end.y - start.y) / (end.x - start.x);
+        // Minor-axis value at the center of the first pixel.
+        let mut minor = slope.mul_add(scalar_from_i32(first) + 0.5 - start.x, start.y);
+        for major in first..past_last {
+            let row = floor_to_i32(minor);
+            let (x, y) = if horizontal {
+                (major, row)
+            } else {
+                (row, major)
+            };
+            let coverage = self.get_clip_coverage(x, y);
+            if coverage == 255 {
+                self.buffer.blend_pixel(x, y, color, blend_mode);
+            } else if coverage > 0 {
+                let adjusted = apply_coverage(color, coverage);
+                self.buffer.blend_pixel(x, y, adjusted, blend_mode);
             }
-
-            let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x0 += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y0 += sy;
-            }
+            minor += slope;
         }
     }
 
@@ -1222,6 +1222,23 @@ impl<'a> Rasterizer<'a> {
         reason = "t/mt (parameter and its complement) and per-segment prev_t/prev_mt are the standard Bezier-flattening parameter names"
     )]
     fn stroke_path_hairline(&mut self, path: &Path, paint: &Paint) {
+        // Skia's hair_path extends open contours for non-butt caps
+        // (extend_pts): 0.5 device px for square caps, pi/8 for round.
+        let extended;
+        let path = match paint.stroke_cap() {
+            skia_rs_paint::StrokeCap::Butt => path,
+            cap => {
+                let device_outset = if cap == skia_rs_paint::StrokeCap::Square {
+                    0.5
+                } else {
+                    std::f32::consts::PI / 8.0
+                };
+                let scale = self.matrix.max_scale().filter(|s| *s > 0.0).unwrap_or(1.0);
+                extended = extend_hairline_caps(path, device_outset / scale);
+                &extended
+            }
+        };
+
         let mut current = Point::zero();
         let mut contour_start = Point::zero();
         // Reused by every curve in the path (no per-segment allocation).
@@ -1909,6 +1926,83 @@ fn flatten_curve_device_error(
             len += 2;
         }
     }
+}
+
+/// A copy of `path` whose open contours start `outset` earlier and end
+/// `outset` later along their end tangents (Skia's `extend_pts` for capped
+/// hairlines). Closed contours and contours without a direction are kept.
+fn extend_hairline_caps(path: &Path, outset: Scalar) -> Path {
+    // The points an element ends with, in order.
+    fn element_points(e: &PathElement) -> Vec<Point> {
+        match *e {
+            PathElement::Move(p) | PathElement::Line(p) => vec![p],
+            PathElement::Quad(c, p) | PathElement::Conic(c, p, _) => vec![c, p],
+            PathElement::Cubic(c1, c2, p) => vec![c1, c2, p],
+            PathElement::Close => Vec::new(),
+        }
+    }
+    fn moved(from: Point, toward_away: Point, outset: Scalar) -> Option<Point> {
+        let (dx, dy) = (from.x - toward_away.x, from.y - toward_away.y);
+        let len = dx.hypot(dy);
+        (len > 0.0).then(|| {
+            Point::new(
+                dx.mul_add(outset / len, from.x),
+                dy.mul_add(outset / len, from.y),
+            )
+        })
+    }
+
+    // Split into contours.
+    let mut contours: Vec<Vec<PathElement>> = Vec::new();
+    for e in path {
+        if matches!(e, PathElement::Move(_)) || contours.is_empty() {
+            contours.push(Vec::new());
+        }
+        if let Some(c) = contours.last_mut() {
+            c.push(e);
+        }
+    }
+
+    let mut b = PathBuilder::new();
+    b.fill_type(path.fill_type());
+    for mut contour in contours {
+        let closed = contour.iter().any(|e| matches!(e, PathElement::Close));
+        if !closed && contour.len() >= 2 {
+            let points: Vec<Point> = contour.iter().flat_map(element_points).collect();
+            // Start: push the first point away from the next distinct point.
+            if let (Some(&first), Some(&next)) =
+                (points.first(), points.iter().find(|q| **q != points[0]))
+                && let Some(p) = moved(first, next, outset)
+            {
+                contour[0] = PathElement::Move(p);
+            }
+            // End: push the last point away from the previous distinct one.
+            if let Some(&last) = points.last()
+                && let Some(&prev) = points.iter().rev().find(|q| **q != last)
+                && let Some(p) = moved(last, prev, outset)
+            {
+                let tail = contour.len() - 1;
+                contour[tail] = match contour[tail] {
+                    PathElement::Line(_) => PathElement::Line(p),
+                    PathElement::Quad(c, _) => PathElement::Quad(c, p),
+                    PathElement::Conic(c, _, w) => PathElement::Conic(c, p, w),
+                    PathElement::Cubic(c1, c2, _) => PathElement::Cubic(c1, c2, p),
+                    other => other,
+                };
+            }
+        }
+        for e in contour {
+            match e {
+                PathElement::Move(p) => b.move_to(p.x, p.y),
+                PathElement::Line(p) => b.line_to(p.x, p.y),
+                PathElement::Quad(c, p) => b.quad_to(c.x, c.y, p.x, p.y),
+                PathElement::Conic(c, p, w) => b.conic_to(c.x, c.y, p.x, p.y, w),
+                PathElement::Cubic(c1, c2, p) => b.cubic_to(c1.x, c1.y, c2.x, c2.y, p.x, p.y),
+                PathElement::Close => b.close(),
+            };
+        }
+    }
+    b.build()
 }
 
 /// Maximum distance, in device pixels, between a conic and the polyline it is

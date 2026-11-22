@@ -651,11 +651,41 @@ fn aliased_hairlines_are_half_open() {
     paint.set_stroke_width(0.0);
     let mut buffer = PixelBuffer::new(SIZE, SIZE);
     Canvas::new_raster(&mut buffer).draw_line(
-        Point::new(20.5, 50.5),
-        Point::new(180.5, 50.5),
+        Point::new(20.0, 50.5),
+        Point::new(180.0, 50.5),
         &paint,
     );
     assert!(lit(&buffer, 20, 50), "first pixel drawn");
     assert!(lit(&buffer, 179, 50), "second-to-last pixel drawn");
     assert!(!lit(&buffer, 180, 50), "the end pixel is excluded");
+}
+
+#[test]
+fn capped_hairlines_extend_to_cover_their_end_pixel() {
+    // Skia's hair_path extends open contours for non-butt caps
+    // (extend_pts), so a square- or round-capped hairline covers the end
+    // pixel that the half-open butt-capped hairline leaves out.
+    use skia_rs_paint::StrokeCap;
+
+    let draw = |cap: StrokeCap| {
+        let mut paint = white(Style::Stroke);
+        paint.set_stroke_width(0.0);
+        paint.set_stroke_cap(cap);
+        let mut b = PathBuilder::new();
+        // Major-axis span is [round(x0), round(x1)): butt covers 10..=19;
+        // square (+-0.5) and round (+-pi/8) caps reach 20.59+ -> 10..=20.
+        b.move_to(10.2, 10.5).line_to(20.2, 10.5);
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        Canvas::new_raster(&mut buffer).draw_path(&b.build(), &paint);
+        buffer
+    };
+    assert!(!lit(&draw(StrokeCap::Butt), 20, 10), "butt: half-open end");
+    assert!(
+        lit(&draw(StrokeCap::Square), 20, 10),
+        "square cap covers the end"
+    );
+    assert!(
+        lit(&draw(StrokeCap::Round), 20, 10),
+        "round cap covers the end"
+    );
 }
