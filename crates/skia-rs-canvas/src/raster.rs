@@ -1221,17 +1221,30 @@ impl<'a> Rasterizer<'a> {
                     }
                     current = end;
                 }
-                PathElement::Conic(ctrl, end, _w) => {
-                    // Approximate as quad for simplicity
-                    let steps = 16;
-                    for i in 1..=steps {
-                        let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                        let mt = 1.0 - t;
-                        let p = quad_point(t, mt, current, ctrl, end);
-                        let prev_t = scalar_from_i32(i - 1) / scalar_from_i32(steps);
-                        let prev_mt = 1.0 - prev_t;
-                        let prev = quad_point(prev_t, prev_mt, current, ctrl, end);
+                PathElement::Conic(ctrl, end, weight) => {
+                    // Honor the conic weight (circles, ovals and round-rect
+                    // corners are weight-sqrt(2)/2 conics; flattening them
+                    // as plain quads bulges them outward). This walk is in
+                    // local space, so convert the device-pixel tolerance.
+                    let scale = self.matrix.determinant().abs().sqrt();
+                    let tolerance = if scale.is_finite() && scale > 0.0 {
+                        CONIC_FLATTEN_TOLERANCE / scale
+                    } else {
+                        CONIC_FLATTEN_TOLERANCE
+                    };
+                    let mut points = Vec::new();
+                    skia_rs_path::flatten::flatten_conic_adaptive(
+                        &mut points,
+                        current,
+                        ctrl,
+                        end,
+                        weight,
+                        tolerance,
+                    );
+                    let mut prev = current;
+                    for p in points {
                         self.draw_line(prev, p, paint);
+                        prev = p;
                     }
                     current = end;
                 }
@@ -1794,6 +1807,10 @@ fn cubic_point(t: Scalar, mt: Scalar, p0: Point, p1: Point, p2: Point, p3: Point
     clippy::similar_names,
     reason = "t/mt (Bezier parameter and its complement) is the standard flattening naming"
 )]
+/// Maximum distance, in device pixels, between a conic and the polyline it is
+/// flattened to (Skia's path flattening tolerance).
+const CONIC_FLATTEN_TOLERANCE: Scalar = 0.25;
+
 fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
     use skia_rs_core::cast::scalar_from_i32;
 
@@ -1830,15 +1847,23 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
                     current = p;
                 }
             }
-            PathElement::Conic(ctrl, end, _w) => {
+            PathElement::Conic(ctrl, end, weight) => {
+                // Honor the conic weight: flattening as a plain quad bulges
+                // circles, ovals and round-rect corners outward (~6% of the
+                // radius on the diagonals). An affine map keeps the weight,
+                // so flatten the mapped conic in device space.
                 let ctrl = matrix.map_point(ctrl);
                 let end = matrix.map_point(end);
-                let steps = 8;
-                let start = current;
-                for i in 1..=steps {
-                    let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                    let mt = 1.0 - t;
-                    let p = quad_point(t, mt, start, ctrl, end);
+                let mut points = Vec::new();
+                skia_rs_path::flatten::flatten_conic_adaptive(
+                    &mut points,
+                    current,
+                    ctrl,
+                    end,
+                    weight,
+                    CONIC_FLATTEN_TOLERANCE,
+                );
+                for p in points {
                     if let Some(edge) = Edge::new(current, p) {
                         edges.push(edge);
                     }
