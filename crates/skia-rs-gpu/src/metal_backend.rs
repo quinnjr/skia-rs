@@ -470,6 +470,38 @@ pub struct MetalContext {
     caps: MetalCaps,
 }
 
+/// Whether `device` implements the Objective-C `selector`
+/// (`-respondsToSelector:`).
+///
+/// Newer `MTLDevice` queries (e.g. `supportsFamily:` on macOS 10.15 /
+/// iOS 13, `supportsRaytracing` on macOS 11 / iOS 14) raise an
+/// unrecognized-selector exception, aborting the process, when sent to a
+/// device on an older OS, so they must be probed first.
+#[cfg(feature = "metal")]
+fn device_responds_to(device: &DeviceRef, selector: &str) -> bool {
+    // Sent via `Message::send_message` with runtime-registered selectors:
+    // objc 0.2's `msg_send!`/`sel!` macros expand to a `cfg(feature =
+    // "cargo-clippy")` check that trips `unexpected_cfgs` in this crate.
+    use metal::objc::Message;
+    use metal::objc::runtime::{BOOL, NO, Sel};
+
+    let responds_to_selector = Sel::register("respondsToSelector:");
+    let selector = Sel::register(selector);
+    // SAFETY: `device` is a valid MTLDevice (an NSObject), and
+    // `respondsToSelector:` is implemented by every NSObject with the
+    // signature `- (BOOL)respondsToSelector:(SEL)aSelector`.
+    let responds: BOOL =
+        unsafe { device.send_message(responds_to_selector, (selector,)) }.unwrap_or(NO);
+    responds != NO
+}
+
+/// [`DeviceRef::supports_family`], or `false` on systems that predate the
+/// `supportsFamily:` query.
+#[cfg(feature = "metal")]
+fn supports_family(device: &DeviceRef, family: metal::MTLGPUFamily) -> bool {
+    device_responds_to(device, "supportsFamily:") && device.supports_family(family)
+}
+
 #[cfg(feature = "metal")]
 impl MetalContext {
     /// Create a new Metal context using the system default device.
@@ -586,9 +618,12 @@ impl MetalContext {
             msaa_depth_resolve: true,
             // metal-rs exposes no sparse-texture query; sparse textures require the
             // Apple6 GPU family (A13 / Apple silicon) or newer.
-            sparse_textures: device.supports_family(metal::MTLGPUFamily::Apple6),
-            function_pointers: device.supports_function_pointers(),
-            ray_tracing: device.supports_raytracing(),
+            sparse_textures: supports_family(device, metal::MTLGPUFamily::Apple6),
+            // macOS 11 / iOS 14 queries: absent (false) on older systems.
+            function_pointers: device_responds_to(device, "supportsFunctionPointers")
+                && device.supports_function_pointers(),
+            ray_tracing: device_responds_to(device, "supportsRaytracing")
+                && device.supports_raytracing(),
             mesh_shaders: false, // Requires checking specific feature set
             argument_buffer_tier: match device.argument_buffers_support() {
                 metal::MTLArgumentBuffersTier::Tier1 => 1,
@@ -604,6 +639,13 @@ impl MetalContext {
 
     /// Detect the highest supported feature set.
     fn detect_feature_set(device: &DeviceRef) -> MetalFeatureSet {
+        // `supportsFamily:` needs macOS 10.15 / iOS 13; older systems get
+        // the lowest common feature set instead of an unrecognized-selector
+        // exception.
+        if !device_responds_to(device, "supportsFamily:") {
+            return MetalFeatureSet::CommonFamily1;
+        }
+
         // Check from highest to lowest
         // Apple Silicon families (newest first)
         if device.supports_family(metal::MTLGPUFamily::Apple9) {
