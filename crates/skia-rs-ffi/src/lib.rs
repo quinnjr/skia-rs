@@ -1955,8 +1955,12 @@ pub unsafe extern "C" fn sk_canvas_save(canvas: *mut sk_canvas_t) -> i32 {
 ///
 /// Both `bounds` and `paint` are optional (null is acceptable). The layer
 /// is allocated lazily (at the next draw) because draws go through the
-/// transient [`Canvas`](skia_rs_canvas::Canvas) layer machinery already. Returns the new save count,
-/// or 0 on failure (null canvas).
+/// transient [`Canvas`](skia_rs_canvas::Canvas) layer machinery already.
+///
+/// Returns the same value as `SkCanvas::saveLayer()` (and
+/// [`sk_canvas_save`]): the save count *before* this call in Skia's
+/// 1-based counting (1 for the first save, 2 for a nested one, ...).
+/// Returns 0 if `canvas` is null.
 ///
 /// **Pragmatic note:** because the FFI canvas reconstructs its underlying
 /// [`Canvas`](skia_rs_canvas::Canvas) between calls, the `layer_paint` / `layer_bounds` are tracked but
