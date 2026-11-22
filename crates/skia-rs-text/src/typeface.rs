@@ -234,15 +234,81 @@ pub struct Typeface {
     parsed: OnceLock<Option<ParsedTypeface>>,
 }
 
+/// Source of [`Typeface::unique_id`] values, shared by every constructor so
+/// that IDs never collide between typefaces created through different paths.
+static NEXT_TYPEFACE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+fn next_typeface_id() -> u32 {
+    NEXT_TYPEFACE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Well-known locations of each platform's default sans-serif font, in order
+/// of preference. Mirrors the families Skia's platform font managers resolve
+/// for a `nullptr` family name.
+fn system_default_font_candidates() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let mut paths = Vec::new();
+    if cfg!(target_os = "windows") {
+        let windir = std::env::var_os("WINDIR")
+            .or_else(|| std::env::var_os("SystemRoot"))
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        let fonts = windir.join("Fonts");
+        paths.extend(["segoeui.ttf", "arial.ttf", "tahoma.ttf"].map(|f| fonts.join(f)));
+    } else if cfg!(any(target_os = "macos", target_os = "ios")) {
+        paths.extend(
+            [
+                "/System/Library/Fonts/Helvetica.ttc",
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/Library/Fonts/Arial.ttf",
+                "/System/Library/Fonts/Geneva.ttf",
+            ]
+            .map(PathBuf::from),
+        );
+    } else if cfg!(target_os = "android") {
+        paths.extend(
+            [
+                "/system/fonts/Roboto-Regular.ttf",
+                "/system/fonts/DroidSans.ttf",
+            ]
+            .map(PathBuf::from),
+        );
+    } else {
+        // Linux / BSD: the common distro locations of DejaVu, Liberation and
+        // Noto Sans (the usual fontconfig `sans-serif` matches).
+        paths.extend(
+            [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+                "/usr/local/share/fonts/dejavu/DejaVuSans.ttf",
+            ]
+            .map(PathBuf::from),
+        );
+    }
+    paths
+}
+
 impl Typeface {
     /// Create a default typeface.
+    ///
+    /// This is a data-less placeholder: it reports plausible metrics and can
+    /// measure text, but it carries no glyph outlines, so drawing text with it
+    /// produces no pixels. It never touches the file system, which keeps it
+    /// deterministic. Use [`system_default`](Self::system_default) for a real
+    /// platform font.
+    #[must_use]
     pub fn default_typeface() -> Self {
-        static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-
         Self {
             family_name: "sans-serif".to_string(),
             style: FontStyle::NORMAL,
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id: next_typeface_id(),
             data: None,
             units_per_em: 2048,
             glyph_count: 256,
@@ -250,14 +316,50 @@ impl Typeface {
         }
     }
 
+    /// Load the platform's default sans-serif typeface from the installed
+    /// system fonts (`Segoe UI` / `Arial` on Windows, `Helvetica` on macOS,
+    /// `DejaVu Sans` / `Liberation Sans` / `Noto Sans` on Linux, `Roboto` on
+    /// Android).
+    ///
+    /// Corresponds to Skia's
+    /// `SkFontMgr::legacyMakeTypeface(nullptr, SkFontStyle())`. Unlike
+    /// [`default_typeface`](Self::default_typeface),
+    /// the result has real glyph outlines and renders visible text. The font
+    /// file is read once per process and shared between calls.
+    ///
+    /// Returns `None` when none of the well-known font files exists, e.g. in
+    /// a minimal container without fonts installed.
+    #[must_use]
+    pub fn system_default() -> Option<Self> {
+        static DATA: OnceLock<Option<Arc<Vec<u8>>>> = OnceLock::new();
+
+        let data = DATA
+            .get_or_init(|| {
+                system_default_font_candidates()
+                    .into_iter()
+                    .find_map(|path| {
+                        let bytes = std::fs::read(path).ok()?;
+                        ttf_parser::Face::parse(&bytes, 0).ok()?;
+                        Some(Arc::new(bytes))
+                    })
+            })
+            .clone()?;
+        Self::from_shared_data(data)
+    }
+
     /// Create a typeface from font data.
     ///
     /// The data is parsed with `ttf_parser` to extract real `units_per_em`,
     /// glyph count, family name, and style flags. Returns `None` if the data
     /// is not a valid OpenType/TrueType font (or collection, index 0).
+    #[must_use]
     pub fn from_data(data: Vec<u8>) -> Option<Self> {
-        static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+        Self::from_shared_data(Arc::new(data))
+    }
 
+    /// Shared implementation of [`from_data`](Self::from_data) that takes
+    /// already reference-counted bytes, so cached font files are not copied.
+    fn from_shared_data(data: Arc<Vec<u8>>) -> Option<Self> {
         if data.len() < 12 {
             return None;
         }
@@ -291,8 +393,8 @@ impl Typeface {
                 width,
                 slant,
             },
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            data: Some(Arc::new(data)),
+            id: next_typeface_id(),
+            data: Some(data),
             units_per_em,
             glyph_count,
             parsed: OnceLock::new(),
@@ -472,6 +574,37 @@ mod tests {
         assert_eq!(tf.family_name(), "sans-serif");
         assert!(!tf.is_bold());
         assert!(!tf.is_italic());
+    }
+
+    #[test]
+    fn test_unique_ids_do_not_collide_across_constructors() {
+        let font = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/demo.ttf"
+        ))
+        .expect("demo.ttf fixture (git lfs pull)");
+        let ids = [
+            Typeface::default_typeface().unique_id(),
+            Typeface::from_data(font.clone()).unwrap().unique_id(),
+            Typeface::default_typeface().unique_id(),
+            Typeface::from_data(font).unwrap().unique_id(),
+        ];
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "duplicate typeface ids: {ids:?}");
+    }
+
+    #[test]
+    fn test_system_default_has_real_glyphs_when_available() {
+        // Machines without any of the well-known fonts (minimal containers)
+        // legitimately get `None`; everywhere else the typeface must carry
+        // real outlines, unlike the data-less `default_typeface`.
+        let Some(tf) = Typeface::system_default() else {
+            return;
+        };
+        assert!(tf.glyph_count() > 0);
+        assert_ne!(tf.char_to_glyph('A'), 0, "system font must map 'A'");
+        let again = Typeface::system_default().expect("cached font stays available");
+        assert_ne!(tf.unique_id(), again.unique_id());
     }
 
     #[test]

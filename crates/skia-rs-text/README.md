@@ -14,21 +14,27 @@ Text layout and rendering for [skia-rs](https://github.com/quinnjr/skia-rs), a p
 ## Usage
 
 ```rust
-use skia_rs_text::{Font, Typeface, TextBlobBuilder};
+use skia_rs_core::Point;
+use skia_rs_text::{Font, TextBlobBuilder, Typeface};
+use std::sync::Arc;
 
-// Create a font
-let typeface = Typeface::default_typeface();
-let font = Font::new(typeface, 24.0);
+// Load the platform's default sans-serif font (Segoe UI, Helvetica,
+// DejaVu Sans, ...). `Typeface::default_typeface()` is a data-less
+// placeholder that can measure text but draws no glyphs, so it is only a
+// fallback for systems without fonts. `Typeface::from_data` loads any
+// TTF/OTF file you ship yourself.
+let typeface = Typeface::system_default().unwrap_or_else(Typeface::default_typeface);
+let font = Font::new(Arc::new(typeface), 24.0);
 
-// Shape text into glyphs
+// Map text to glyphs
 let glyphs = font.text_to_glyphs("Hello, world!");
 
 // Build a text blob
 let mut builder = TextBlobBuilder::new();
-builder.alloc_run(&font, glyphs.len(), 0.0, 0.0);
-let blob = builder.build();
+builder.add_text("Hello, world!", &font, Point::zero());
+let blob = builder.build().expect("non-empty blob");
 
-// Draw with canvas
+// Draw with a canvas (skia-rs-canvas, `text` feature)
 canvas.draw_text_blob(&blob, 100.0, 100.0, &paint);
 ```
 
