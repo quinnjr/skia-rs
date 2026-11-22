@@ -842,9 +842,35 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Rasterize `path`, applying the paint's path effect the way Skia's
+    /// `skpathutils::FillPathWithPaint` does: filter through the paint's
+    /// stroke record, and draw the result (or the source, if the effect
+    /// fails) with the record as the effect left it.
+    fn rasterize_path(&mut self, path: &Path, paint: &Paint) {
+        let Some(effect) = paint.path_effect() else {
+            self.with_rasterizer(|raster| raster.draw_path(path, paint));
+            return;
+        };
+        let mut rec = stroke_rec_from_paint(paint);
+        let filtered = effect.filter_path(path, &mut rec);
+        let final_path = filtered.as_ref().unwrap_or(path);
+        let styled = paint_with_stroke_rec(paint, rec);
+        let styled = styled.as_ref().unwrap_or(paint);
+        self.with_rasterizer(|raster| raster.draw_path(final_path, styled));
+    }
+
     /// Draw a rectangle.
+    ///
+    /// With a path effect, the rectangle is drawn as a path (starting at the
+    /// top-left corner, clockwise, like `SkPath::addRect`) so the effect
+    /// applies, as in Skia.
     pub fn draw_rect(&mut self, rect: &Rect, paint: &Paint) {
         match &mut self.backing {
+            Backing::Raster(_) if paint.path_effect().is_some() => {
+                let mut b = skia_rs_path::PathBuilder::new();
+                b.add_rect(rect);
+                self.rasterize_path(&b.build(), paint);
+            }
             Backing::Raster(_) => {
                 self.with_rasterizer(|raster| raster.draw_rect(rect, paint));
             }
@@ -859,8 +885,16 @@ impl<'a> Canvas<'a> {
     }
 
     /// Draw an oval.
+    ///
+    /// With a path effect, the oval is drawn as a path (starting at 3
+    /// o'clock, clockwise, like `SkPath::addOval`) so the effect applies.
     pub fn draw_oval(&mut self, rect: &Rect, paint: &Paint) {
         match &mut self.backing {
+            Backing::Raster(_) if paint.path_effect().is_some() => {
+                let mut b = skia_rs_path::PathBuilder::new();
+                b.add_oval(rect);
+                self.rasterize_path(&b.build(), paint);
+            }
             Backing::Raster(_) => {
                 self.with_rasterizer(|raster| raster.draw_oval(rect, paint));
             }
@@ -875,8 +909,16 @@ impl<'a> Canvas<'a> {
     }
 
     /// Draw a circle.
+    ///
+    /// With a path effect, the circle is drawn as a path (starting at 3
+    /// o'clock, clockwise, like `SkPath::addCircle`) so the effect applies.
     pub fn draw_circle(&mut self, center: Point, radius: Scalar, paint: &Paint) {
         match &mut self.backing {
+            Backing::Raster(_) if paint.path_effect().is_some() => {
+                let mut b = skia_rs_path::PathBuilder::new();
+                b.add_circle(center.x, center.y, radius);
+                self.rasterize_path(&b.build(), paint);
+            }
             Backing::Raster(_) => {
                 self.with_rasterizer(|raster| raster.draw_circle(center, radius, paint));
             }
@@ -906,7 +948,7 @@ impl<'a> Canvas<'a> {
                 // and the raster path matches the former RasterCanvas
                 // implementation.
                 let path = build_arc_path(oval, start_angle, sweep_angle, use_center);
-                self.with_rasterizer(|raster| raster.draw_path(&path, paint));
+                self.rasterize_path(&path, paint);
             }
             Backing::Recording(commands) => {
                 commands.push(DrawCommand::DrawArc {
@@ -926,7 +968,7 @@ impl<'a> Canvas<'a> {
         match &mut self.backing {
             Backing::Raster(_) => {
                 let path = build_round_rect_path(rect, rx, ry);
-                self.with_rasterizer(|raster| raster.draw_path(&path, paint));
+                self.rasterize_path(&path, paint);
             }
             Backing::Recording(commands) => {
                 commands.push(DrawCommand::DrawRoundRect {
@@ -959,21 +1001,7 @@ impl<'a> Canvas<'a> {
     /// [`StrokeRec`]: skia_rs_path::StrokeRec
     pub fn draw_path(&mut self, path: &Path, paint: &Paint) {
         match &mut self.backing {
-            Backing::Raster(_) => {
-                let Some(effect) = paint.path_effect() else {
-                    self.with_rasterizer(|raster| raster.draw_path(path, paint));
-                    return;
-                };
-                // skpathutils::FillPathWithPaint: filter through the paint's
-                // stroke record; on failure draw the source, but with the
-                // record as the effect left it.
-                let mut rec = stroke_rec_from_paint(paint);
-                let filtered = effect.filter_path(path, &mut rec);
-                let final_path = filtered.as_ref().unwrap_or(path);
-                let styled = paint_with_stroke_rec(paint, rec);
-                let styled = styled.as_ref().unwrap_or(paint);
-                self.with_rasterizer(|raster| raster.draw_path(final_path, styled));
-            }
+            Backing::Raster(_) => self.rasterize_path(path, paint),
             Backing::Recording(commands) => {
                 // Record the original path, like SkPicture: the paint still
                 // carries the effect, so playback applies it exactly once.
@@ -1466,6 +1494,41 @@ impl<'a> Canvas<'a> {
         paint: &Paint,
     ) {
         use skia_rs_paint::Style;
+        use skia_rs_path::StrokeRec;
+
+        if let Some(effect) = paint.path_effect() {
+            // Skia's scaler context applies the path effect to the glyph in
+            // glyph space, before positioning, so every instance of a glyph
+            // gets the same pattern regardless of where it is drawn. Fake
+            // bold is folded into the stroke record first
+            // (useStrokeForFakeBold), then the effect filters the outline.
+            let mut rec = stroke_rec_from_paint(paint);
+            if font.is_embolden() {
+                let extra = fake_bold_extra(font.size());
+                rec = match rec {
+                    StrokeRec::Fill => StrokeRec::StrokeAndFill(extra),
+                    StrokeRec::Hairline => StrokeRec::Stroke(extra),
+                    StrokeRec::Stroke(w) => StrokeRec::Stroke(w + extra),
+                    StrokeRec::StrokeAndFill(w) => StrokeRec::StrokeAndFill(w + extra),
+                };
+            }
+            let filtered = effect.filter_path(outline, &mut rec);
+            let glyph = filtered.as_ref().unwrap_or(outline);
+            // Draw with the record's style, and drop the effect so draw_path
+            // does not apply it a second time.
+            let (style, width) = match rec {
+                StrokeRec::Fill => (Style::Fill, paint.stroke_width()),
+                StrokeRec::Hairline => (Style::Stroke, 0.0),
+                StrokeRec::Stroke(w) => (Style::Stroke, w),
+                StrokeRec::StrokeAndFill(w) => (Style::StrokeAndFill, w),
+            };
+            let mut styled = paint.clone();
+            styled.set_style(style);
+            styled.set_stroke_width(width);
+            styled.set_path_effect(None);
+            self.draw_path(&glyph.transformed(&Matrix::translate(x, y)), &styled);
+            return;
+        }
 
         let path = outline.transformed(&Matrix::translate(x, y));
         if !font.is_embolden() {

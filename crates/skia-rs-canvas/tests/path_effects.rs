@@ -7,6 +7,9 @@ use skia_rs_path::{DashEffect, PathBuilder};
 use std::sync::Arc;
 
 const W: i32 = 120;
+
+/// A boxed drawing routine, for table-driven comparisons.
+type Draw<'a> = Box<dyn Fn(&mut Canvas<'_>) + 'a>;
 const H: i32 = 20;
 
 fn dashed_paint(intervals: Vec<f32>) -> Paint {
@@ -213,4 +216,125 @@ fn zero_length_line_draws_cap_dots_like_skia() {
         0,
         "butt caps draw nothing for a point"
     );
+}
+
+#[test]
+fn shapes_apply_path_effects_like_their_paths() {
+    // Skia draws rects/ovals/circles/round rects/arcs as paths when the
+    // paint has a path effect, so a dashed outline must match the dashed
+    // equivalent path exactly.
+    use skia_rs_core::Rect;
+
+    const SW: i32 = 120;
+    const SH: i32 = 120;
+    let paint = dashed_paint(vec![6.0, 4.0]);
+    let rect = Rect::from_xywh(10.0, 10.0, 100.0, 80.0);
+    let render = |draw: &dyn Fn(&mut Canvas<'_>)| {
+        let mut buffer = PixelBuffer::new(SW, SH);
+        draw(&mut Canvas::new_raster(&mut buffer));
+        (0..SH)
+            .flat_map(|y| (0..SW).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).unwrap_or(Color::BLACK).red())
+            .collect::<Vec<_>>()
+    };
+    let path_of = |build: &dyn Fn(&mut PathBuilder)| {
+        let mut b = PathBuilder::new();
+        build(&mut b);
+        b.build()
+    };
+
+    let rect_path = path_of(&|b| {
+        b.add_rect(&rect);
+    });
+    let oval_path = path_of(&|b| {
+        b.add_oval(&rect);
+    });
+    let circle_path = path_of(&|b| {
+        b.add_circle(60.0, 50.0, 40.0);
+    });
+
+    let cases: [(&str, Draw<'_>, Draw<'_>); 3] = [
+        (
+            "rect",
+            Box::new(|c| c.draw_rect(&rect, &paint)),
+            Box::new(|c| c.draw_path(&rect_path, &paint)),
+        ),
+        (
+            "oval",
+            Box::new(|c| c.draw_oval(&rect, &paint)),
+            Box::new(|c| c.draw_path(&oval_path, &paint)),
+        ),
+        (
+            "circle",
+            Box::new(|c| c.draw_circle(Point::new(60.0, 50.0), 40.0, &paint)),
+            Box::new(|c| c.draw_path(&circle_path, &paint)),
+        ),
+    ];
+    for (name, shape, path) in &cases {
+        let shape_pixels = render(shape.as_ref());
+        let path_pixels = render(path.as_ref());
+        assert!(shape_pixels.iter().any(|&r| r > 0), "{name}: nothing drawn");
+        assert_eq!(
+            shape_pixels, path_pixels,
+            "{name}: dash must apply to the shape"
+        );
+    }
+
+    // Round rects and arcs already build paths: the dash must leave gaps.
+    let mut buffer = PixelBuffer::new(SW, SH);
+    Canvas::new_raster(&mut buffer).draw_round_rect(&rect, 12.0, 12.0, &paint);
+    let top_edge: Vec<bool> = (30..90).map(|x| lit(&buffer, x, 10)).collect();
+    assert!(top_edge.iter().any(|&l| l) && top_edge.iter().any(|&l| !l));
+}
+
+#[cfg(feature = "text")]
+#[test]
+fn glyph_path_effects_do_not_depend_on_glyph_position() {
+    // Skia applies the paint's path effect to each glyph in glyph space, so
+    // a lattice effect looks identical wherever the glyph is drawn.
+    use skia_rs_core::Matrix;
+    use skia_rs_path::Line2DEffect;
+    use skia_rs_text::{Font, Typeface};
+
+    const DEMO_TTF: &[u8] = include_bytes!("fixtures/demo.ttf");
+    let font = Font::new(
+        Arc::new(Typeface::from_data(DEMO_TTF.to_vec()).expect("parse demo.ttf")),
+        80.0,
+    );
+    let mut paint = Paint::new();
+    paint.set_color(Color::WHITE.into());
+    paint.set_path_effect(Some(Arc::new(
+        Line2DEffect::new(1.0, Matrix::scale(5.0, 5.0)).unwrap(),
+    )));
+
+    // Line2D with scale(5, 5) hatches horizontally every 5px, so shift the
+    // glyph vertically by 3px: a canvas-anchored hatch would no longer line
+    // up with the glyph, while a glyph-space hatch moves with it.
+    let (w, h) = (120, 110);
+    let render = |y: f32| {
+        let mut buffer = PixelBuffer::new(w, h);
+        Canvas::new_raster(&mut buffer).draw_glyphs(
+            &[1],
+            &[Point::zero()],
+            Point::new(10.0, y),
+            &font,
+            &paint,
+        );
+        buffer
+    };
+    let at_90 = render(90.0);
+    let at_93 = render(93.0);
+
+    let mut painted = 0;
+    for y in 0..h - 3 {
+        for x in 0..w {
+            let a = at_90.get_pixel(x, y).unwrap_or(Color::BLACK);
+            let b = at_93.get_pixel(x, y + 3).unwrap_or(Color::BLACK);
+            assert_eq!(a, b, "hatch differs at ({x},{y}) after a 3px shift");
+            if a.red() > 0 {
+                painted += 1;
+            }
+        }
+    }
+    assert!(painted > 0, "the hatched glyph must paint something");
 }
