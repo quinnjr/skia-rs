@@ -34,7 +34,7 @@ use skia_rs_paint::{BlendMode, Paint, Style};
 use skia_rs_path::PathBuilder;
 
 use crate::simd::mul_div_255_round;
-use skia_rs_path::{FillType, Path, PathElement};
+use skia_rs_path::{FillType, Path, PathElement, Verb};
 
 use crate::clip::ClipStack;
 
@@ -1210,11 +1210,10 @@ impl<'a> Rasterizer<'a> {
     fn stroke_path(&mut self, path: &Path, paint: &Paint) {
         // Positive widths always fill the stroke outline, even sub-pixel
         // ones. Skia's SkDrawTreatAsHairline instead draws thin AA strokes
-        // with its hairline blitters, but those support shaders, caps and
-        // single-coverage polylines; this rasterizer's hairlines do not.
-        // Filling the anti-aliased outline gives the same coverage while
-        // keeping the paint's shader/filters, the caps, and one blend per
-        // pixel.
+        // with its hairline blitters (modulating alpha by the width), which
+        // blend each polyline pixel once; this rasterizer's hairlines draw
+        // segment by segment. Filling the anti-aliased outline gives the
+        // same coverage while keeping the caps and one blend per pixel.
         if paint.stroke_width() > 0.0 {
             if let Some(outline) = stroke_outline(path, paint) {
                 self.fill_path(&outline, paint);
@@ -1287,7 +1286,9 @@ impl<'a> Rasterizer<'a> {
                 outset,
             })
         });
-        let elements: Vec<PathElement> = path.iter().collect();
+        // Lookahead (contour ends, closed contours) reads the verb array,
+        // which lines up one-to-one with the element iterator.
+        let verbs = path.verbs();
 
         let mut current = Point::zero();
         let mut contour_start = Point::zero();
@@ -1296,11 +1297,9 @@ impl<'a> Rasterizer<'a> {
         // Reused by every curve in the path (no per-segment allocation).
         let mut curve_points: Vec<Point> = Vec::new();
 
-        for (index, &element) in elements.iter().enumerate() {
-            let ends_contour = matches!(
-                elements.get(index + 1),
-                None | Some(PathElement::Move(_) | PathElement::Close)
-            );
+        for (index, element) in path.iter().enumerate() {
+            let ends_contour =
+                matches!(verbs.get(index + 1), None | Some(Verb::Move | Verb::Close));
             // Extend `pts` when this segment is capped (hair_path's
             // `!isClosed || degenerate` condition).
             let extend = |pts: &mut [Point]| {
@@ -1315,7 +1314,7 @@ impl<'a> Rasterizer<'a> {
                 PathElement::Move(p) => {
                     current = p;
                     contour_start = p;
-                    closed = contour_is_closed(&elements[index + 1..]);
+                    closed = contour_is_closed(verbs.get(index + 1..).unwrap_or_default());
                 }
                 PathElement::Line(p) => {
                     let mut pts = [current, p];
@@ -2074,17 +2073,12 @@ impl HairlineCaps {
     }
 }
 
-/// Whether the contour whose elements (after its `Move`) are `rest` ends with
-/// a `Close` (Skia's `is_next_contour_closed`).
-fn contour_is_closed(rest: &[PathElement]) -> bool {
-    for e in rest {
-        match e {
-            PathElement::Close => return true,
-            PathElement::Move(_) => return false,
-            _ => {}
-        }
-    }
-    false
+/// Whether the contour whose verbs (after its `Move`) are `rest` ends with a
+/// `Close` (Skia's `is_next_contour_closed`).
+fn contour_is_closed(rest: &[Verb]) -> bool {
+    rest.iter()
+        .find(|v| matches!(v, Verb::Move | Verb::Close))
+        .is_some_and(|v| *v == Verb::Close)
 }
 
 /// Maximum distance, in device pixels, between a conic and the polyline it is
