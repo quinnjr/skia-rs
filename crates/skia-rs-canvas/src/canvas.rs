@@ -872,8 +872,15 @@ impl<'a> Canvas<'a> {
     /// is singular or has perspective: mapping the clip's corners through a
     /// perspective inverse can cross the horizon (w <= 0), and their
     /// bounding box then no longer covers the visible area.
+    ///
+    /// Also `None` when the paint has a mask or image filter: those can move
+    /// or spread output from outside the clip into view (shadows, blurs),
+    /// so culled geometry could have been visible.
     fn local_cull(&self, paint: &Paint) -> Option<Rect> {
-        if self.total_matrix().has_perspective() {
+        if self.total_matrix().has_perspective()
+            || paint.mask_filter().is_some()
+            || paint.image_filter().is_some()
+        {
             return None;
         }
         let inverse = self.total_matrix().invert()?;

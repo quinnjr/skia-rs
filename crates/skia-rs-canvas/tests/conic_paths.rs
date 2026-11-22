@@ -942,3 +942,23 @@ fn draw_point_honors_width_and_anti_aliasing() {
         );
     }
 }
+
+#[test]
+fn hairline_draw_line_ignores_caps_like_skia_draw_points() {
+    // Skia blits drawLine/drawPoints hairlines with SkScan::HairLine (no
+    // cap extension); only hairline paths extend their ends for caps.
+    use skia_rs_core::Point;
+    use skia_rs_paint::StrokeCap;
+
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    paint.set_stroke_cap(StrokeCap::Square);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_line(
+        Point::new(10.2, 10.5),
+        Point::new(20.2, 10.5),
+        &paint,
+    );
+    assert!(lit(&buffer, 10, 10) && lit(&buffer, 19, 10));
+    assert!(!lit(&buffer, 20, 10), "no cap extension for draw_line");
+}

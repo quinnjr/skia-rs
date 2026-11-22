@@ -617,6 +617,11 @@ impl<'a> Rasterizer<'a> {
     /// the paint's stroke width, cap and join. A stroke width of zero is a
     /// hairline, drawn with Bresenham's algorithm (aliased) or Wu's
     /// algorithm (anti-aliased).
+    ///
+    /// A hairline (width 0) ignores the stroke cap, like Skia's
+    /// `drawLine`/`drawPoints`, which blit hairlines through `PtProcRec`'s
+    /// `bw_line_hair_proc` / `aa_line_hair_proc` (`SkScan::HairLine`).
+    /// Only hairline *paths* extend their ends for caps (`hair_path`).
     pub fn draw_line(&mut self, p0: Point, p1: Point, paint: &Paint) {
         if paint.stroke_width() > 0.0 {
             let mut b = PathBuilder::new();
@@ -966,7 +971,12 @@ impl<'a> Rasterizer<'a> {
         }
 
         // SkDraw::drawRect: an aliased hairline rect under a scale/translate
-        // CTM is blitted by SkScan::HairRect as a closed pixel frame.
+        // CTM is blitted by SkScan::HairRect as a closed pixel frame. Other
+        // hairline rects are four hairline segments, as in Skia:
+        // SkScan::AntiHairRect is a 5-point AntiHairLine polyline (drawn
+        // segment by segment, so AA corners blend twice there too), and a
+        // non-rect-preserving CTM goes through hair_path's per-segment
+        // HairLine.
         if !paint.is_anti_alias() && self.matrix.is_scale_translate() {
             self.hair_rect(rect, paint);
             return;
