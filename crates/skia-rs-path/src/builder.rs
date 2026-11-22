@@ -175,32 +175,66 @@ impl PathBuilder {
     }
 
     /// Add a rounded rectangle, like Skia's
-    /// `SkPath::addRoundRect(rect, rx, ry, SkPathDirection::kCW)`.
+    /// `SkPath::addRoundRect(rect, rx, ry, SkPathDirection::kCW)`:
+    /// `SkRRect::setRectXY` followed by `addRRect` with its default start
+    /// index 6.
     ///
-    /// Zero radii add a plain rectangle. Radii larger than half the rect are
-    /// scaled down together (`SkRRect::setRectXY`). Corners are exact
-    /// quarter-ellipse conics (weight `sqrt(2)/2`), and the contour starts at
-    /// `(left, bottom - ry)` going clockwise (`SkPath::addRRect`'s default
-    /// start index 6), so dashes and trims line up with Skia. When the radii
-    /// cover the whole rect, the result is an oval starting at the
-    /// left-middle point, as `addRRect` emits for an oval-type rrect.
+    /// - Negative radii add nothing.
+    /// - Non-finite radii are treated as zero.
+    /// - Radii larger than half the rect are scaled down together, clamped
+    ///   to the half-dimensions, and kept circular if they were equal.
+    /// - With zero radii (or an empty rect) the result is a rectangle
+    ///   starting at the bottom-left corner (`addRect` start index 3).
+    /// - When the radii cover the whole rect the result is an oval starting
+    ///   at the left-middle point (`addOval` start index 3).
+    /// - Otherwise the contour starts at `(left, bottom - ry)`.
+    ///
+    /// All contours run clockwise and corners are exact quarter-ellipse
+    /// conics (weight `sqrt(2)/2`), so dashes and trims line up with Skia.
     pub fn add_round_rect(&mut self, rect: &Rect, rx: Scalar, ry: Scalar) -> &mut Self {
         const W: Scalar = std::f32::consts::FRAC_1_SQRT_2;
 
-        if rx <= 0.0 || ry <= 0.0 || rect.is_empty() {
-            return self.add_rect(rect);
+        if rx < 0.0 || ry < 0.0 {
+            return self;
         }
 
-        let scale = (rect.width() / (2.0 * rx))
-            .min(rect.height() / (2.0 * ry))
-            .min(1.0);
-        let rx = rx * scale;
-        let ry = ry * scale;
-        let (l, t, r, b) = (rect.left, rect.top, rect.right, rect.bottom);
+        // SkRRect::setRectXY (on the sorted rect).
+        let (l, r) = (rect.left.min(rect.right), rect.left.max(rect.right));
+        let (t, b) = (rect.top.min(rect.bottom), rect.top.max(rect.bottom));
+        let (width, height) = (r - l, b - t);
+        let (half_w, half_h) = (f32::midpoint(-l, r), f32::midpoint(-t, b));
+        let (mut rx, mut ry) = if rx.is_finite() && ry.is_finite() {
+            (rx, ry)
+        } else {
+            (0.0, 0.0)
+        };
+        #[allow(
+            clippy::float_cmp,
+            reason = "SkRRect::setRectXY's exact wasCircular test"
+        )]
+        let was_circular = rx == ry;
+        if width < rx + rx || height < ry + ry {
+            let scale = (width / (rx + rx)).min(height / (ry + ry));
+            rx = (rx * scale).min(half_w);
+            ry = (ry * scale).min(half_h);
+            if was_circular {
+                rx = rx.min(ry);
+                ry = rx;
+            }
+        }
 
-        if 2.0 * rx >= rect.width() && 2.0 * ry >= rect.height() {
-            // An oval-type rrect: SkPath::addRRect emits addOval with start
-            // index 6 / 2 = 3, i.e. from the left-middle point, clockwise.
+        if rx <= 0.0 || ry <= 0.0 || width <= 0.0 || height <= 0.0 {
+            // Rect-type rrect: addRect with start index (6 + 1) / 2 = 3.
+            return self
+                .move_to(l, b)
+                .line_to(l, t)
+                .line_to(r, t)
+                .line_to(r, b)
+                .close();
+        }
+
+        if rx >= half_w && ry >= half_h {
+            // Oval-type rrect: addOval with start index 6 / 2 = 3.
             let (cx, cy) = (f32::midpoint(l, r), f32::midpoint(t, b));
             return self
                 .move_to(l, cy)
@@ -683,6 +717,38 @@ mod tests {
                 Verb::Close,
             ]
         );
+    }
+
+    #[test]
+    fn add_round_rect_handles_degenerate_radii_like_skia() {
+        let rect = Rect::from_xywh(0.0, 0.0, 40.0, 20.0);
+        let first = |rx: Scalar, ry: Scalar| {
+            let mut b = PathBuilder::new();
+            b.add_round_rect(&rect, rx, ry);
+            b.build().iter().next()
+        };
+
+        // Negative radii add nothing (SkPath::addRoundRect).
+        assert_eq!(first(-1.0, 5.0), None);
+
+        // Non-finite radii become 0: a rect from the bottom-left corner,
+        // with finite coordinates.
+        for (rx, ry) in [
+            (Scalar::INFINITY, 5.0),
+            (Scalar::NAN, 5.0),
+            (5.0, Scalar::INFINITY),
+        ] {
+            let mut b = PathBuilder::new();
+            b.add_round_rect(&rect, rx, ry);
+            let path = b.build();
+            assert_eq!(
+                path.iter().next(),
+                Some(PathElement::Move(Point::new(0.0, 20.0))),
+                "rx={rx} ry={ry}"
+            );
+            assert!(path.bounds().left.is_finite() && path.bounds().right.is_finite());
+            assert_eq!(path.verbs()[1..4], [Verb::Line, Verb::Line, Verb::Line]);
+        }
     }
 
     #[test]

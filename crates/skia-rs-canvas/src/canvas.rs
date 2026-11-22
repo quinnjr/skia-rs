@@ -2509,10 +2509,15 @@ pub enum VertexMode {
 // =============================================================================
 
 fn build_round_rect_path(rect: &Rect, rx: Scalar, ry: Scalar) -> Path {
-    // SkCanvas::drawRoundRect -> SkRRect::setRectXY -> SkPath::addRRect:
-    // uniform radius scaling, exact conic corners, and Skia's start point.
+    // SkCanvas::drawRoundRect: a plain drawRect unless both radii are
+    // positive, otherwise SkRRect::setRectXY -> SkPath::addRRect (uniform
+    // radius scaling, exact conic corners, and Skia's start point).
     let mut builder = skia_rs_path::PathBuilder::new();
-    builder.add_round_rect(rect, rx, ry);
+    if rx > 0.0 && ry > 0.0 {
+        builder.add_round_rect(rect, rx, ry);
+    } else {
+        builder.add_rect(rect);
+    }
     builder.build()
 }
 
