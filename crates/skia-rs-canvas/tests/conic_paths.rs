@@ -92,3 +92,43 @@ fn hairline_circle_path_stays_on_the_circle() {
     let (ox, oy) = diagonal(cx, cy, r + 4.0);
     assert!(!lit(&buffer, ox, oy), "no bulged hairline past r");
 }
+
+#[test]
+fn polygon_points_stroke_one_joined_path() {
+    // SkDraw::drawPoints(kPolygon) strokes one open path: the corner gets a
+    // miter join (not two butt caps leaving a notch) and the overlap of the
+    // two segments is blended once.
+    use skia_rs_canvas::PointMode;
+    use skia_rs_core::Point;
+    use skia_rs_paint::{StrokeCap, StrokeJoin};
+
+    let mut paint = Paint::new();
+    paint.set_color32(Color::from_argb(128, 255, 255, 255));
+    paint.set_style(Style::Stroke);
+    paint.set_stroke_width(10.0);
+    paint.set_stroke_cap(StrokeCap::Butt);
+    paint.set_stroke_join(StrokeJoin::Miter);
+
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_points(
+        PointMode::Polygon,
+        &[
+            Point::new(10.0, 20.0),
+            Point::new(100.0, 20.0),
+            Point::new(100.0, 110.0),
+        ],
+        &paint,
+    );
+
+    let red = |x, y| buffer.get_pixel(x, y).unwrap_or(Color::BLACK).red();
+    // Outer corner (x 100..105, y 15..20) is covered only by the miter join.
+    assert!(red(103, 17) > 0, "the corner must be mitered, not notched");
+    // Where the segments overlap, coverage must not be blended twice.
+    let overlap = red(98, 22);
+    let single = red(50, 20);
+    assert!(single > 0);
+    assert!(
+        overlap <= single.saturating_add(2),
+        "overlap blended twice: {overlap} vs single-coverage {single}"
+    );
+}
