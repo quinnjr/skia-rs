@@ -750,6 +750,11 @@ impl<'a> Canvas<'a> {
     /// Draw a point.
     pub fn draw_point(&mut self, pt: Point, paint: &Paint) {
         match &mut self.backing {
+            // SkCanvas::drawPoint is drawPoints(kPoints, 1): a positive
+            // stroke width draws a width-sized square or circle.
+            Backing::Raster(_) if paint.stroke_width() > 0.0 => {
+                self.draw_points(PointMode::Points, &[pt], paint);
+            }
             Backing::Raster(_) => {
                 self.with_rasterizer(|raster| raster.draw_point(pt, paint));
             }

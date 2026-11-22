@@ -578,15 +578,36 @@ impl<'a> Rasterizer<'a> {
         reason = "point/paint mirrors SkCanvas::drawPoint's (SkPoint, SkPaint) parameter names"
     )]
     pub fn draw_point(&mut self, point: Point, paint: &Paint) {
-        use skia_rs_core::cast::round_to_i32;
-        // The pixel containing the point (Skia's bw_pt_hair_proc floors):
-        // pixel i spans [i, i+1), matching the hairline line rasterizers.
-        let transformed = self.matrix.map_point(point);
-        let x = round_to_i32(transformed.x - 0.5);
-        let y = round_to_i32(transformed.y - 0.5);
-
+        use skia_rs_core::cast::floor_to_i32;
+        let device = self.matrix.map_point(point);
+        if !(device.x.is_finite() && device.y.is_finite()) {
+            return;
+        }
         let source = self.make_source(paint);
-        self.blit_pixel_cov(x, y, 255, &source, paint.blend_mode());
+        let blend_mode = paint.blend_mode();
+        if !paint.is_anti_alias() {
+            // The pixel containing the point (bw_pt_hair_proc floors).
+            let (x, y) = (floor_to_i32(device.x), floor_to_i32(device.y));
+            self.blit_pixel_cov(x, y, 255, &source, blend_mode);
+            return;
+        }
+        // aa_square_proc: an anti-aliased 1x1 square centered on the point,
+        // covering up to four pixels by area.
+        let (left, top) = (device.x - 0.5, device.y - 0.5);
+        let (x0, y0) = (floor_to_i32(left), floor_to_i32(top));
+        let (fx, fy) = (left - left.floor(), top - top.floor());
+        for (dy, wy) in [(0, 1.0 - fy), (1, fy)] {
+            for (dx, wx) in [(0, 1.0 - fx), (1, fx)] {
+                let coverage = skia_rs_core::cast::f32_to_u8_sat((wx * wy * 255.0).round());
+                self.blit_pixel_cov(
+                    x0.saturating_add(dx),
+                    y0.saturating_add(dy),
+                    coverage,
+                    &source,
+                    blend_mode,
+                );
+            }
+        }
     }
 
     /// Draw a line segment.
@@ -623,7 +644,9 @@ impl<'a> Rasterizer<'a> {
     fn draw_line_aliased(&mut self, p0: Point, p1: Point, paint: &Paint) {
         use skia_rs_core::cast::{floor_to_i32, scalar_from_i32};
 
-        let (mut start, mut end) = (self.matrix.map_point(p0), self.matrix.map_point(p1));
+        let Some((mut start, mut end)) = self.device_segment(p0, p1) else {
+            return;
+        };
         let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
         let horizontal = (end.x - start.x).abs() > (end.y - start.y).abs();
@@ -654,7 +677,7 @@ impl<'a> Rasterizer<'a> {
         }
         let slope = (end.y - start.y) / (end.x - start.x);
         // Minor-axis value at the center of the first pixel.
-        let mut minor = slope.mul_add(scalar_from_i32(first) + 0.5 - start.x, start.y);
+        let mut minor = slope * (scalar_from_i32(first) + 0.5 - start.x) + start.y;
         for major in first..past_last {
             let row = floor_to_i32(minor);
             let (x, y) = if horizontal {
@@ -677,8 +700,9 @@ impl<'a> Rasterizer<'a> {
         // Wu's algorithm assumes pixel i is centered at i; Skia's pixel
         // centers are at i + 0.5. Shift by half a pixel so a line at
         // y = 50.5 lands entirely on row 50 (SkScan_Antihair).
-        let t0 = self.matrix.map_point(p0);
-        let t1 = self.matrix.map_point(p1);
+        let Some((t0, t1)) = self.device_segment(p0, p1) else {
+            return;
+        };
 
         let mut x0 = t0.x - 0.5;
         let mut y0 = t0.y - 0.5;
@@ -711,27 +735,8 @@ impl<'a> Rasterizer<'a> {
         let yend = y0 + gradient * (xend - x0);
         let xgap = 1.0 - fpart(x0 + 0.5);
         let xpxl1 = floor_to_i32(xend);
-        let ypxl1 = floor_to_i32(yend);
 
-        if steep {
-            self.plot_aa(
-                ypxl1,
-                xpxl1,
-                (1.0 - fpart(yend)) * xgap,
-                &source,
-                blend_mode,
-            );
-            self.plot_aa(ypxl1 + 1, xpxl1, fpart(yend) * xgap, &source, blend_mode);
-        } else {
-            self.plot_aa(
-                xpxl1,
-                ypxl1,
-                (1.0 - fpart(yend)) * xgap,
-                &source,
-                blend_mode,
-            );
-            self.plot_aa(xpxl1, ypxl1 + 1, fpart(yend) * xgap, &source, blend_mode);
-        }
+        self.plot_wu_endpoint(steep, xpxl1, yend, xgap, &source, blend_mode);
 
         let mut intery = yend + gradient;
 
@@ -740,27 +745,8 @@ impl<'a> Rasterizer<'a> {
         let yend = y1 + gradient * (xend - x1);
         let xgap = fpart(x1 + 0.5);
         let xpxl2 = floor_to_i32(xend);
-        let ypxl2 = floor_to_i32(yend);
 
-        if steep {
-            self.plot_aa(
-                ypxl2,
-                xpxl2,
-                (1.0 - fpart(yend)) * xgap,
-                &source,
-                blend_mode,
-            );
-            self.plot_aa(ypxl2 + 1, xpxl2, fpart(yend) * xgap, &source, blend_mode);
-        } else {
-            self.plot_aa(
-                xpxl2,
-                ypxl2,
-                (1.0 - fpart(yend)) * xgap,
-                &source,
-                blend_mode,
-            );
-            self.plot_aa(xpxl2, ypxl2 + 1, fpart(yend) * xgap, &source, blend_mode);
-        }
+        self.plot_wu_endpoint(steep, xpxl2, yend, xgap, &source, blend_mode);
 
         // Main loop, limited to the device along the major axis.
         let extent = if steep {
@@ -768,22 +754,66 @@ impl<'a> Rasterizer<'a> {
         } else {
             self.buffer.width
         };
-        let (first, past_last) = ((xpxl1 + 1).max(0), xpxl2.min(extent));
-        intery = gradient.mul_add(scalar_from_i32(first - (xpxl1 + 1)), intery);
+        let (first, past_last) = (xpxl1.saturating_add(1).max(0), xpxl2.min(extent));
+        // Re-base `intery` to `first` (in floating point: the integer gap
+        // can exceed i32 for far-off lines).
+        intery += gradient * (scalar_from_i32(first) - scalar_from_i32(xpxl1) - 1.0);
         if steep {
             for x in first..past_last {
                 let y = floor_to_i32(intery);
                 self.plot_aa(y, x, 1.0 - fpart(intery), &source, blend_mode);
-                self.plot_aa(y + 1, x, fpart(intery), &source, blend_mode);
+                self.plot_aa(y.saturating_add(1), x, fpart(intery), &source, blend_mode);
                 intery += gradient;
             }
         } else {
             for x in first..past_last {
                 let y = floor_to_i32(intery);
                 self.plot_aa(x, y, 1.0 - fpart(intery), &source, blend_mode);
-                self.plot_aa(x, y + 1, fpart(intery), &source, blend_mode);
+                self.plot_aa(x, y.saturating_add(1), fpart(intery), &source, blend_mode);
                 intery += gradient;
             }
+        }
+    }
+
+    /// The hairline `p0`-`p1` mapped to device space and clipped to the
+    /// device (outset by two pixels, so clipped ends stay off-device), as
+    /// Skia clips lines before rasterizing them (`SkLineClipper`). This
+    /// keeps far-off endpoints from saturating pixel indices or losing f32
+    /// precision. `None` when the segment misses the device or is not
+    /// finite.
+    fn device_segment(&self, p0: Point, p1: Point) -> Option<(Point, Point)> {
+        let (a, b) = (self.matrix.map_point(p0), self.matrix.map_point(p1));
+        let bounds = (
+            -2.0,
+            -2.0,
+            f64::from(self.buffer.width) + 2.0,
+            f64::from(self.buffer.height) + 2.0,
+        );
+        clip_segment(a, b, bounds)
+    }
+
+    /// Plot one Wu endpoint: the pixel pair straddling `yend` in column
+    /// `major` (rows and columns swapped for steep lines), weighted by the
+    /// endpoint's horizontal gap coverage `xgap`.
+    fn plot_wu_endpoint(
+        &mut self,
+        steep: bool,
+        major: i32,
+        yend: Scalar,
+        xgap: Scalar,
+        source: &PixelSource<'_>,
+        blend_mode: BlendMode,
+    ) {
+        use skia_rs_core::cast::floor_to_i32;
+        let minor = floor_to_i32(yend);
+        let frac = yend - yend.floor();
+        let (near, far) = ((1.0 - frac) * xgap, frac * xgap);
+        if steep {
+            self.plot_aa(minor, major, near, source, blend_mode);
+            self.plot_aa(minor.saturating_add(1), major, far, source, blend_mode);
+        } else {
+            self.plot_aa(major, minor, near, source, blend_mode);
+            self.plot_aa(major, minor.saturating_add(1), far, source, blend_mode);
         }
     }
 
@@ -987,6 +1017,10 @@ impl<'a> Rasterizer<'a> {
 
     /// Draw a rectangle (filled or stroked based on paint style).
     pub fn draw_rect(&mut self, rect: &Rect, paint: &Paint) {
+        // SkCanvas::drawRect quick-rejects rects with non-finite edges.
+        if !rect.is_finite() {
+            return;
+        }
         match paint.style() {
             Style::Fill => self.fill_rect(rect, paint),
             Style::Stroke => self.stroke_rect(rect, paint),
@@ -1024,7 +1058,7 @@ impl<'a> Rasterizer<'a> {
             if dy.abs() > r {
                 continue;
             }
-            let half = r.mul_add(r, -(dy * dy)).sqrt();
+            let half = (r * r - dy * dy).sqrt();
             let x0 = round_to_i32(tc.x - half);
             let x1 = round_to_i32(tc.x + half);
             self.blit_span(x0, x1, y, &source, blend_mode);
@@ -1099,7 +1133,7 @@ impl<'a> Rasterizer<'a> {
                         // Calculate distance from pixel center to circle center
                         let dx = scalar_from_i32(px) + 0.5 - cx;
                         let dy = scalar_from_i32(py) + 0.5 - cy;
-                        let dist_sq = dx.mul_add(dx, dy * dy);
+                        let dist_sq = dx * dx + dy * dy;
 
                         // Calculate coverage using smoothstep
                         let dist = dist_sq.sqrt();
@@ -1131,7 +1165,7 @@ impl<'a> Rasterizer<'a> {
                             clippy::imprecise_flops,
                             reason = "per-pixel hot loop: hypot is markedly slower and its overflow guarding is unnecessary for pixel-space distances"
                         )]
-                        let dist = dx.mul_add(dx, dy * dy).sqrt();
+                        let dist = (dx * dx + dy * dy).sqrt();
 
                         let outer_coverage = if dist <= outer_r - 0.5 {
                             1.0
@@ -1532,9 +1566,8 @@ impl<'a> Rasterizer<'a> {
                     for x in px_start..px_end {
                         let l = scalar_from_i32(x).max(x0);
                         let r = scalar_from_i32(x + 1).min(x1);
-                        coverage[usize::try_from(x - clip_x0).unwrap_or(0)] = (r - l)
-                            .max(0.0)
-                            .mul_add(0.25, coverage[usize::try_from(x - clip_x0).unwrap_or(0)]);
+                        coverage[usize::try_from(x - clip_x0).unwrap_or(0)] +=
+                            (r - l).max(0.0) * 0.25;
                     }
                 }
             }
@@ -1683,7 +1716,7 @@ impl Edge {
     /// Calculate x intersection at a given scanline y.
     #[inline]
     fn x_at(&self, y: f32) -> f32 {
-        (y - self.y_min).mul_add(self.inv_slope, self.x_at_y_min)
+        (y - self.y_min) * self.inv_slope + self.x_at_y_min
     }
 
     /// Check if this edge is active at the given scanline.
@@ -1886,29 +1919,23 @@ impl ActiveEdgeTable {
     }
 }
 
-/// Quadratic Bezier point at parameter `t` (`mt` = 1 - t), as separable
-/// `mul_add` chains: `p0*mt^2 + 2*p1*mt*t + p2*t^2`.
+/// Quadratic Bezier point at parameter `t` (`mt` = 1 - t):
+/// `p0*mt^2 + 2*p1*mt*t + p2*t^2`.
 fn quad_point(t: Scalar, mt: Scalar, p0: Point, p1: Point, p2: Point) -> Point {
     Point::new(
-        (t * t).mul_add(p2.x, (2.0 * mt * t).mul_add(p1.x, mt * mt * p0.x)),
-        (t * t).mul_add(p2.y, (2.0 * mt * t).mul_add(p1.y, mt * mt * p0.y)),
+        mt * mt * p0.x + 2.0 * mt * t * p1.x + t * t * p2.x,
+        mt * mt * p0.y + 2.0 * mt * t * p1.y + t * t * p2.y,
     )
 }
 
-/// Cubic Bezier point at parameter `t` (`mt` = 1 - t), as separable `mul_add`
-/// chains: `p0*mt^3 + 3*p1*mt^2*t + 3*p2*mt*t^2 + p3*t^3`.
+/// Cubic Bezier point at parameter `t` (`mt` = 1 - t):
+/// `p0*mt^3 + 3*p1*mt^2*t + 3*p2*mt*t^2 + p3*t^3`.
 fn cubic_point(t: Scalar, mt: Scalar, p0: Point, p1: Point, p2: Point, p3: Point) -> Point {
     let mt2 = mt * mt;
     let t2 = t * t;
     Point::new(
-        (t2 * t).mul_add(
-            p3.x,
-            (3.0 * mt * t2).mul_add(p2.x, (mt2 * mt).mul_add(p0.x, 3.0 * mt2 * t * p1.x)),
-        ),
-        (t2 * t).mul_add(
-            p3.y,
-            (3.0 * mt * t2).mul_add(p2.y, (mt2 * mt).mul_add(p0.y, 3.0 * mt2 * t * p1.y)),
-        ),
+        mt2 * mt * p0.x + 3.0 * mt2 * t * p1.x + 3.0 * mt * t2 * p2.x + t2 * t * p3.x,
+        mt2 * mt * p0.y + 3.0 * mt2 * t * p1.y + 3.0 * mt * t2 * p2.y + t2 * t * p3.y,
     )
 }
 
@@ -1988,11 +2015,8 @@ fn flatten_curve_device_error(
         // bulging to both sides of it.
         let mut max_dev_sq: Scalar = 0.0;
         for f in [0.25, 0.5, 0.75] {
-            let p = matrix.map_point(eval((t1 - t0).mul_add(f, t0)));
-            let (cx, cy) = (
-                (d1.x - d0.x).mul_add(f, d0.x),
-                (d1.y - d0.y).mul_add(f, d0.y),
-            );
+            let p = matrix.map_point(eval((t1 - t0) * f + t0));
+            let (cx, cy) = ((d1.x - d0.x) * f + d0.x, (d1.y - d0.y) * f + d0.y);
             let (dx, dy) = (p.x - cx, p.y - cy);
             max_dev_sq = max_dev_sq.max(dx * dx + dy * dy);
         }
@@ -2007,6 +2031,56 @@ fn flatten_curve_device_error(
             len += 2;
         }
     }
+}
+
+/// Liang-Barsky clip of the segment `a`-`b` to `(left, top, right, bottom)`,
+/// computed in f64 so endpoints far outside the device keep the visible
+/// part precise. `None` when the segment is outside or not finite.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "clipped coordinates lie within the device bounds, so they fit f32"
+)]
+fn clip_segment(a: Point, b: Point, bounds: (f64, f64, f64, f64)) -> Option<(Point, Point)> {
+    let (left, top, right, bottom) = bounds;
+    let (ax, ay, bx, by) = (
+        f64::from(a.x),
+        f64::from(a.y),
+        f64::from(b.x),
+        f64::from(b.y),
+    );
+    if !(ax.is_finite() && ay.is_finite() && bx.is_finite() && by.is_finite()) {
+        return None;
+    }
+    let (dx, dy) = (bx - ax, by - ay);
+    let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+    for (p, q) in [
+        (-dx, ax - left),
+        (dx, right - ax),
+        (-dy, ay - top),
+        (dy, bottom - ay),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None;
+            }
+        } else {
+            let r = q / p;
+            if p < 0.0 {
+                t0 = t0.max(r);
+            } else {
+                t1 = t1.min(r);
+            }
+        }
+    }
+    if t0 > t1 {
+        return None;
+    }
+    let at = |t: f64| Point::new((ax + t * dx) as Scalar, (ay + t * dy) as Scalar);
+    // Unclipped ends are returned exactly.
+    Some((
+        if t0 > 0.0 { at(t0) } else { a },
+        if t1 < 1.0 { at(t1) } else { b },
+    ))
 }
 
 /// Cap extension for hairline segments (Skia's `extend_pts`), applied in
@@ -2036,8 +2110,8 @@ impl HairlineCaps {
         let dev = &mut dev[..n];
         let outset = self.outset;
         let push = |p: &mut Point, (tx, ty): (Scalar, Scalar)| {
-            p.x = tx.mul_add(outset, p.x);
-            p.y = ty.mul_add(outset, p.y);
+            p.x += tx * outset;
+            p.y += ty * outset;
         };
         let unit = |from: Point, to: Point| {
             let (dx, dy) = (from.x - to.x, from.y - to.y);

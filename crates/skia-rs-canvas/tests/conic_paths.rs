@@ -858,3 +858,87 @@ fn aliased_hairline_circle_respects_the_clip() {
         "right side outside the clip is not"
     );
 }
+
+#[test]
+fn negative_weight_conic_fills_finitely() {
+    // conic_to(w = -1) degrades to a line (SkPath::conicTo), so the fill is
+    // the triangle (0,0)-(100,100)-(0,100) rather than inf/NaN edges.
+    let mut b = PathBuilder::new();
+    b.move_to(0.0, 0.0)
+        .conic_to(150.0, 0.0, 100.0, 100.0, -1.0)
+        .line_to(0.0, 100.0)
+        .close();
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_path(&b.build(), &white(Style::Fill));
+    assert!(lit(&buffer, 20, 80), "inside the triangle");
+    assert!(!lit(&buffer, 80, 20), "outside the triangle");
+    assert!(!lit(&buffer, 150, 150), "nothing spills to the device");
+}
+
+#[test]
+fn antialiased_hairline_with_endpoints_beyond_i32_does_not_overflow() {
+    // y = x / 4 through the origin: it crosses the device, but its
+    // endpoints' minor coordinates (|y| = 4e9, exact in f32) saturate pixel
+    // indices to i32::MIN/MAX. That must not overflow, and the visible
+    // part must still land on the line.
+    use skia_rs_core::Point;
+
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    paint.set_anti_alias(true);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_line(
+        Point::new(-1.6e10, -4e9),
+        Point::new(1.6e10, 4e9),
+        &paint,
+    );
+    // Pixel centers (100.5, y + 0.5): the line is at y = 25.125 there.
+    assert!(
+        lit(&buffer, 100, 24) || lit(&buffer, 100, 25),
+        "on the line"
+    );
+    assert!(!lit(&buffer, 100, 60), "nowhere else");
+}
+#[test]
+fn non_finite_rects_are_rejected() {
+    // SkCanvas quick-rejects non-finite rects instead of drawing to the
+    // device edge.
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    let mut canvas = Canvas::new_raster(&mut buffer);
+    canvas.draw_rect(&Rect::new(10.0, 10.0, f32::INFINITY, 20.0), &paint);
+    canvas.draw_rect(&Rect::new(10.0, f32::NAN, 20.0, 20.0), &white(Style::Fill));
+    for x in 0..SIZE {
+        for y in 0..30 {
+            assert!(!lit(&buffer, x, y), "({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn draw_point_honors_width_and_anti_aliasing() {
+    use skia_rs_core::Point;
+
+    // drawPoint is drawPoints(kPoints, 1): a 10-wide square.
+    let mut wide = white(Style::Stroke);
+    wide.set_stroke_width(10.0);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_point(Point::new(50.0, 50.0), &wide);
+    assert!(lit(&buffer, 46, 46) && lit(&buffer, 53, 53), "square drawn");
+    assert!(!lit(&buffer, 56, 50), "nothing past the square");
+
+    // An AA hairline point covers a 1x1 square: four pixels at a quarter.
+    let mut aa = white(Style::Stroke);
+    aa.set_stroke_width(0.0);
+    aa.set_anti_alias(true);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_point(Point::new(10.0, 10.0), &aa);
+    for (x, y) in [(9, 9), (10, 9), (9, 10), (10, 10)] {
+        let red = buffer.get_pixel(x, y).unwrap_or(Color::BLACK).red();
+        assert!(
+            (50..=80).contains(&red),
+            "({x}, {y}) quarter coverage: {red}"
+        );
+    }
+}
