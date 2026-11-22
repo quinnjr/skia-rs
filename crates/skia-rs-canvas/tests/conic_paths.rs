@@ -689,3 +689,77 @@ fn capped_hairlines_extend_to_cover_their_end_pixel() {
         "round cap covers the end"
     );
 }
+
+#[test]
+fn aliased_hairline_rect_is_a_closed_frame() {
+    // SkScan::HairRect covers floor(left)..=floor(right) and
+    // floor(top)..=floor(bottom), all four corners included.
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_rect(&Rect::new(10.0, 10.0, 20.0, 20.0), &paint);
+    for (x, y) in [(10, 10), (20, 10), (10, 20), (20, 20), (15, 10), (20, 15)] {
+        assert!(lit(&buffer, x, y), "frame pixel ({x}, {y})");
+    }
+    assert!(!lit(&buffer, 15, 15), "interior stays empty");
+    assert!(!lit(&buffer, 21, 20), "nothing past the frame");
+}
+
+#[test]
+fn zero_length_capped_hairline_draws_a_dot() {
+    // extend_pts moves a degenerate segment's ends apart horizontally, so a
+    // round- or square-capped zero-length hairline still draws a pixel.
+    use skia_rs_paint::StrokeCap;
+
+    for cap in [StrokeCap::Round, StrokeCap::Square] {
+        let mut paint = white(Style::Stroke);
+        paint.set_stroke_width(0.0);
+        paint.set_stroke_cap(cap);
+        let mut b = PathBuilder::new();
+        b.move_to(30.5, 30.5).line_to(30.5, 30.5);
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        Canvas::new_raster(&mut buffer).draw_path(&b.build(), &paint);
+        assert!(lit(&buffer, 30, 30), "{cap:?} cap draws a dot");
+    }
+}
+
+#[test]
+fn hairline_caps_extend_in_device_space() {
+    // Under scale(10, 1) a vertical square-capped hairline must still reach
+    // half a *device* pixel past its end (Skia extends after mapping).
+    use skia_rs_paint::StrokeCap;
+
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    paint.set_stroke_cap(StrokeCap::Square);
+    let mut b = PathBuilder::new();
+    b.move_to(5.05, 40.2).line_to(5.05, 60.2);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    let mut canvas = Canvas::new_raster(&mut buffer);
+    canvas.scale(10.0, 1.0);
+    canvas.draw_path(&b.build(), &paint);
+    assert!(lit(&buffer, 50, 60), "the square cap covers device row 60");
+}
+
+#[test]
+fn far_off_hairlines_only_walk_the_device() {
+    // A hairline spanning +-1e9 must finish promptly (the walk is clipped to
+    // the device) and still draw its visible part.
+    use skia_rs_core::Point;
+
+    for anti_alias in [false, true] {
+        let mut paint = white(Style::Stroke);
+        paint.set_stroke_width(0.0);
+        paint.set_anti_alias(anti_alias);
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        Canvas::new_raster(&mut buffer).draw_line(
+            Point::new(-1e9, 70.5),
+            Point::new(1e9, 70.5),
+            &paint,
+        );
+        assert!(
+            lit(&buffer, 100, 70),
+            "visible part drawn (aa = {anti_alias})"
+        );
+    }
+}

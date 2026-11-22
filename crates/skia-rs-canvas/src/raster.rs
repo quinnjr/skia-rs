@@ -651,6 +651,17 @@ impl<'a> Rasterizer<'a> {
         if first >= past_last {
             return; // too short to draw
         }
+        // Only walk the part of the major axis inside the device (Skia clips
+        // the line before HairLineRgn), so far-off lines cost nothing.
+        let extent = if horizontal {
+            self.buffer.width
+        } else {
+            self.buffer.height
+        };
+        let (first, past_last) = (first.max(0), past_last.min(extent));
+        if first >= past_last {
+            return;
+        }
         let slope = (end.y - start.y) / (end.x - start.x);
         // Minor-axis value at the center of the first pixel.
         let mut minor = slope.mul_add(scalar_from_i32(first) + 0.5 - start.x, start.y);
@@ -674,7 +685,7 @@ impl<'a> Rasterizer<'a> {
 
     /// Draw line with anti-aliasing using Wu's algorithm.
     fn draw_line_aa(&mut self, p0: Point, p1: Point, paint: &Paint) {
-        use skia_rs_core::cast::floor_to_i32;
+        use skia_rs_core::cast::{floor_to_i32, scalar_from_i32};
         // Fractional part in [0, 1) for negative values too
         // (`f32::fract` is negative below zero, which the half-pixel
         // shift below produces near the top/left edges).
@@ -710,7 +721,9 @@ impl<'a> Rasterizer<'a> {
         let gradient = if dx.abs() < 0.0001 { 1.0 } else { dy / dx };
 
         // Handle first endpoint
-        let xend = x0.round();
+        // Round half up, so endpoints are translation-consistent across
+        // zero (`f32::round` rounds half away from zero).
+        let xend = (x0 + 0.5).floor();
         let yend = y0 + gradient * (xend - x0);
         let xgap = 1.0 - fpart(x0 + 0.5);
         let xpxl1 = floor_to_i32(xend);
@@ -727,7 +740,7 @@ impl<'a> Rasterizer<'a> {
         let mut intery = yend + gradient;
 
         // Handle second endpoint
-        let xend = x1.round();
+        let xend = (x1 + 0.5).floor();
         let yend = y1 + gradient * (xend - x1);
         let xgap = fpart(x1 + 0.5);
         let xpxl2 = floor_to_i32(xend);
@@ -741,16 +754,23 @@ impl<'a> Rasterizer<'a> {
             self.plot_aa(xpxl2, ypxl2 + 1, fpart(yend) * xgap, color, blend_mode);
         }
 
-        // Main loop
+        // Main loop, limited to the device along the major axis.
+        let extent = if steep {
+            self.buffer.height
+        } else {
+            self.buffer.width
+        };
+        let (first, past_last) = ((xpxl1 + 1).max(0), xpxl2.min(extent));
+        intery = gradient.mul_add(scalar_from_i32(first - (xpxl1 + 1)), intery);
         if steep {
-            for x in (xpxl1 + 1)..xpxl2 {
+            for x in first..past_last {
                 let y = floor_to_i32(intery);
                 self.plot_aa(y, x, 1.0 - fpart(intery), color, blend_mode);
                 self.plot_aa(y + 1, x, fpart(intery), color, blend_mode);
                 intery += gradient;
             }
         } else {
-            for x in (xpxl1 + 1)..xpxl2 {
+            for x in first..past_last {
                 let y = floor_to_i32(intery);
                 self.plot_aa(x, y, 1.0 - fpart(intery), color, blend_mode);
                 self.plot_aa(x, y + 1, fpart(intery), color, blend_mode);
@@ -899,6 +919,13 @@ impl<'a> Rasterizer<'a> {
             return;
         }
 
+        // SkDraw::drawRect: an aliased hairline rect under a scale/translate
+        // CTM is blitted by SkScan::HairRect as a closed pixel frame.
+        if !paint.is_anti_alias() && self.matrix.is_scale_translate() {
+            self.hair_rect(rect, paint);
+            return;
+        }
+
         let tl = Point::new(rect.left, rect.top);
         let tr = Point::new(rect.right, rect.top);
         let bl = Point::new(rect.left, rect.bottom);
@@ -908,6 +935,38 @@ impl<'a> Rasterizer<'a> {
         self.draw_line(tr, br, paint);
         self.draw_line(br, bl, paint);
         self.draw_line(bl, tl, paint);
+    }
+
+    /// `SkScan::HairRect`: blit the one-pixel frame of the device rect,
+    /// spanning pixels `floor(left)..=floor(right)` and
+    /// `floor(top)..=floor(bottom)` (a solid block when either side is at
+    /// most two pixels).
+    fn hair_rect(&mut self, rect: &Rect, paint: &Paint) {
+        use skia_rs_core::cast::floor_to_i32;
+        let dev = self.matrix.map_rect(rect);
+        // Trim to the device outset by one (Skia intersects with the clip
+        // bounds outset by 1) so the integer extents cannot overflow.
+        let (w, h) = (self.buffer.width, self.buffer.height);
+        let trim = |v: Scalar, hi: i32| floor_to_i32(v).clamp(-1, hi.saturating_add(1));
+        let (left, top) = (trim(dev.left, w), trim(dev.top, h));
+        let (right, bottom) = (trim(dev.right + 1.0, w), trim(dev.bottom + 1.0, h));
+        if left >= right || top >= bottom {
+            return;
+        }
+        let source = PixelSource::Solid(premultiply_color(paint.color32()));
+        let blend_mode = paint.blend_mode();
+        if right - left <= 2 || bottom - top <= 2 {
+            for y in top..bottom {
+                self.blit_span(left, right, y, &source, blend_mode);
+            }
+            return;
+        }
+        self.blit_span(left, right, top, &source, blend_mode);
+        for y in top + 1..bottom - 1 {
+            self.blit_span(left, left + 1, y, &source, blend_mode);
+            self.blit_span(right - 1, right, y, &source, blend_mode);
+        }
+        self.blit_span(left, right, bottom - 1, &source, blend_mode);
     }
 
     /// Draw a rectangle (filled or stroked based on paint style).
@@ -1222,81 +1281,115 @@ impl<'a> Rasterizer<'a> {
         reason = "t/mt (parameter and its complement) and per-segment prev_t/prev_mt are the standard Bezier-flattening parameter names"
     )]
     fn stroke_path_hairline(&mut self, path: &Path, paint: &Paint) {
-        // Skia's hair_path extends open contours for non-butt caps
-        // (extend_pts): 0.5 device px for square caps, pi/8 for round.
-        let extended;
-        let path = match paint.stroke_cap() {
-            skia_rs_paint::StrokeCap::Butt => path,
-            cap => {
-                let device_outset = if cap == skia_rs_paint::StrokeCap::Square {
-                    0.5
-                } else {
-                    std::f32::consts::PI / 8.0
-                };
-                let scale = self.matrix.max_scale().filter(|s| *s > 0.0).unwrap_or(1.0);
-                extended = extend_hairline_caps(path, device_outset / scale);
-                &extended
-            }
+        // Skia's hair_path extends segments for non-butt caps (extend_pts):
+        // 0.5 device px for square caps, pi/8 for round. Extension happens
+        // in device space, per segment: a segment that starts a contour
+        // extends its start, one that ends a contour extends its end, and
+        // closed contours only extend degenerate segments.
+        let cap_outset = match paint.stroke_cap() {
+            skia_rs_paint::StrokeCap::Butt => None,
+            skia_rs_paint::StrokeCap::Square => Some(0.5),
+            skia_rs_paint::StrokeCap::Round => Some(std::f32::consts::PI / 8.0),
         };
+        let caps = cap_outset.and_then(|outset| {
+            self.matrix.invert().map(|inverse| HairlineCaps {
+                matrix: self.matrix,
+                inverse,
+                outset,
+            })
+        });
+        let elements: Vec<PathElement> = path.iter().collect();
 
         let mut current = Point::zero();
         let mut contour_start = Point::zero();
+        let mut closed = false;
+        let mut prev_is_move = false;
         // Reused by every curve in the path (no per-segment allocation).
         let mut curve_points: Vec<Point> = Vec::new();
 
-        for element in path {
+        for (index, &element) in elements.iter().enumerate() {
+            let ends_contour = matches!(
+                elements.get(index + 1),
+                None | Some(PathElement::Move(_) | PathElement::Close)
+            );
+            // Extend `pts` when this segment is capped (hair_path's
+            // `!isClosed || degenerate` condition).
+            let extend = |pts: &mut [Point]| {
+                if let Some(caps) = &caps {
+                    let degenerate = pts.iter().all(|q| *q == pts[0]);
+                    if !closed || degenerate {
+                        caps.extend(pts, prev_is_move, ends_contour);
+                    }
+                }
+            };
             match element {
                 PathElement::Move(p) => {
                     current = p;
                     contour_start = p;
+                    closed = contour_is_closed(&elements[index + 1..]);
                 }
                 PathElement::Line(p) => {
-                    self.draw_line(current, p, paint);
+                    let mut pts = [current, p];
+                    extend(&mut pts);
+                    self.draw_line(pts[0], pts[1], paint);
                     current = p;
                 }
                 // Every curve is flattened against a device-pixel error bound
                 // (as in edge collection), so hairlines stay smooth under any
                 // CTM rather than showing fixed-step facets when magnified.
                 PathElement::Quad(ctrl, end) => {
-                    let start = current;
+                    let mut pts = [current, ctrl, end];
+                    extend(&mut pts);
+                    let [a, b, c] = pts;
                     self.hairline_curve(
                         &mut curve_points,
-                        start,
-                        |t| quad_point(t, 1.0 - t, start, ctrl, end),
-                        end,
+                        a,
+                        |t| quad_point(t, 1.0 - t, a, b, c),
+                        c,
                         paint,
                     );
                     current = end;
                 }
                 PathElement::Conic(ctrl, end, weight) => {
-                    let start = current;
+                    let mut pts = [current, ctrl, end];
+                    extend(&mut pts);
+                    let [a, b, c] = pts;
                     self.hairline_curve(
                         &mut curve_points,
-                        start,
-                        |t| conic_point(start, ctrl, end, weight, t),
-                        end,
+                        a,
+                        |t| conic_point(a, b, c, weight, t),
+                        c,
                         paint,
                     );
                     current = end;
                 }
                 PathElement::Cubic(c1, c2, end) => {
-                    let start = current;
+                    let mut pts = [current, c1, c2, end];
+                    extend(&mut pts);
+                    let [a, b, c, d] = pts;
                     self.hairline_curve(
                         &mut curve_points,
-                        start,
-                        |t| cubic_point(t, 1.0 - t, start, c1, c2, end),
-                        end,
+                        a,
+                        |t| cubic_point(t, 1.0 - t, a, b, c, d),
+                        d,
                         paint,
                     );
                     current = end;
                 }
                 PathElement::Close => {
-                    if current != contour_start {
-                        self.draw_line(current, contour_start, paint);
+                    let mut pts = [current, contour_start];
+                    // hair_path caps a moveTo/close pair (a degenerate
+                    // contour) to match SVG's dot for zero-length subpaths.
+                    if prev_is_move && let Some(caps) = &caps {
+                        caps.extend(&mut pts, true, ends_contour);
+                    }
+                    if pts[0] != pts[1] {
+                        self.draw_line(pts[0], pts[1], paint);
                     }
                     current = contour_start;
                 }
             }
+            prev_is_move = matches!(element, PathElement::Move(_));
         }
     }
 
@@ -1928,81 +2021,79 @@ fn flatten_curve_device_error(
     }
 }
 
-/// A copy of `path` whose open contours start `outset` earlier and end
-/// `outset` later along their end tangents (Skia's `extend_pts` for capped
-/// hairlines). Closed contours and contours without a direction are kept.
-fn extend_hairline_caps(path: &Path, outset: Scalar) -> Path {
-    // The points an element ends with, in order.
-    fn element_points(e: &PathElement) -> Vec<Point> {
-        match *e {
-            PathElement::Move(p) | PathElement::Line(p) => vec![p],
-            PathElement::Quad(c, p) | PathElement::Conic(c, p, _) => vec![c, p],
-            PathElement::Cubic(c1, c2, p) => vec![c1, c2, p],
-            PathElement::Close => Vec::new(),
-        }
-    }
-    fn moved(from: Point, toward_away: Point, outset: Scalar) -> Option<Point> {
-        let (dx, dy) = (from.x - toward_away.x, from.y - toward_away.y);
-        let len = dx.hypot(dy);
-        (len > 0.0).then(|| {
-            Point::new(
-                dx.mul_add(outset / len, from.x),
-                dy.mul_add(outset / len, from.y),
-            )
-        })
-    }
+/// Cap extension for hairline segments (Skia's `extend_pts`), applied in
+/// device space and mapped back to the local space the walker draws in.
+struct HairlineCaps {
+    matrix: Matrix,
+    inverse: Matrix,
+    outset: Scalar,
+}
 
-    // Split into contours.
-    let mut contours: Vec<Vec<PathElement>> = Vec::new();
-    for e in path {
-        if matches!(e, PathElement::Move(_)) || contours.is_empty() {
-            contours.push(Vec::new());
+impl HairlineCaps {
+    /// Extend a segment's start (`at_start`) and/or end (`at_end`) by the cap
+    /// outset along its device-space tangent. Control points that coincide
+    /// with the end point move with it; a fully degenerate segment moves its
+    /// end point horizontally (+x at the start, -x at the end), as Skia does.
+    fn extend(&self, pts: &mut [Point], at_start: bool, at_end: bool) {
+        if !(at_start || at_end) {
+            return;
         }
-        if let Some(c) = contours.last_mut() {
-            c.push(e);
+        let mut dev: [Point; 4] = [Point::zero(); 4];
+        let n = pts.len();
+        for (d, p) in dev.iter_mut().zip(pts.iter()) {
+            *d = self.matrix.map_point(*p);
         }
-    }
-
-    let mut b = PathBuilder::new();
-    b.fill_type(path.fill_type());
-    for mut contour in contours {
-        let closed = contour.iter().any(|e| matches!(e, PathElement::Close));
-        if !closed && contour.len() >= 2 {
-            let points: Vec<Point> = contour.iter().flat_map(element_points).collect();
-            // Start: push the first point away from the next distinct point.
-            if let (Some(&first), Some(&next)) =
-                (points.first(), points.iter().find(|q| **q != points[0]))
-                && let Some(p) = moved(first, next, outset)
-            {
-                contour[0] = PathElement::Move(p);
-            }
-            // End: push the last point away from the previous distinct one.
-            if let Some(&last) = points.last()
-                && let Some(&prev) = points.iter().rev().find(|q| **q != last)
-                && let Some(p) = moved(last, prev, outset)
-            {
-                let tail = contour.len() - 1;
-                contour[tail] = match contour[tail] {
-                    PathElement::Line(_) => PathElement::Line(p),
-                    PathElement::Quad(c, _) => PathElement::Quad(c, p),
-                    PathElement::Conic(c, _, w) => PathElement::Conic(c, p, w),
-                    PathElement::Cubic(c1, c2, _) => PathElement::Cubic(c1, c2, p),
-                    other => other,
-                };
+        let dev = &mut dev[..n];
+        let outset = self.outset;
+        let push = |p: &mut Point, (tx, ty): (Scalar, Scalar)| {
+            p.x = tx.mul_add(outset, p.x);
+            p.y = ty.mul_add(outset, p.y);
+        };
+        let unit = |from: Point, to: Point| {
+            let (dx, dy) = (from.x - to.x, from.y - to.y);
+            let len = dx.hypot(dy);
+            (dx / len, dy / len)
+        };
+        if at_start {
+            match (1..n).find(|&k| dev[k] != dev[0]) {
+                Some(k) => {
+                    let tangent = unit(dev[0], dev[k]);
+                    for p in &mut dev[..k] {
+                        push(p, tangent);
+                    }
+                }
+                None => push(&mut dev[0], (1.0, 0.0)),
             }
         }
-        for e in contour {
-            match e {
-                PathElement::Move(p) => b.move_to(p.x, p.y),
-                PathElement::Line(p) => b.line_to(p.x, p.y),
-                PathElement::Quad(c, p) => b.quad_to(c.x, c.y, p.x, p.y),
-                PathElement::Conic(c, p, w) => b.conic_to(c.x, c.y, p.x, p.y, w),
-                PathElement::Cubic(c1, c2, p) => b.cubic_to(c1.x, c1.y, c2.x, c2.y, p.x, p.y),
-                PathElement::Close => b.close(),
-            };
+        if at_end {
+            let last = n - 1;
+            match (0..last).rev().find(|&k| dev[k] != dev[last]) {
+                Some(k) => {
+                    let tangent = unit(dev[last], dev[k]);
+                    for p in &mut dev[k + 1..] {
+                        push(p, tangent);
+                    }
+                }
+                None => push(&mut dev[last], (-1.0, 0.0)),
+            }
+        }
+        for (p, d) in pts.iter_mut().zip(dev.iter()) {
+            *p = self.inverse.map_point(*d);
         }
     }
-    b.build()
+}
+
+/// Whether the contour whose elements (after its `Move`) are `rest` ends with
+/// a `Close` (Skia's `is_next_contour_closed`).
+fn contour_is_closed(rest: &[PathElement]) -> bool {
+    for e in rest {
+        match e {
+            PathElement::Close => return true,
+            PathElement::Move(_) => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Maximum distance, in device pixels, between a conic and the polyline it is
