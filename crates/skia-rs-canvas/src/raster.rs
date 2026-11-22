@@ -1832,7 +1832,8 @@ fn push_curve_edges(
 /// replacing the contents of `out` (a reusable buffer, so hot paths do not
 /// allocate per segment), subdividing until every piece deviates from the
 /// true curve by at most [`CONIC_FLATTEN_TOLERANCE`] *device* pixels under
-/// `matrix`.
+/// `matrix` (checked at the quarter, half and three-quarter points of each
+/// piece, so inflected cubics are subdivided too).
 ///
 /// `eval` gives the local-space point at `t` in `[0, 1]`; `end` is the exact
 /// local end point. The curve is evaluated in local space and the error is
@@ -1861,11 +1862,22 @@ fn flatten_curve_device_error(
         let tm = f32::midpoint(t0, t1);
         let d0 = matrix.map_point(eval(t0));
         let d1 = matrix.map_point(eval(t1));
-        let dm = matrix.map_point(eval(tm));
-        let chord_mid = Point::new(f32::midpoint(d0.x, d1.x), f32::midpoint(d0.y, d1.y));
-        let (dx, dy) = (dm.x - chord_mid.x, dm.y - chord_mid.y);
-        let within = dx * dx + dy * dy <= CONIC_FLATTEN_TOLERANCE * CONIC_FLATTEN_TOLERANCE;
-        if depth >= MAX_DEPTH || within || !(dx.is_finite() && dy.is_finite()) {
+        // Compare the curve with the chord at t = 1/4, 1/2 and 3/4 of the
+        // interval. The midpoint alone is blind to inflections: a symmetric
+        // S-shaped cubic passes exactly through its chord's midpoint while
+        // bulging to both sides of it.
+        let mut max_dev_sq: Scalar = 0.0;
+        for f in [0.25, 0.5, 0.75] {
+            let p = matrix.map_point(eval((t1 - t0).mul_add(f, t0)));
+            let (cx, cy) = (
+                (d1.x - d0.x).mul_add(f, d0.x),
+                (d1.y - d0.y).mul_add(f, d0.y),
+            );
+            let (dx, dy) = (p.x - cx, p.y - cy);
+            max_dev_sq = max_dev_sq.max(dx * dx + dy * dy);
+        }
+        let within = max_dev_sq <= CONIC_FLATTEN_TOLERANCE * CONIC_FLATTEN_TOLERANCE;
+        if depth >= MAX_DEPTH || within || !max_dev_sq.is_finite() {
             out.push(if t1 >= 1.0 { end } else { eval(t1) });
         } else {
             // Push the second half first so the first half is processed

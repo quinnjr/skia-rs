@@ -340,3 +340,30 @@ fn dashed_inverted_rect_matches_the_sorted_rect() {
     assert!(sorted.iter().any(|&v| v > 0));
     assert_eq!(inverted, sorted);
 }
+
+#[test]
+fn inflected_cubic_is_not_collapsed_to_its_chord() {
+    // A symmetric S-shaped cubic passes through its chord's midpoint, so a
+    // midpoint-only flatness test would emit a single straight edge.
+    use skia_rs_core::Point;
+
+    let (o, s) = (Point::new(20.0, 100.0), 1.6_f32);
+    let pt = |x: f32, y: f32| Point::new(x.mul_add(s, o.x), y.mul_add(s, o.y));
+    let (p0, p1, p2, p3) = (
+        pt(0.0, 0.0),
+        pt(0.0, 100.0),
+        pt(100.0, -100.0),
+        pt(100.0, 0.0),
+    );
+    let mut path = PathBuilder::new();
+    path.move_to(p0.x, p0.y)
+        .cubic_to(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y)
+        .close();
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_path(&path.build(), &white(Style::Fill));
+
+    // B(0.25) lies ~29 * 1.6 = 46px below the chord and B(0.75) as far above
+    // it; the lobes between the curve and the chord must be filled.
+    assert!(lit(&buffer, 45, 125), "lower lobe of the S must be filled");
+    assert!(lit(&buffer, 155, 75), "upper lobe of the S must be filled");
+}
