@@ -1225,13 +1225,16 @@ impl<'a> Rasterizer<'a> {
                     // Honor the conic weight (circles, ovals and round-rect
                     // corners are weight-sqrt(2)/2 conics; flattening them
                     // as plain quads bulges them outward). This walk is in
-                    // local space, so convert the device-pixel tolerance.
-                    let scale = self.matrix.determinant().abs().sqrt();
-                    let tolerance = if scale.is_finite() && scale > 0.0 {
-                        CONIC_FLATTEN_TOLERANCE / scale
-                    } else {
-                        CONIC_FLATTEN_TOLERANCE
-                    };
+                    // local space, so convert the device-pixel tolerance by
+                    // the CTM's largest scale factor (the most a local error
+                    // can be magnified along any axis).
+                    let tolerance = self
+                        .matrix
+                        .max_scale()
+                        .filter(|scale| *scale > 0.0)
+                        .map_or(CONIC_FLATTEN_TOLERANCE, |scale| {
+                            CONIC_FLATTEN_TOLERANCE / scale
+                        });
                     let mut points = Vec::new();
                     skia_rs_path::flatten::flatten_conic_adaptive(
                         &mut points,
@@ -1802,23 +1805,90 @@ fn cubic_point(t: Scalar, mt: Scalar, p0: Point, p1: Point, p2: Point, p3: Point
     )
 }
 
+/// Flatten one conic segment (`[start, ctrl, end]` in local space) into
+/// device-space edges, starting from the already-mapped `current` point, and
+/// return the new current point.
+///
+/// The conic weight must be honored: flattening as a plain quad bulges
+/// circles, ovals and round-rect corners outward (~6% of the radius on the
+/// diagonals). An affine map keeps the weight, so the mapped conic is
+/// flattened in device space. A perspective map changes the weight, so the
+/// conic is flattened in local space and the polyline projected instead (as
+/// `SkPath::transform` does).
+fn push_conic_edges(
+    edges: &mut Vec<Edge>,
+    mut current: Point,
+    [start, ctrl, end]: [Point; 3],
+    weight: Scalar,
+    matrix: &Matrix,
+) -> Point {
+    use skia_rs_path::flatten::flatten_conic_adaptive;
+
+    let mut points = Vec::new();
+    if matrix.has_perspective() {
+        flatten_conic_adaptive(
+            &mut points,
+            start,
+            ctrl,
+            end,
+            weight,
+            CONIC_FLATTEN_TOLERANCE,
+        );
+        for p in &mut points {
+            *p = matrix.map_point(*p);
+        }
+    } else {
+        flatten_conic_adaptive(
+            &mut points,
+            current,
+            matrix.map_point(ctrl),
+            matrix.map_point(end),
+            weight,
+            CONIC_FLATTEN_TOLERANCE,
+        );
+    }
+    for p in points {
+        if let Some(edge) = Edge::new(current, p) {
+            edges.push(edge);
+        }
+        current = p;
+    }
+    current
+}
+
+/// Maximum distance, in device pixels, between a conic and the polyline it is
+/// flattened to (Skia's path flattening tolerance).
+const CONIC_FLATTEN_TOLERANCE: Scalar = 0.25;
+
 /// Collect edges from a path.
 #[allow(
     clippy::similar_names,
     reason = "t/mt (Bezier parameter and its complement) is the standard flattening naming"
 )]
-/// Maximum distance, in device pixels, between a conic and the polyline it is
-/// flattened to (Skia's path flattening tolerance).
-const CONIC_FLATTEN_TOLERANCE: Scalar = 0.25;
-
 fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
     use skia_rs_core::cast::scalar_from_i32;
 
     let mut edges = Vec::new();
     let mut current = Point::zero();
     let mut contour_start = Point::zero();
+    // Local-space counterparts, needed to flatten conics before a
+    // perspective projection.
+    let mut local_current = Point::zero();
+    let mut local_contour_start = Point::zero();
 
     for element in path {
+        let local_start = local_current;
+        local_current = match element {
+            PathElement::Move(p) => {
+                local_contour_start = p;
+                p
+            }
+            PathElement::Line(p)
+            | PathElement::Quad(_, p)
+            | PathElement::Conic(_, p, _)
+            | PathElement::Cubic(_, _, p) => p,
+            PathElement::Close => local_contour_start,
+        };
         match element {
             PathElement::Move(p) => {
                 current = matrix.map_point(p);
@@ -1848,27 +1918,8 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
                 }
             }
             PathElement::Conic(ctrl, end, weight) => {
-                // Honor the conic weight: flattening as a plain quad bulges
-                // circles, ovals and round-rect corners outward (~6% of the
-                // radius on the diagonals). An affine map keeps the weight,
-                // so flatten the mapped conic in device space.
-                let ctrl = matrix.map_point(ctrl);
-                let end = matrix.map_point(end);
-                let mut points = Vec::new();
-                skia_rs_path::flatten::flatten_conic_adaptive(
-                    &mut points,
-                    current,
-                    ctrl,
-                    end,
-                    weight,
-                    CONIC_FLATTEN_TOLERANCE,
-                );
-                for p in points {
-                    if let Some(edge) = Edge::new(current, p) {
-                        edges.push(edge);
-                    }
-                    current = p;
-                }
+                let conic = [local_start, ctrl, end];
+                current = push_conic_edges(&mut edges, current, conic, weight, matrix);
             }
             PathElement::Cubic(c1, c2, end) => {
                 let c1 = matrix.map_point(c1);

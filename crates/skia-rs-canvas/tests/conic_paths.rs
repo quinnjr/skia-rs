@@ -132,3 +132,61 @@ fn polygon_points_stroke_one_joined_path() {
         "overlap blended twice: {overlap} vs single-coverage {single}"
     );
 }
+
+#[test]
+fn circle_under_perspective_matches_the_projected_curve() {
+    // A perspective map changes a conic's weight, so mapping its control
+    // points and keeping w = sqrt(2)/2 draws the wrong curve. The circle
+    // must rasterize like a finely flattened polygon projected through the
+    // same matrix.
+    use skia_rs_core::Matrix;
+
+    let mut persp = Matrix::IDENTITY;
+    persp.values[Matrix::PERSP_0] = 0.004;
+    persp.values[Matrix::PERSP_1] = 0.002;
+
+    let (cx, cy, r) = (60.0_f32, 60.0_f32, 50.0_f32);
+    let mut circle = PathBuilder::new();
+    circle.add_circle(cx, cy, r);
+
+    let mut polygon = PathBuilder::new();
+    let steps = 720;
+    for i in 0..steps {
+        #[allow(clippy::cast_precision_loss, reason = "small loop index")]
+        let a = (i as f32) / (steps as f32) * std::f32::consts::TAU;
+        let (x, y) = (r.mul_add(a.cos(), cx), r.mul_add(a.sin(), cy));
+        if i == 0 {
+            polygon.move_to(x, y);
+        } else {
+            polygon.line_to(x, y);
+        }
+    }
+    polygon.close();
+
+    let render = |path: &skia_rs_path::Path| {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            canvas.set_matrix(&persp);
+            canvas.draw_path(path, &white(Style::Fill));
+        }
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .filter(|&(x, y)| lit(&buffer, x, y))
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let actual = render(&circle.build());
+    let expected = render(&polygon.build());
+    let differing = actual.symmetric_difference(&expected).count();
+    assert!(
+        expected.len() > 1000,
+        "the projected circle must be visible"
+    );
+    assert!(
+        // ~6 pixels differ with exact flattening, ~40 with the affine
+        // weight; allow 0.5% (~16) for AA/edge noise.
+        differing * 200 <= expected.len(),
+        "{differing} pixels differ from the projected circle ({} expected)",
+        expected.len()
+    );
+}
