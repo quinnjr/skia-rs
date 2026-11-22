@@ -1222,27 +1222,12 @@ impl<'a> Rasterizer<'a> {
                     current = end;
                 }
                 PathElement::Conic(ctrl, end, weight) => {
-                    // Honor the conic weight (circles, ovals and round-rect
-                    // corners are weight-sqrt(2)/2 conics; flattening them
-                    // as plain quads bulges them outward). This walk is in
-                    // local space, so convert the device-pixel tolerance by
-                    // the CTM's largest scale factor (the most a local error
-                    // can be magnified along any axis).
-                    let tolerance = self
-                        .matrix
-                        .max_scale()
-                        .filter(|scale| *scale > 0.0)
-                        .map_or(CONIC_FLATTEN_TOLERANCE, |scale| {
-                            CONIC_FLATTEN_TOLERANCE / scale
-                        });
                     let mut points = Vec::new();
-                    skia_rs_path::flatten::flatten_conic_adaptive(
+                    flatten_conic_device_error(
                         &mut points,
-                        current,
-                        ctrl,
-                        end,
+                        [current, ctrl, end],
                         weight,
-                        tolerance,
+                        &self.matrix,
                     );
                     let mut prev = current;
                     for p in points {
@@ -1808,52 +1793,73 @@ fn cubic_point(t: Scalar, mt: Scalar, p0: Point, p1: Point, p2: Point, p3: Point
 /// Flatten one conic segment (`[start, ctrl, end]` in local space) into
 /// device-space edges, starting from the already-mapped `current` point, and
 /// return the new current point.
-///
-/// The conic weight must be honored: flattening as a plain quad bulges
-/// circles, ovals and round-rect corners outward (~6% of the radius on the
-/// diagonals). An affine map keeps the weight, so the mapped conic is
-/// flattened in device space. A perspective map changes the weight, so the
-/// conic is flattened in local space and the polyline projected instead (as
-/// `SkPath::transform` does).
 fn push_conic_edges(
     edges: &mut Vec<Edge>,
     mut current: Point,
-    [start, ctrl, end]: [Point; 3],
+    conic: [Point; 3],
     weight: Scalar,
     matrix: &Matrix,
 ) -> Point {
-    use skia_rs_path::flatten::flatten_conic_adaptive;
-
     let mut points = Vec::new();
-    if matrix.has_perspective() {
-        flatten_conic_adaptive(
-            &mut points,
-            start,
-            ctrl,
-            end,
-            weight,
-            CONIC_FLATTEN_TOLERANCE,
-        );
-        for p in &mut points {
-            *p = matrix.map_point(*p);
-        }
-    } else {
-        flatten_conic_adaptive(
-            &mut points,
-            current,
-            matrix.map_point(ctrl),
-            matrix.map_point(end),
-            weight,
-            CONIC_FLATTEN_TOLERANCE,
-        );
-    }
+    flatten_conic_device_error(&mut points, conic, weight, matrix);
     for p in points {
+        let p = matrix.map_point(p);
         if let Some(edge) = Edge::new(current, p) {
             edges.push(edge);
         }
         current = p;
     }
     current
+}
+
+/// Flatten a conic (`[start, ctrl, end]` in local space) into local-space
+/// polyline points (excluding `start`), subdividing until every piece
+/// deviates from the true curve by at most [`CONIC_FLATTEN_TOLERANCE`]
+/// *device* pixels under `matrix`.
+///
+/// The conic is evaluated in its exact rational form (honoring the weight;
+/// circles, ovals and round-rect corners are weight-sqrt(2)/2 conics and
+/// bulge ~6% if treated as quads) in local space, and the error is measured
+/// after mapping through the full matrix. That is correct for any CTM:
+/// scale, skew, and perspective (which changes a projected conic's weight,
+/// so mapping control points alone would draw the wrong curve).
+fn flatten_conic_device_error(
+    out: &mut Vec<Point>,
+    [start, ctrl, end]: [Point; 3],
+    weight: Scalar,
+    matrix: &Matrix,
+) {
+    const MAX_DEPTH: u32 = 12;
+
+    let eval = |t: Scalar| -> Point {
+        let mt = 1.0 - t;
+        let (a, b, c) = (mt * mt, 2.0 * weight * t * mt, t * t);
+        let denom = a + b + c;
+        Point::new(
+            (start.x * a + ctrl.x * b + end.x * c) / denom,
+            (start.y * a + ctrl.y * b + end.y * c) / denom,
+        )
+    };
+
+    // Iterative subdivision over [t0, t1] intervals (depth-first, in order).
+    let mut stack = vec![(0.0_f32, 1.0_f32, 0_u32)];
+    while let Some((t0, t1, depth)) = stack.pop() {
+        let tm = f32::midpoint(t0, t1);
+        let d0 = matrix.map_point(eval(t0));
+        let d1 = matrix.map_point(eval(t1));
+        let dm = matrix.map_point(eval(tm));
+        let chord_mid = Point::new(f32::midpoint(d0.x, d1.x), f32::midpoint(d0.y, d1.y));
+        let (dx, dy) = (dm.x - chord_mid.x, dm.y - chord_mid.y);
+        let within = dx * dx + dy * dy <= CONIC_FLATTEN_TOLERANCE * CONIC_FLATTEN_TOLERANCE;
+        if depth >= MAX_DEPTH || within || !(dx.is_finite() && dy.is_finite()) {
+            out.push(if t1 >= 1.0 { end } else { eval(t1) });
+        } else {
+            // Push the second half first so the first half is processed
+            // next, keeping the output in curve order.
+            stack.push((tm, t1, depth + 1));
+            stack.push((t0, tm, depth + 1));
+        }
+    }
 }
 
 /// Maximum distance, in device pixels, between a conic and the polyline it is

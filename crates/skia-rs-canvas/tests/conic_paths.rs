@@ -190,3 +190,56 @@ fn circle_under_perspective_matches_the_projected_curve() {
         expected.len()
     );
 }
+
+#[test]
+fn magnified_circle_under_perspective_stays_smooth() {
+    // A unit circle magnified 80x with a perspective term: the flattening
+    // tolerance must hold in device pixels, not local units (0.25 local
+    // units would be ~20 device px, a visible polygon).
+    use skia_rs_core::Matrix;
+
+    let mut m = Matrix::translate(100.0, 100.0).concat(&Matrix::scale(80.0, 80.0));
+    m.values[Matrix::PERSP_0] = 0.05;
+    m.values[Matrix::PERSP_1] = 0.03;
+
+    let mut circle = PathBuilder::new();
+    circle.add_circle(0.0, 0.0, 1.0);
+
+    let mut polygon = PathBuilder::new();
+    let steps = 2000;
+    for i in 0..steps {
+        #[allow(clippy::cast_precision_loss, reason = "small loop index")]
+        let a = (i as f32) / (steps as f32) * std::f32::consts::TAU;
+        if i == 0 {
+            polygon.move_to(a.cos(), a.sin());
+        } else {
+            polygon.line_to(a.cos(), a.sin());
+        }
+    }
+    polygon.close();
+
+    let render = |path: &skia_rs_path::Path| {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            canvas.set_matrix(&m);
+            canvas.draw_path(path, &white(Style::Fill));
+        }
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .filter(|&(x, y)| lit(&buffer, x, y))
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let actual = render(&circle.build());
+    let expected = render(&polygon.build());
+    let differing = actual.symmetric_difference(&expected).count();
+    assert!(
+        expected.len() > 5000,
+        "the projected circle must be visible"
+    );
+    assert!(
+        differing * 200 <= expected.len(),
+        "{differing} pixels differ from the projected circle ({} expected)",
+        expected.len()
+    );
+}
