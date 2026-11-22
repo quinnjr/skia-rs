@@ -324,27 +324,24 @@ impl Typeface {
     /// Corresponds to Skia's
     /// `SkFontMgr::legacyMakeTypeface(nullptr, SkFontStyle())`. Unlike
     /// [`default_typeface`](Self::default_typeface),
-    /// the result has real glyph outlines and renders visible text. The font
-    /// file is read once per process and shared between calls.
+    /// the result has real glyph outlines and renders visible text. Like the
+    /// typeface Skia's font manager caches, it is loaded once per process:
+    /// every call returns the same typeface (same [`unique_id`](Self::unique_id)
+    /// and shared font bytes), so per-typeface caches keep hitting.
     ///
     /// Returns `None` when none of the well-known font files exists, e.g. in
     /// a minimal container without fonts installed.
     #[must_use]
     pub fn system_default() -> Option<Self> {
-        static DATA: OnceLock<Option<Arc<Vec<u8>>>> = OnceLock::new();
+        static TYPEFACE: OnceLock<Option<Typeface>> = OnceLock::new();
 
-        let data = DATA
+        TYPEFACE
             .get_or_init(|| {
                 system_default_font_candidates()
                     .into_iter()
-                    .find_map(|path| {
-                        let bytes = std::fs::read(path).ok()?;
-                        ttf_parser::Face::parse(&bytes, 0).ok()?;
-                        Some(Arc::new(bytes))
-                    })
+                    .find_map(|path| Self::from_data(std::fs::read(path).ok()?))
             })
-            .clone()?;
-        Self::from_shared_data(data)
+            .clone()
     }
 
     /// Create a typeface from font data.
@@ -354,12 +351,6 @@ impl Typeface {
     /// is not a valid OpenType/TrueType font (or collection, index 0).
     #[must_use]
     pub fn from_data(data: Vec<u8>) -> Option<Self> {
-        Self::from_shared_data(Arc::new(data))
-    }
-
-    /// Shared implementation of [`from_data`](Self::from_data) that takes
-    /// already reference-counted bytes, so cached font files are not copied.
-    fn from_shared_data(data: Arc<Vec<u8>>) -> Option<Self> {
         if data.len() < 12 {
             return None;
         }
@@ -394,7 +385,7 @@ impl Typeface {
                 slant,
             },
             id: next_typeface_id(),
-            data: Some(data),
+            data: Some(Arc::new(data)),
             units_per_em,
             glyph_count,
             parsed: OnceLock::new(),
@@ -603,8 +594,14 @@ mod tests {
         };
         assert!(tf.glyph_count() > 0);
         assert_ne!(tf.char_to_glyph('A'), 0, "system font must map 'A'");
+        // Like Skia's cached default typeface: every call is the same face.
         let again = Typeface::system_default().expect("cached font stays available");
-        assert_ne!(tf.unique_id(), again.unique_id());
+        assert_eq!(tf.unique_id(), again.unique_id());
+        assert_eq!(
+            tf.font_data().map(<[u8]>::as_ptr),
+            again.font_data().map(<[u8]>::as_ptr),
+            "font bytes must be shared, not re-read"
+        );
     }
 
     #[test]

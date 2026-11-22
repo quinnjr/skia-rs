@@ -14,7 +14,9 @@ Text layout and rendering for [skia-rs](https://github.com/quinnjr/skia-rs), a p
 ## Usage
 
 ```rust
-use skia_rs_core::Point;
+use skia_rs_canvas::Surface; // with skia-rs-canvas's `text` feature
+use skia_rs_core::{Color, Point};
+use skia_rs_paint::Paint;
 use skia_rs_text::{Font, TextBlobBuilder, Typeface};
 use std::sync::Arc;
 
@@ -26,16 +28,17 @@ use std::sync::Arc;
 let typeface = Typeface::system_default().unwrap_or_else(Typeface::default_typeface);
 let font = Font::new(Arc::new(typeface), 24.0);
 
-// Map text to glyphs
-let glyphs = font.text_to_glyphs("Hello, world!");
-
 // Build a text blob
 let mut builder = TextBlobBuilder::new();
 builder.add_text("Hello, world!", &font, Point::zero());
 let blob = builder.build().expect("non-empty blob");
 
-// Draw with a canvas (skia-rs-canvas, `text` feature)
-canvas.draw_text_blob(&blob, 100.0, 100.0, &paint);
+// Draw it
+let mut surface = Surface::new_raster_n32_premul(400, 100).expect("surface");
+let mut paint = Paint::new();
+paint.set_color32(Color::from_rgb(20, 20, 20));
+paint.set_anti_alias(true);
+surface.raster_canvas().draw_text_blob(&blob, 20.0, 60.0, &paint);
 ```
 
 ## License
