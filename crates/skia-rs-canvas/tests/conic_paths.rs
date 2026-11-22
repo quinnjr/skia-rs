@@ -367,3 +367,52 @@ fn inflected_cubic_is_not_collapsed_to_its_chord() {
     assert!(lit(&buffer, 45, 125), "lower lobe of the S must be filled");
     assert!(lit(&buffer, 155, 75), "upper lobe of the S must be filled");
 }
+
+#[test]
+fn negative_circle_radius_with_a_path_effect_draws_nothing() {
+    // SkCanvas::drawCircle clamps a negative radius to 0, with or without a
+    // path effect.
+    use skia_rs_core::Point;
+    use skia_rs_path::{Path1DEffect, Path1DStyle};
+    use std::sync::Arc;
+
+    let mut stamp = PathBuilder::new();
+    stamp.add_rect(&Rect::from_xywh(-3.0, -3.0, 6.0, 6.0));
+    let mut paint = white(Style::Stroke);
+    paint.set_path_effect(Some(Arc::new(
+        Path1DEffect::new(stamp.build(), 10.0, 0.0, Path1DStyle::Translate).unwrap(),
+    )));
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_circle(Point::new(100.0, 100.0), -40.0, &paint);
+    let painted = (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .filter(|&(x, y)| lit(&buffer, x, y))
+        .count();
+    assert_eq!(painted, 0);
+}
+
+#[test]
+fn zero_radius_inverted_round_rect_dashes_like_draw_rect() {
+    // drawRoundRect with a zero radius is drawRect, which sorts the rect.
+    use skia_rs_path::DashEffect;
+    use std::sync::Arc;
+
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(3.0);
+    paint.set_path_effect(Some(Arc::new(
+        DashEffect::new(vec![10.0, 5.0], 0.0).unwrap(),
+    )));
+    let render = |draw: &dyn Fn(&mut Canvas<'_>)| {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        draw(&mut Canvas::new_raster(&mut buffer));
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).unwrap_or(Color::BLACK).red())
+            .collect::<Vec<_>>()
+    };
+    let inverted = Rect::new(170.0, 130.0, 20.0, 30.0);
+    let round = render(&|c| c.draw_round_rect(&inverted, 0.0, 0.0, &paint));
+    let rect = render(&|c| c.draw_rect(&inverted, &paint));
+    assert!(rect.iter().any(|&v| v > 0));
+    assert_eq!(round, rect);
+}

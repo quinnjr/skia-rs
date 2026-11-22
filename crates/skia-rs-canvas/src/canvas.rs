@@ -943,8 +943,16 @@ impl<'a> Canvas<'a> {
     pub fn draw_circle(&mut self, center: Point, radius: Scalar, paint: &Paint) {
         match &mut self.backing {
             Backing::Raster(_) if paint.path_effect().is_some() => {
+                // SkCanvas::drawCircle clamps a negative radius to 0 and
+                // draws the oval of the (sorted) bounds.
+                let r = radius.max(0.0);
                 let mut b = skia_rs_path::PathBuilder::new();
-                b.add_circle(center.x, center.y, radius);
+                b.add_oval(&Rect::new(
+                    center.x - r,
+                    center.y - r,
+                    center.x + r,
+                    center.y + r,
+                ));
                 self.rasterize_path(&b.build(), paint);
             }
             Backing::Raster(_) => {
@@ -2546,7 +2554,8 @@ fn build_round_rect_path(rect: &Rect, rx: Scalar, ry: Scalar) -> Path {
     if rx > 0.0 && ry > 0.0 {
         builder.add_round_rect(rect, rx, ry);
     } else {
-        builder.add_rect(rect);
+        // drawRect sorts the rect first (fixing start corner and direction).
+        builder.add_rect(&sorted_rect(rect));
     }
     builder.build()
 }
