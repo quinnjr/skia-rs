@@ -495,6 +495,22 @@ fn device_responds_to(device: &DeviceRef, selector: &str) -> bool {
     responds != NO
 }
 
+/// Send the argument-less `BOOL` query `selector` to `device`, or `false`
+/// when the device does not implement it.
+#[cfg(feature = "metal")]
+fn device_bool_query(device: &DeviceRef, selector: &str) -> bool {
+    use metal::objc::Message;
+    use metal::objc::runtime::{BOOL, NO, Sel};
+
+    if !device_responds_to(device, selector) {
+        return false;
+    }
+    // SAFETY: `device` is a valid MTLDevice that implements `selector`,
+    // which callers pass only for `- (BOOL)selector` getters.
+    let value: BOOL = unsafe { device.send_message(Sel::register(selector), ()) }.unwrap_or(NO);
+    value != NO
+}
+
 /// [`DeviceRef::supports_family`], or `false` on systems that predate the
 /// `supportsFamily:` query.
 #[cfg(feature = "metal")]
@@ -647,8 +663,9 @@ impl MetalContext {
             // differs (0 means the query is unavailable on this OS).
             argument_buffers: argument_buffer_tier > 0,
             // macOS 10.13 / iOS 11.
-            raster_order_groups: has("rasterOrderGroupsSupported")
-                && device.raster_order_groups_supported(),
+            // The property's getter is `areRasterOrderGroupsSupported`;
+            // metal-rs 0.29 sends the unimplemented plain property name.
+            raster_order_groups: device_bool_query(device, "areRasterOrderGroupsSupported"),
             float32_filtering: true, // Most Metal devices support this
             msaa_depth_resolve: true,
             // metal-rs exposes no sparse-texture query; sparse textures require the
