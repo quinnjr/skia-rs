@@ -813,7 +813,20 @@ impl<'a> Canvas<'a> {
     }
 
     /// Draw a line.
+    ///
+    /// Like `SkCanvas::drawLine` (`drawPoints(kLines_PointMode)`), the
+    /// segment is always stroked, and the paint's path effect (e.g. a dash)
+    /// is applied to it.
     pub fn draw_line(&mut self, p0: Point, p1: Point, paint: &Paint) {
+        if paint.path_effect().is_some() && matches!(self.backing, Backing::Raster(_)) {
+            let mut builder = skia_rs_path::PathBuilder::new();
+            builder.move_to(p0.x, p0.y).line_to(p1.x, p1.y);
+            let mut stroke = paint.clone();
+            stroke.set_style(skia_rs_paint::Style::Stroke);
+            self.draw_path(&builder.build(), &stroke);
+            return;
+        }
+
         match &mut self.backing {
             Backing::Raster(_) => {
                 self.with_rasterizer(|raster| raster.draw_line(p0, p1, paint));
@@ -937,19 +950,21 @@ impl<'a> Canvas<'a> {
     /// [`PathEffect`]: skia_rs_path::PathEffect
     /// [`TrimEffect`]: skia_rs_path::TrimEffect
     pub fn draw_path(&mut self, path: &Path, paint: &Paint) {
-        // If the paint carries a path effect, apply it first and drop through
-        // the `Path` slot with the effected path. Fall back to the input path
-        // if the effect produces nothing.
-        let effected = paint.path_effect().and_then(|e| e.apply(path));
-        let final_path: &Path = effected.as_ref().unwrap_or(path);
-
         match &mut self.backing {
             Backing::Raster(_) => {
+                // If the paint carries a path effect, apply it first and
+                // rasterize the effected path. Fall back to the input path if
+                // the effect produces nothing.
+                let effected = paint.path_effect().and_then(|e| e.apply(path));
+                let final_path: &Path = effected.as_ref().unwrap_or(path);
                 self.with_rasterizer(|raster| raster.draw_path(final_path, paint));
             }
             Backing::Recording(commands) => {
+                // Record the original path, like SkPicture: the paint still
+                // carries the effect, so playback applies it exactly once.
+                // Recording the effected path made playback dash it twice.
                 commands.push(DrawCommand::DrawPath {
-                    path: final_path.clone(),
+                    path: path.clone(),
                     paint: paint.clone(),
                 });
             }
