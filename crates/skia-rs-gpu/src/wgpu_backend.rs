@@ -32,6 +32,10 @@ pub struct WgpuContext {
 
 impl WgpuContext {
     /// Create a new wgpu context.
+    ///
+    /// # Errors
+    /// Returns [`GpuError::DeviceCreation`] if no suitable adapter is found or
+    /// the device request fails.
     pub async fn new() -> GpuResult<Self> {
         Self::new_with_backends(wgpu::Backends::all()).await
     }
@@ -43,6 +47,7 @@ impl WgpuContext {
     /// or `Backends::METAL` to force a single-backend instance. The adapter
     /// and device selection logic is otherwise identical to [`Self::new`].
     ///
+    /// # Errors
     /// Returns an error if no adapter is available for the requested mask —
     /// callers should treat `DeviceCreation` as "this backend is not
     /// available in this environment" rather than a hard failure, and fall
@@ -61,7 +66,7 @@ impl WgpuContext {
             })
             .await
             .ok_or_else(|| {
-                GpuError::DeviceCreation(format!("No adapter found for backends {:?}", backends))
+                GpuError::DeviceCreation(format!("No adapter found for backends {backends:?}"))
             })?;
 
         let adapter_info = adapter.get_info();
@@ -87,8 +92,7 @@ impl WgpuContext {
                 wgpu::Backend::Metal => GpuBackendType::Metal,
                 wgpu::Backend::Dx12 => GpuBackendType::Direct3D12,
                 wgpu::Backend::Gl => GpuBackendType::OpenGL,
-                wgpu::Backend::BrowserWebGpu => GpuBackendType::WebGPU,
-                _ => GpuBackendType::WebGPU,
+                wgpu::Backend::BrowserWebGpu | wgpu::Backend::Empty => GpuBackendType::WebGPU,
             },
             device_type: match adapter_info.device_type {
                 wgpu::DeviceType::IntegratedGpu => GpuDeviceType::Integrated,
@@ -120,31 +124,43 @@ impl WgpuContext {
     }
 
     /// Create a blocking context (for non-async usage).
+    ///
+    /// # Errors
+    /// See [`Self::new`].
     pub fn new_blocking() -> GpuResult<Self> {
         pollster::block_on(Self::new())
     }
 
     /// Blocking counterpart to [`Self::new_with_backends`].
+    ///
+    /// # Errors
+    /// See [`Self::new_with_backends`].
     pub fn new_with_backends_blocking(backends: wgpu::Backends) -> GpuResult<Self> {
         pollster::block_on(Self::new_with_backends(backends))
     }
 
     /// Get the device.
-    pub fn device(&self) -> &Arc<wgpu::Device> {
+    #[must_use]
+    pub const fn device(&self) -> &Arc<wgpu::Device> {
         &self.device
     }
 
     /// Get the queue.
-    pub fn queue(&self) -> &Arc<wgpu::Queue> {
+    #[must_use]
+    pub const fn queue(&self) -> &Arc<wgpu::Queue> {
         &self.queue
     }
 
     /// Get capabilities.
-    pub fn capabilities(&self) -> &GpuCaps {
+    #[must_use]
+    pub const fn capabilities(&self) -> &GpuCaps {
         &self.caps
     }
 
     /// Create an offscreen surface.
+    ///
+    /// # Errors
+    /// See [`WgpuSurface::new`].
     pub fn create_surface(&self, props: &GpuSurfaceProps) -> GpuResult<WgpuSurface> {
         WgpuSurface::new(self.device.clone(), self.queue.clone(), props)
     }
@@ -189,6 +205,10 @@ pub struct WgpuSurface {
 
 impl WgpuSurface {
     /// Create a new wgpu surface.
+    ///
+    /// # Errors
+    /// Returns [`GpuError::SurfaceCreation`] if `props.format` is not a
+    /// colour format wgpu surfaces support (RGBA8/BGRA8, linear or sRGB).
     pub fn new(
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
@@ -235,7 +255,7 @@ impl WgpuSurface {
     }
 
     /// Get the texture view.
-    pub fn view(&self) -> &wgpu::TextureView {
+    pub const fn view(&self) -> &wgpu::TextureView {
         &self.view
     }
 
@@ -251,10 +271,10 @@ impl WgpuSurface {
             ops: wgpu::Operations {
                 load: match desc.clear_color {
                     Some([r, g, b, a]) => wgpu::LoadOp::Clear(wgpu::Color {
-                        r: r as f64,
-                        g: g as f64,
-                        b: b as f64,
-                        a: a as f64,
+                        r: f64::from(r),
+                        g: f64::from(g),
+                        b: f64::from(b),
+                        a: f64::from(a),
                     }),
                     None => wgpu::LoadOp::Load,
                 },
@@ -291,10 +311,10 @@ impl GpuSurface for WgpuSurface {
 
     fn clear(&mut self, color: Color) {
         let clear = clear_color_for_format(
-            color.red() as f64 / 255.0,
-            color.green() as f64 / 255.0,
-            color.blue() as f64 / 255.0,
-            color.alpha() as f64 / 255.0,
+            f64::from(color.red()) / 255.0,
+            f64::from(color.green()) / 255.0,
+            f64::from(color.blue()) / 255.0,
+            f64::from(color.alpha()) / 255.0,
             self.format,
         );
 
@@ -332,6 +352,9 @@ impl GpuSurface for WgpuSurface {
         let bytes_per_pixel = self.format.bytes_per_pixel() as usize;
         let aligned_bytes_per_row = (self.width as usize * bytes_per_pixel + 255) & !255;
         let buffer_size = aligned_bytes_per_row * self.height as usize;
+        let Ok(bytes_per_row) = u32::try_from(aligned_bytes_per_row) else {
+            return false;
+        };
 
         let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback buffer"),
@@ -409,7 +432,7 @@ impl GpuSurface for WgpuSurface {
                 buffer: &staging_buffer,
                 layout: wgpu::ImageDataLayout {
                     offset: 0,
-                    bytes_per_row: Some(aligned_bytes_per_row as u32),
+                    bytes_per_row: Some(bytes_per_row),
                     rows_per_image: Some(self.height),
                 },
             },
@@ -429,7 +452,7 @@ impl GpuSurface for WgpuSurface {
         });
         self.device.poll(wgpu::Maintain::Wait);
 
-        if rx.recv().map(|r| r.is_ok()).unwrap_or(false) {
+        if rx.recv().is_ok_and(|r| r.is_ok()) {
             let data = slice.get_mapped_range();
 
             // Copy row by row (handling alignment)
@@ -462,7 +485,7 @@ impl GpuSurface for WgpuSurface {
 // ---------------------------------------------------------------------------
 
 /// Translate a crate vertex format to wgpu.
-fn convert_vertex_format(f: CrateVertexFormat) -> wgpu::VertexFormat {
+const fn convert_vertex_format(f: CrateVertexFormat) -> wgpu::VertexFormat {
     match f {
         CrateVertexFormat::Float32 => wgpu::VertexFormat::Float32,
         CrateVertexFormat::Float32x2 => wgpu::VertexFormat::Float32x2,
@@ -480,7 +503,7 @@ fn convert_vertex_format(f: CrateVertexFormat) -> wgpu::VertexFormat {
     }
 }
 
-fn convert_topology(t: CratePrimitiveTopology) -> wgpu::PrimitiveTopology {
+const fn convert_topology(t: CratePrimitiveTopology) -> wgpu::PrimitiveTopology {
     match t {
         CratePrimitiveTopology::PointList => wgpu::PrimitiveTopology::PointList,
         CratePrimitiveTopology::LineList => wgpu::PrimitiveTopology::LineList,
@@ -490,7 +513,7 @@ fn convert_topology(t: CratePrimitiveTopology) -> wgpu::PrimitiveTopology {
     }
 }
 
-fn convert_blend_factor(f: CrateBlendFactor) -> wgpu::BlendFactor {
+const fn convert_blend_factor(f: CrateBlendFactor) -> wgpu::BlendFactor {
     match f {
         CrateBlendFactor::Zero => wgpu::BlendFactor::Zero,
         CrateBlendFactor::One => wgpu::BlendFactor::One,
@@ -508,7 +531,7 @@ fn convert_blend_factor(f: CrateBlendFactor) -> wgpu::BlendFactor {
     }
 }
 
-fn convert_blend_op(o: CrateBlendOperation) -> wgpu::BlendOperation {
+const fn convert_blend_op(o: CrateBlendOperation) -> wgpu::BlendOperation {
     match o {
         CrateBlendOperation::Add => wgpu::BlendOperation::Add,
         CrateBlendOperation::Subtract => wgpu::BlendOperation::Subtract,
@@ -518,7 +541,7 @@ fn convert_blend_op(o: CrateBlendOperation) -> wgpu::BlendOperation {
     }
 }
 
-fn convert_blend_state(state: CrateBlendState) -> wgpu::BlendState {
+const fn convert_blend_state(state: CrateBlendState) -> wgpu::BlendState {
     wgpu::BlendState {
         color: wgpu::BlendComponent {
             src_factor: convert_blend_factor(state.color.src_factor),
@@ -550,7 +573,11 @@ fn convert_write_mask(mask: ColorWriteMask) -> wgpu::ColorWrites {
     out
 }
 
-fn convert_texture_format(format: TextureFormat) -> Option<wgpu::TextureFormat> {
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "fallible by design: callers reject unmapped formats, so adding a TextureFormat wgpu cannot represent only needs a `None` arm here"
+)]
+const fn convert_texture_format(format: TextureFormat) -> Option<wgpu::TextureFormat> {
     match format {
         TextureFormat::Rgba8Unorm => Some(wgpu::TextureFormat::Rgba8Unorm),
         TextureFormat::Rgba8UnormSrgb => Some(wgpu::TextureFormat::Rgba8UnormSrgb),
@@ -565,7 +592,7 @@ fn convert_texture_format(format: TextureFormat) -> Option<wgpu::TextureFormat> 
     }
 }
 
-fn convert_index_format(f: CrateIndexFormat) -> wgpu::IndexFormat {
+const fn convert_index_format(f: CrateIndexFormat) -> wgpu::IndexFormat {
     match f {
         CrateIndexFormat::Uint16 => wgpu::IndexFormat::Uint16,
         CrateIndexFormat::Uint32 => wgpu::IndexFormat::Uint32,
@@ -578,6 +605,10 @@ fn convert_index_format(f: CrateIndexFormat) -> wgpu::IndexFormat {
 /// never became a real GPU pipeline. Here we compile both shader modules
 /// via the device, translate the vertex layout, blend and multisample
 /// state, and produce a pipeline the executor can bind.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a single field-by-field translation of RenderPipelineDescriptor into wgpu's descriptor; splitting it would scatter the 1:1 mapping"
+)]
 fn build_wgpu_pipeline(
     device: &wgpu::Device,
     desc: &RenderPipelineDescriptor,
@@ -608,7 +639,7 @@ fn build_wgpu_pipeline(
             .iter()
             .map(|a| wgpu::VertexAttribute {
                 format: convert_vertex_format(a.format),
-                offset: a.offset as u64,
+                offset: u64::from(a.offset),
                 shader_location: a.location,
             })
             .collect();
@@ -619,7 +650,7 @@ fn build_wgpu_pipeline(
         .iter()
         .zip(attr_storage.iter())
         .map(|(vb, attrs)| wgpu::VertexBufferLayout {
-            array_stride: vb.stride as u64,
+            array_stride: u64::from(vb.stride),
             step_mode: match vb.step_mode {
                 crate::pipeline::VertexStepMode::Vertex => wgpu::VertexStepMode::Vertex,
                 crate::pipeline::VertexStepMode::Instance => wgpu::VertexStepMode::Instance,
@@ -642,7 +673,7 @@ fn build_wgpu_pipeline(
         .collect();
 
     // Validate that every requested target format is supported.
-    if color_targets.iter().any(|t| t.is_none()) {
+    if color_targets.iter().any(std::option::Option::is_none) {
         return Err(GpuError::OperationFailed(
             "unsupported colour target format for wgpu".into(),
         ));
@@ -657,8 +688,8 @@ fn build_wgpu_pipeline(
             depth_write_enabled: ds.depth_write_enabled,
             depth_compare: convert_compare(ds.depth_compare),
             stencil: wgpu::StencilState {
-                front: convert_stencil_face(&ds.stencil_front),
-                back: convert_stencil_face(&ds.stencil_back),
+                front: convert_stencil_face(ds.stencil_front),
+                back: convert_stencil_face(ds.stencil_back),
                 read_mask: ds.stencil_read_mask,
                 write_mask: ds.stencil_write_mask,
             },
@@ -691,18 +722,14 @@ fn build_wgpu_pipeline(
         vertex: wgpu::VertexState {
             module: &vs_module,
             entry_point: Some(desc.vertex_entry.as_str()),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
             buffers: &vb_layouts,
         },
         fragment: Some(wgpu::FragmentState {
             module: fragment_module,
             entry_point: Some(desc.fragment_entry.as_str()),
-            compilation_options: Default::default(),
-            targets: color_targets
-                .iter()
-                .map(|t| t.clone())
-                .collect::<Vec<_>>()
-                .as_slice(),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: color_targets.as_slice(),
         }),
         primitive: wgpu::PrimitiveState {
             topology: convert_topology(desc.primitive.topology),
@@ -734,7 +761,7 @@ fn build_wgpu_pipeline(
 }
 
 /// True if a target format applies an sRGB transfer function on write.
-fn format_is_srgb(format: TextureFormat) -> bool {
+const fn format_is_srgb(format: TextureFormat) -> bool {
     matches!(
         format,
         TextureFormat::Rgba8UnormSrgb | TextureFormat::Bgra8UnormSrgb
@@ -747,12 +774,16 @@ fn format_is_srgb(format: TextureFormat) -> bool {
 /// target the hardware then re-encodes them to sRGB on write. So an sRGB
 /// clear color (e.g. from an 8-bit `Color`) must be linearized first,
 /// otherwise the visible result is too bright. Non-sRGB targets pass through.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "clear-colour components are normalized [0, 1] values; f32 precision is ample for the sRGB→linear conversion"
+)]
 fn clear_color_for_format(r: f64, g: f64, b: f64, a: f64, format: TextureFormat) -> wgpu::Color {
     if format_is_srgb(format) {
         wgpu::Color {
-            r: crate::gradient::srgb_to_linear(r as f32) as f64,
-            g: crate::gradient::srgb_to_linear(g as f32) as f64,
-            b: crate::gradient::srgb_to_linear(b as f32) as f64,
+            r: f64::from(crate::gradient::srgb_to_linear(r as f32)),
+            g: f64::from(crate::gradient::srgb_to_linear(g as f32)),
+            b: f64::from(crate::gradient::srgb_to_linear(b as f32)),
             a, // alpha is always linear
         }
     } else {
@@ -760,7 +791,7 @@ fn clear_color_for_format(r: f64, g: f64, b: f64, a: f64, format: TextureFormat)
     }
 }
 
-fn convert_compare(c: crate::pipeline::CompareFunction) -> wgpu::CompareFunction {
+const fn convert_compare(c: crate::pipeline::CompareFunction) -> wgpu::CompareFunction {
     use crate::pipeline::CompareFunction as CF;
     match c {
         CF::Never => wgpu::CompareFunction::Never,
@@ -774,7 +805,7 @@ fn convert_compare(c: crate::pipeline::CompareFunction) -> wgpu::CompareFunction
     }
 }
 
-fn convert_stencil_op(op: crate::pipeline::StencilOperation) -> wgpu::StencilOperation {
+const fn convert_stencil_op(op: crate::pipeline::StencilOperation) -> wgpu::StencilOperation {
     use crate::pipeline::StencilOperation as SO;
     match op {
         SO::Keep => wgpu::StencilOperation::Keep,
@@ -788,7 +819,7 @@ fn convert_stencil_op(op: crate::pipeline::StencilOperation) -> wgpu::StencilOpe
     }
 }
 
-fn convert_stencil_face(f: &crate::pipeline::StencilFaceState) -> wgpu::StencilFaceState {
+const fn convert_stencil_face(f: crate::pipeline::StencilFaceState) -> wgpu::StencilFaceState {
     wgpu::StencilFaceState {
         compare: convert_compare(f.compare),
         fail_op: convert_stencil_op(f.fail_op),
@@ -811,11 +842,16 @@ pub struct WgpuPipelineCache {
 
 impl WgpuPipelineCache {
     /// Create an empty cache.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Get or compile a pipeline for the descriptor.
+    ///
+    /// # Errors
+    /// Returns [`GpuError::OperationFailed`] if the descriptor uses a colour
+    /// target format wgpu cannot represent.
     pub fn get_or_create(
         &self,
         device: &wgpu::Device,
@@ -903,6 +939,7 @@ pub struct WgpuExecutor {
 
 impl WgpuExecutor {
     /// Create a new executor.
+    #[must_use]
     pub fn new(context: &WgpuContext) -> Self {
         Self {
             device: context.device.clone(),
@@ -956,13 +993,17 @@ impl WgpuExecutor {
     }
 
     /// Access the underlying pipeline cache.
-    pub fn pipeline_cache(&self) -> &Arc<WgpuPipelineCache> {
+    pub const fn pipeline_cache(&self) -> &Arc<WgpuPipelineCache> {
         &self.pipelines
     }
 
     /// Register a render pipeline with a stable id.
     ///
     /// The id is the value you pass to `CommandBuffer::set_pipeline`.
+    ///
+    /// # Errors
+    /// Returns [`GpuError::OperationFailed`] if the descriptor uses a colour
+    /// target format wgpu cannot represent.
     pub fn register_pipeline(
         &self,
         pipeline_id: u64,
@@ -991,7 +1032,7 @@ impl WgpuExecutor {
         self.pipelines.len()
     }
 
-    /// Number of registered (pipeline_id → pipeline) mappings.
+    /// Number of registered (`pipeline_id` → pipeline) mappings.
     pub fn registered_pipeline_count(&self) -> usize {
         self.pipeline_by_id.lock().len()
     }
@@ -1005,11 +1046,24 @@ impl WgpuExecutor {
     /// crate's `CommandBuffer` was a write-only sink. The executor closes
     /// the loop so callers can submit their recorded commands to the GPU
     /// and see pixels change.
+    ///
+    /// # Errors
+    /// Returns an error if replaying a render pass fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive match over DrawCommand that splits the stream into render passes and copies; the arms share pass state, so splitting would need a state-machine refactor"
+    )]
     pub fn execute(
         &self,
         surface: &WgpuSurface,
         commands: &CommandBuffer,
     ) -> GpuResult<ExecuteStats> {
+        /// Whether a render pass is currently being accumulated.
+        enum PassState {
+            None,
+            Open { clear: Option<wgpu::Color> },
+        }
+
         let mut stats = ExecuteStats::default();
 
         let mut encoder = self
@@ -1025,19 +1079,14 @@ impl WgpuExecutor {
         // For the first pass with no prior Clear the surface is loaded (not
         // cleared). This matches the default wgpu behaviour and lets
         // consumers record a Clear command explicitly when they want one.
-        enum PassState {
-            None,
-            Open { clear: Option<wgpu::Color> },
-        }
-
-        let mut state = PassState::None;
+        let mut pass_state = PassState::None;
         let mut pending_ops: Vec<&DrawCommand> = Vec::new();
 
         let flush_pass = |enc: &mut wgpu::CommandEncoder,
                           clear: Option<wgpu::Color>,
                           ops: &[&DrawCommand],
                           stats: &mut ExecuteStats,
-                          ctx: &WgpuExecutor,
+                          ctx: &Self,
                           view: &wgpu::TextureView|
          -> GpuResult<()> {
             if clear.is_none() && ops.is_empty() {
@@ -1047,8 +1096,11 @@ impl WgpuExecutor {
                 // Attach the stencil buffer (if enabled) and clear it at pass
                 // start, so stencil-then-cover works and no stencil state
                 // leaks between path draws.
-                let stencil_guard = ctx.stencil.lock();
-                let stencil_view = stencil_guard
+                // The view keeps the texture alive on its own, so the lock
+                // is released as soon as the view exists.
+                let stencil_view = ctx
+                    .stencil
+                    .lock()
                     .as_ref()
                     .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
                 let depth_stencil_attachment =
@@ -1071,10 +1123,7 @@ impl WgpuExecutor {
                         view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: match clear {
-                                Some(c) => wgpu::LoadOp::Clear(c),
-                                None => wgpu::LoadOp::Load,
-                            },
+                            load: clear.map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -1104,10 +1153,10 @@ impl WgpuExecutor {
                             size,
                         } => {
                             if let Some(buf) = buffers.get(buffer_id) {
-                                let slice = match size {
-                                    Some(sz) => buf.slice(*offset..*offset + sz),
-                                    None => buf.slice(*offset..),
-                                };
+                                let slice = size.as_ref().map_or_else(
+                                    || buf.slice(*offset..),
+                                    |sz| buf.slice(*offset..*offset + sz),
+                                );
                                 pass.set_vertex_buffer(*slot, slice);
                             }
                         }
@@ -1118,10 +1167,10 @@ impl WgpuExecutor {
                             size,
                         } => {
                             if let Some(buf) = buffers.get(buffer_id) {
-                                let slice = match size {
-                                    Some(sz) => buf.slice(*offset..*offset + sz),
-                                    None => buf.slice(*offset..),
-                                };
+                                let slice = size.as_ref().map_or_else(
+                                    || buf.slice(*offset..),
+                                    |sz| buf.slice(*offset..*offset + sz),
+                                );
                                 pass.set_index_buffer(slice, convert_index_format(*format));
                             }
                         }
@@ -1140,10 +1189,10 @@ impl WgpuExecutor {
                         }
                         DrawCommand::SetBlendConstant { color } => {
                             pass.set_blend_constant(wgpu::Color {
-                                r: color[0] as f64,
-                                g: color[1] as f64,
-                                b: color[2] as f64,
-                                a: color[3] as f64,
+                                r: f64::from(color[0]),
+                                g: f64::from(color[1]),
+                                b: f64::from(color[2]),
+                                a: f64::from(color[3]),
                             });
                         }
                         DrawCommand::SetStencilReference { reference } => {
@@ -1184,10 +1233,6 @@ impl WgpuExecutor {
                         DrawCommand::InsertDebugMarker { label } => {
                             pass.insert_debug_marker(label);
                         }
-                        // Bind groups are not yet wired through the
-                        // executor — callers register them externally via
-                        // wgpu. We skip without erroring.
-                        DrawCommand::SetBindGroup { .. } => {}
                         // Copy commands cannot happen inside a render pass;
                         // they're split out before we reach here.
                         DrawCommand::CopyBufferToBuffer { .. }
@@ -1198,7 +1243,11 @@ impl WgpuExecutor {
                         // Compute dispatches are filtered out before the pass
                         // is built (this executor has no compute pass); they
                         // must never be replayed as a draw.
-                        DrawCommand::DispatchCompute { .. } => {}
+                        //
+                        // Bind groups are not yet wired through the
+                        // executor — callers register them externally via
+                        // wgpu. We skip without erroring.
+                        DrawCommand::DispatchCompute { .. } | DrawCommand::SetBindGroup { .. } => {}
                     }
                 }
             }
@@ -1210,18 +1259,18 @@ impl WgpuExecutor {
                 DrawCommand::Clear { color } => {
                     // Close any existing pass first, then start a fresh one
                     // with the clear color recorded.
-                    if let PassState::Open { clear } = &state {
-                        let refs: Vec<&DrawCommand> = pending_ops.iter().copied().collect();
+                    if let PassState::Open { clear } = &pass_state {
+                        let refs: Vec<&DrawCommand> = pending_ops.clone();
                         flush_pass(&mut encoder, *clear, &refs, &mut stats, self, &surface.view)?;
                         pending_ops.clear();
                     }
                     stats.clears += 1;
-                    state = PassState::Open {
+                    pass_state = PassState::Open {
                         clear: Some(clear_color_for_format(
-                            color.red() as f64 / 255.0,
-                            color.green() as f64 / 255.0,
-                            color.blue() as f64 / 255.0,
-                            color.alpha() as f64 / 255.0,
+                            f64::from(color.red()) / 255.0,
+                            f64::from(color.green()) / 255.0,
+                            f64::from(color.blue()) / 255.0,
+                            f64::from(color.alpha()) / 255.0,
                             surface.format,
                         )),
                     };
@@ -1235,11 +1284,11 @@ impl WgpuExecutor {
                 } => {
                     // Flush any open render pass first — copies must run
                     // outside a render pass.
-                    if let PassState::Open { clear } = &state {
-                        let refs: Vec<&DrawCommand> = pending_ops.iter().copied().collect();
+                    if let PassState::Open { clear } = &pass_state {
+                        let refs: Vec<&DrawCommand> = pending_ops.clone();
                         flush_pass(&mut encoder, *clear, &refs, &mut stats, self, &surface.view)?;
                         pending_ops.clear();
-                        state = PassState::None;
+                        pass_state = PassState::None;
                     }
                     let buffers = self.buffers.lock();
                     if let (Some(s), Some(d)) = (buffers.get(src), buffers.get(dst)) {
@@ -1264,8 +1313,8 @@ impl WgpuExecutor {
                 }
                 other => {
                     // Anything else is pass content.
-                    if matches!(state, PassState::None) {
-                        state = PassState::Open { clear: None };
+                    if matches!(pass_state, PassState::None) {
+                        pass_state = PassState::Open { clear: None };
                     }
                     pending_ops.push(other);
                 }
@@ -1273,8 +1322,8 @@ impl WgpuExecutor {
         }
 
         // Flush any remaining pending pass.
-        if let PassState::Open { clear } = &state {
-            let refs: Vec<&DrawCommand> = pending_ops.iter().copied().collect();
+        if let PassState::Open { clear } = &pass_state {
+            let refs: Vec<&DrawCommand> = pending_ops.clone();
             flush_pass(&mut encoder, *clear, &refs, &mut stats, self, &surface.view)?;
         }
 
@@ -1324,12 +1373,14 @@ impl WgpuStencilSurface {
     }
 
     /// Access the stencil view (for passing into a render pass).
-    pub fn view(&self) -> &wgpu::TextureView {
+    #[must_use]
+    pub const fn view(&self) -> &wgpu::TextureView {
         &self.depth_stencil_view
     }
 
     /// Access the stencil texture.
-    pub fn texture(&self) -> &wgpu::Texture {
+    #[must_use]
+    pub const fn texture(&self) -> &wgpu::Texture {
         &self.depth_stencil_texture
     }
 }
@@ -1369,12 +1420,13 @@ impl std::fmt::Debug for WgpuGpuImageBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WgpuGpuImageBackend")
             .field("live_textures", &self.textures.lock().len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl WgpuGpuImageBackend {
     /// Build a backend from an existing `WgpuContext`.
+    #[must_use]
     pub fn new(context: &WgpuContext) -> Self {
         Self {
             device: context.device.clone(),
@@ -1385,12 +1437,17 @@ impl WgpuGpuImageBackend {
     }
 
     /// Number of live GPU textures held by this backend.
+    #[must_use]
     pub fn live_texture_count(&self) -> usize {
         self.textures.lock().len()
     }
 }
 
-fn codec_format_to_wgpu(
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "fallible by design: GpuImageError::UnsupportedFormat is the slot for codec formats wgpu cannot represent"
+)]
+const fn codec_format_to_wgpu(
     format: CodecGpuTextureFormat,
 ) -> Result<wgpu::TextureFormat, GpuImageError> {
     Ok(match format {
@@ -1415,8 +1472,8 @@ impl GpuImageBackend for WgpuGpuImageBackend {
             return Err(GpuImageError::UploadFailed("empty image".into()));
         }
         let wgpu_format = codec_format_to_wgpu(format)?;
-        let width = info.width() as u32;
-        let height = info.height() as u32;
+        let width = info.width().cast_unsigned();
+        let height = info.height().cast_unsigned();
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("skia-rs gpu image"),
@@ -1445,7 +1502,9 @@ impl GpuImageBackend for WgpuGpuImageBackend {
             pixels,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(row_bytes as u32),
+                bytes_per_row: Some(u32::try_from(row_bytes).map_err(|_| {
+                    GpuImageError::UploadFailed("row bytes exceed u32::MAX".into())
+                })?),
                 rows_per_image: Some(height),
             },
             wgpu::Extent3d {
@@ -1476,14 +1535,15 @@ impl GpuImageBackend for WgpuGpuImageBackend {
         dst: &mut [u8],
         dst_row_bytes: usize,
     ) -> Result<(), GpuImageError> {
-        let width = info.width() as u32;
-        let height = info.height() as u32;
-        let bpp = format.bytes_per_pixel() as u32;
+        let width = info.width().cast_unsigned();
+        let height = info.height().cast_unsigned();
+        let bpp = u32::try_from(format.bytes_per_pixel())
+            .map_err(|_| GpuImageError::ReadBackFailed("bytes per pixel exceed u32::MAX".into()))?;
         // wgpu requires buffer rows to be aligned to COPY_BYTES_PER_ROW_ALIGNMENT (256).
         let unpadded_bpr = width * bpp;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let padded_bpr = unpadded_bpr.div_ceil(align) * align;
-        let buffer_size = (padded_bpr * height) as u64;
+        let buffer_size = u64::from(padded_bpr * height);
 
         let textures = self.textures.lock();
         let texture = textures.get(&handle.id).ok_or_else(|| {
@@ -1632,11 +1692,7 @@ mod tests {
             TF::Depth24Stencil8,
             TF::Depth32Float,
         ] {
-            assert!(
-                convert_texture_format(f).is_some(),
-                "format {:?} unmapped",
-                f
-            );
+            assert!(convert_texture_format(f).is_some(), "format {f:?} unmapped");
         }
     }
 
@@ -1714,18 +1770,16 @@ mod tests {
         // pipeline layout, every builtin whose shader declared a @group(0)
         // binding failed pipeline creation. Auto-layout must let all of them
         // compile. Requires a GPU adapter; skips gracefully without one.
-        let ctx = match WgpuContext::new_blocking() {
-            Ok(c) => c,
-            Err(_) => {
-                eprintln!("no wgpu adapter available; skipping builtin pipeline test");
-                return;
-            }
-        };
         use crate::pipeline::{
             BlendState, ColorTargetState, RenderPipelineDescriptor, VertexAttribute,
             VertexBufferLayout, VertexFormat, VertexStepMode,
         };
         use crate::shader::builtin;
+
+        let Ok(ctx) = WgpuContext::new_blocking() else {
+            eprintln!("no wgpu adapter available; skipping builtin pipeline test");
+            return;
+        };
 
         let layout = VertexBufferLayout {
             stride: 16,
@@ -1784,7 +1838,7 @@ mod tests {
         assert!((c.r - 0.5).abs() < 1e-9, "non-sRGB passes through");
 
         let cs = clear_color_for_format(0.5, 0.5, 0.5, 1.0, TextureFormat::Rgba8UnormSrgb);
-        let expected = crate::gradient::srgb_to_linear(0.5) as f64;
+        let expected = f64::from(crate::gradient::srgb_to_linear(0.5));
         assert!(
             (cs.r - expected).abs() < 1e-6,
             "sRGB target linearizes clear"

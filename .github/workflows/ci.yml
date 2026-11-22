@@ -54,6 +54,11 @@ jobs:
       # workspace `[lints]` table) as hard errors. Justified false positives
       # for the Skia port carry narrow `#[allow(..., reason = "...")]`.
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Feature-gated GPU backend code is invisible to the default build, so
+      # lint it explicitly (Metal is macOS-only; it is covered by the
+      # conformance build on macos-latest).
+      - name: Clippy (GPU backends)
+        run: cargo clippy --workspace --all-targets --features "wgpu-backend,vulkan,opengl" -- -D warnings
 
   # ==========================================================================
   # Build & Test Matrix

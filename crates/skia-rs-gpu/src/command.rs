@@ -507,13 +507,13 @@ impl CommandBuffer {
 
     /// Check if the buffer is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.commands.is_empty()
     }
 
     /// Get the number of commands.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.commands.len()
     }
 }

@@ -3,6 +3,15 @@
 //! This module provides utilities for generating and rendering SDFs,
 //! which enable resolution-independent rendering of text and vector shapes.
 
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+#![allow(
+    clippy::manual_midpoint,
+    reason = "faithful port of Skia's f32 averaging (SkScalarAve); f32::midpoint rounds via f64 and diverges from Skia"
+)]
+
 use crate::cast_util::{scalar_from_u32, scalar_from_usize};
 use skia_rs_core::cast::f32_to_u8_sat;
 use skia_rs_core::{Point, Rect};
@@ -548,13 +557,13 @@ impl SdfTextBatch {
 
     /// Check if empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.instances.is_empty()
     }
 
     /// Get instance count.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.instances.len()
     }
 

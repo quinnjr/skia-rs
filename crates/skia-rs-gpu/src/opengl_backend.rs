@@ -112,6 +112,7 @@ impl OpenGLVersion {
     };
 
     /// Create a new version.
+    #[must_use]
     pub const fn new(major: u32, minor: u32, is_es: bool) -> Self {
         Self {
             major,
@@ -121,6 +122,7 @@ impl OpenGLVersion {
     }
 
     /// Check if version meets minimum requirement.
+    #[must_use]
     pub fn meets(&self, min: &Self) -> bool {
         if self.is_es != min.is_es {
             return false;
@@ -165,6 +167,10 @@ impl Default for OpenGLContextConfig {
 
 /// OpenGL capabilities and limits.
 #[derive(Debug, Clone, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors an independent OpenGL feature/extension flag; a bitflags or enum encoding would obscure the 1:1 mapping to GL queries"
+)]
 pub struct OpenGLCaps {
     /// Base GPU capabilities.
     pub base: GpuCaps,
@@ -258,7 +264,8 @@ pub enum GLShaderType {
 #[cfg(feature = "opengl")]
 impl GLShaderType {
     /// Convert to glow shader type.
-    pub fn to_gl(self) -> u32 {
+    #[must_use]
+    pub const fn to_gl(self) -> u32 {
         match self {
             Self::Vertex => glow::VERTEX_SHADER,
             Self::Fragment => glow::FRAGMENT_SHADER,
@@ -273,17 +280,18 @@ impl GLShaderType {
 /// OpenGL texture format information.
 #[derive(Debug, Clone, Copy)]
 pub struct GLTextureFormat {
-    /// Internal format (e.g., GL_RGBA8).
+    /// Internal format (e.g., `GL_RGBA8`).
     pub internal_format: u32,
-    /// Format (e.g., GL_RGBA).
+    /// Format (e.g., `GL_RGBA`).
     pub format: u32,
-    /// Type (e.g., GL_UNSIGNED_BYTE).
+    /// Type (e.g., `GL_UNSIGNED_BYTE`).
     pub data_type: u32,
 }
 
-/// Convert TextureFormat to OpenGL format.
+/// Convert `TextureFormat` to OpenGL format.
 #[cfg(feature = "opengl")]
-pub fn texture_format_to_gl(format: TextureFormat) -> GLTextureFormat {
+#[must_use]
+pub const fn texture_format_to_gl(format: TextureFormat) -> GLTextureFormat {
     match format {
         TextureFormat::Rgba8Unorm => GLTextureFormat {
             internal_format: glow::RGBA8,
@@ -378,7 +386,8 @@ pub enum GLBlendFactor {
 #[cfg(feature = "opengl")]
 impl GLBlendFactor {
     /// Convert to OpenGL constant.
-    pub fn to_gl(self) -> u32 {
+    #[must_use]
+    pub const fn to_gl(self) -> u32 {
         match self {
             Self::Zero => glow::ZERO,
             Self::One => glow::ONE,
@@ -418,7 +427,8 @@ pub enum GLBlendEquation {
 #[cfg(feature = "opengl")]
 impl GLBlendEquation {
     /// Convert to OpenGL constant.
-    pub fn to_gl(self) -> u32 {
+    #[must_use]
+    pub const fn to_gl(self) -> u32 {
         match self {
             Self::Add => glow::FUNC_ADD,
             Self::Subtract => glow::FUNC_SUBTRACT,
@@ -454,7 +464,8 @@ pub enum GLCompareFunc {
 #[cfg(feature = "opengl")]
 impl GLCompareFunc {
     /// Convert to OpenGL constant.
-    pub fn to_gl(self) -> u32 {
+    #[must_use]
+    pub const fn to_gl(self) -> u32 {
         match self {
             Self::Never => glow::NEVER,
             Self::Less => glow::LESS,
@@ -493,7 +504,8 @@ pub enum GLStencilOp {
 #[cfg(feature = "opengl")]
 impl GLStencilOp {
     /// Convert to OpenGL constant.
-    pub fn to_gl(self) -> u32 {
+    #[must_use]
+    pub const fn to_gl(self) -> u32 {
         match self {
             Self::Keep => glow::KEEP,
             Self::Zero => glow::ZERO,
@@ -534,7 +546,8 @@ pub enum GLFrontFace {
 #[cfg(feature = "opengl")]
 impl GLFrontFace {
     /// Convert to OpenGL constant.
-    pub fn to_gl(self) -> u32 {
+    #[must_use]
+    pub const fn to_gl(self) -> u32 {
         match self {
             Self::Ccw => glow::CCW,
             Self::Cw => glow::CW,
@@ -557,7 +570,8 @@ pub enum GLPolygonMode {
 #[cfg(feature = "opengl")]
 impl GLPolygonMode {
     /// Convert to OpenGL constant.
-    pub fn to_gl(self) -> u32 {
+    #[must_use]
+    pub const fn to_gl(self) -> u32 {
         match self {
             Self::Fill => glow::FILL,
             Self::Line => glow::LINE,
@@ -592,6 +606,10 @@ impl OpenGLContext {
     ///
     /// # Safety
     /// The provided glow context must be valid and current.
+    ///
+    /// # Errors
+    /// Returns [`GpuError::DeviceCreation`] if the `GL_VERSION` string cannot
+    /// be parsed or the context is older than the default minimum version.
     pub unsafe fn from_glow(gl: glow::Context) -> GpuResult<Self> {
         // SAFETY: gl is valid per function contract
         unsafe { Self::from_glow_with_config(gl, OpenGLContextConfig::default()) }
@@ -601,6 +619,14 @@ impl OpenGLContext {
     ///
     /// # Safety
     /// The provided glow context must be valid and current.
+    ///
+    /// # Errors
+    /// Returns [`GpuError::DeviceCreation`] if the `GL_VERSION` string cannot
+    /// be parsed or the context is older than `config.min_version`.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public constructor takes the config by value (builder-style, like Skia's GrContextOptions); changing to a reference would break callers"
+    )]
     pub unsafe fn from_glow_with_config(
         gl: glow::Context,
         config: OpenGLContextConfig,
@@ -668,8 +694,7 @@ impl OpenGLContext {
             Ok((major, minor, is_es))
         } else {
             Err(GpuError::DeviceCreation(format!(
-                "Failed to parse OpenGL version: {}",
-                version
+                "Failed to parse OpenGL version: {version}"
             )))
         }
     }
@@ -731,6 +756,10 @@ impl OpenGLContext {
     }
 
     /// Query OpenGL capabilities.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a flat, linear sequence of independent glGet queries; splitting it would only scatter the field-by-field mapping"
+    )]
     unsafe fn query_caps(
         gl: &glow::Context,
         version: OpenGLVersion,
@@ -738,7 +767,8 @@ impl OpenGLContext {
     ) -> OpenGLCaps {
         // SAFETY: gl is valid per function contract
         unsafe {
-            let get_int = |pname| gl.get_parameter_i32(pname) as u32;
+            // GL reports limits as GLint; reinterpret as unsigned exactly as before.
+            let get_int = |pname| gl.get_parameter_i32(pname).cast_unsigned();
             let get_float = |pname| gl.get_parameter_f32(pname);
 
             let max_texture_size = get_int(glow::MAX_TEXTURE_SIZE);
@@ -818,7 +848,7 @@ impl OpenGLContext {
             let max_viewport_dims = {
                 let mut dims = [0i32; 2];
                 gl.get_parameter_i32_slice(glow::MAX_VIEWPORT_DIMS, &mut dims);
-                [dims[0] as u32, dims[1] as u32]
+                [dims[0].cast_unsigned(), dims[1].cast_unsigned()]
             };
 
             OpenGLCaps {
@@ -884,7 +914,9 @@ impl OpenGLContext {
     unsafe fn get_extensions(gl: &glow::Context) -> Vec<String> {
         // SAFETY: gl is valid per function contract
         unsafe {
-            let num_extensions = gl.get_parameter_i32(glow::NUM_EXTENSIONS) as u32;
+            // A negative count can only come from a broken driver; treat it as none.
+            let num_extensions =
+                u32::try_from(gl.get_parameter_i32(glow::NUM_EXTENSIONS)).unwrap_or(0);
             (0..num_extensions)
                 .map(|i| gl.get_parameter_indexed_string(glow::EXTENSIONS, i))
                 .collect()
@@ -892,12 +924,12 @@ impl OpenGLContext {
     }
 
     /// Get the glow context.
-    pub fn gl(&self) -> &glow::Context {
+    pub const fn gl(&self) -> &glow::Context {
         &self.gl
     }
 
     /// Get OpenGL capabilities.
-    pub fn opengl_caps(&self) -> &OpenGLCaps {
+    pub const fn opengl_caps(&self) -> &OpenGLCaps {
         &self.caps
     }
 
@@ -1170,6 +1202,7 @@ impl GpuContext for OpenGLContext {
 /// `glDrawElements` control should skip this and use [`OpenGLContext::gl`]
 /// with hand-rolled GL code. See the module-level docs for the rationale.
 ///
+/// # Errors
 /// Returns `Err(GpuError::DeviceCreation)` if the host has no GL driver that
 /// wgpu can enumerate. This is expected on headless CI without GPU access;
 /// callers should degrade gracefully.
@@ -1191,6 +1224,10 @@ impl OpenGLContext {
     /// See [`new_opengl_wgpu_context`] for the standalone constructor that
     /// returns the underlying [`crate::wgpu_backend::WgpuContext`] if you
     /// need access to the device/queue for custom surface creation.
+    ///
+    /// # Errors
+    /// Returns [`GpuError::DeviceCreation`] if wgpu cannot find a GL adapter
+    /// (see [`new_opengl_wgpu_context`]).
     pub fn new_wgpu_executor(
         &self,
     ) -> GpuResult<(
@@ -1213,11 +1250,11 @@ mod tests {
         assert_eq!(v.major, 4);
         assert_eq!(v.minor, 5);
         assert!(!v.is_es);
-        assert_eq!(format!("{}", v), "OpenGL 4.5");
+        assert_eq!(format!("{v}"), "OpenGL 4.5");
 
         let es = OpenGLVersion::GLES_3_0;
         assert!(es.is_es);
-        assert_eq!(format!("{}", es), "OpenGL ES 3.0");
+        assert_eq!(format!("{es}"), "OpenGL ES 3.0");
     }
 
     #[test]
@@ -1273,7 +1310,7 @@ mod tests {
             Err(GpuError::DeviceCreation(_)) => {
                 // Expected on headless CI without a GL driver.
             }
-            Err(other) => panic!("unexpected error kind: {:?}", other),
+            Err(other) => panic!("unexpected error kind: {other:?}"),
         }
     }
 }

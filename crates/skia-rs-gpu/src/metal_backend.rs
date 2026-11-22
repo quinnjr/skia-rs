@@ -25,7 +25,7 @@ use crate::{
 };
 
 #[cfg(feature = "metal")]
-use metal::{Device, DeviceRef, MTLPixelFormat, MTLSize};
+use metal::{Device, DeviceRef, MTLPixelFormat};
 
 /// Metal feature set levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -125,6 +125,10 @@ pub struct MetalContextConfig {
 
 /// Metal capabilities and limits.
 #[derive(Debug, Clone, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors an independent MTLDevice capability query; keeping them as named fields preserves the 1:1 mapping to Metal"
+)]
 pub struct MetalCaps {
     /// Base GPU capabilities.
     pub base: GpuCaps,
@@ -193,12 +197,13 @@ pub struct MetalPixelFormatInfo {
     pub renderable: bool,
 }
 
-/// Convert TextureFormat to Metal pixel format (nominal mapping).
+/// Convert `TextureFormat` to Metal pixel format (nominal mapping).
 ///
 /// Note: `Depth24Stencil8` maps to `Depth24Unorm_Stencil8`, which is **not**
 /// supported on all Metal devices (Apple-silicon GPUs do not support it).
 #[cfg(feature = "metal")]
-pub fn texture_format_to_metal(format: TextureFormat) -> MTLPixelFormat {
+#[must_use]
+pub const fn texture_format_to_metal(format: TextureFormat) -> MTLPixelFormat {
     match format {
         TextureFormat::Rgba8Unorm => MTLPixelFormat::RGBA8Unorm,
         TextureFormat::Rgba8UnormSrgb => MTLPixelFormat::RGBA8Unorm_sRGB,
@@ -213,9 +218,10 @@ pub fn texture_format_to_metal(format: TextureFormat) -> MTLPixelFormat {
     }
 }
 
-/// Convert Metal pixel format to TextureFormat.
+/// Convert Metal pixel format to `TextureFormat`.
 #[cfg(feature = "metal")]
-pub fn metal_to_texture_format(format: MTLPixelFormat) -> Option<TextureFormat> {
+#[must_use]
+pub const fn metal_to_texture_format(format: MTLPixelFormat) -> Option<TextureFormat> {
     match format {
         MTLPixelFormat::RGBA8Unorm => Some(TextureFormat::Rgba8Unorm),
         MTLPixelFormat::RGBA8Unorm_sRGB => Some(TextureFormat::Rgba8UnormSrgb),
@@ -467,11 +473,26 @@ pub struct MetalContext {
 #[cfg(feature = "metal")]
 impl MetalContext {
     /// Create a new Metal context using the system default device.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError::DeviceCreation`] if the system has no Metal device.
     pub fn new() -> GpuResult<Self> {
         Self::with_config(MetalContextConfig::default())
     }
 
     /// Create a new Metal context with configuration.
+    ///
+    /// Falls back to the system default device when no device matches the
+    /// low-power / headless preference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError::DeviceCreation`] if the system has no Metal device.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public constructor takes the config by value (builder-style, like Skia's GrContextOptions); changing to a reference would break callers"
+    )]
     pub fn with_config(config: MetalContextConfig) -> GpuResult<Self> {
         let device = if config.prefer_low_power {
             Device::all()
@@ -494,6 +515,12 @@ impl MetalContext {
     }
 
     /// Create a new Metal context from an existing device.
+    ///
+    /// # Errors
+    ///
+    /// Currently never fails: creating the command queue and querying
+    /// capabilities are infallible in Metal. The `Result` keeps the signature
+    /// aligned with the other backends' constructors.
     pub fn from_device(device: Device) -> GpuResult<Self> {
         let command_queue = device.new_command_queue();
 
@@ -522,7 +549,7 @@ impl MetalContext {
 
         // Query texture limits based on feature set
         let (max_texture_size, max_3d_size, max_cube_size, max_array_layers) =
-            Self::get_texture_limits(&feature_set);
+            Self::get_texture_limits(feature_set);
 
         MetalCaps {
             base: GpuCaps {
@@ -554,10 +581,12 @@ impl MetalContext {
                 device.argument_buffers_support(),
                 metal::MTLArgumentBuffersTier::Tier1 | metal::MTLArgumentBuffersTier::Tier2
             ),
-            raster_order_groups: device.are_raster_order_groups_supported(),
+            raster_order_groups: device.raster_order_groups_supported(),
             float32_filtering: true, // Most Metal devices support this
             msaa_depth_resolve: true,
-            sparse_textures: device.supports_sparse_textures(),
+            // metal-rs exposes no sparse-texture query; sparse textures require the
+            // Apple6 GPU family (A13 / Apple silicon) or newer.
+            sparse_textures: device.supports_family(metal::MTLGPUFamily::Apple6),
             function_pointers: device.supports_function_pointers(),
             ray_tracing: device.supports_raytracing(),
             mesh_shaders: false, // Requires checking specific feature set
@@ -629,28 +658,29 @@ impl MetalContext {
     }
 
     /// Get texture limits for a feature set.
-    fn get_texture_limits(feature_set: &MetalFeatureSet) -> (u32, u32, u32, u32) {
+    ///
+    /// Apple3+ GPUs and every macOS family support 16384-texel 2D/cube
+    /// textures; older iOS families are limited to 8192.
+    const fn get_texture_limits(feature_set: MetalFeatureSet) -> (u32, u32, u32, u32) {
         match feature_set {
-            MetalFeatureSet::AppleFamily7
+            MetalFeatureSet::AppleFamily3
+            | MetalFeatureSet::AppleFamily4
+            | MetalFeatureSet::AppleFamily5
+            | MetalFeatureSet::AppleFamily6
+            | MetalFeatureSet::AppleFamily7
             | MetalFeatureSet::AppleFamily8
             | MetalFeatureSet::AppleFamily9
+            | MetalFeatureSet::MacosGpuFamily1V4
             | MetalFeatureSet::MacosGpuFamily2V1 => (16384, 2048, 16384, 2048),
-            MetalFeatureSet::AppleFamily5
-            | MetalFeatureSet::AppleFamily6
-            | MetalFeatureSet::MacosGpuFamily1V4 => (16384, 2048, 16384, 2048),
-            MetalFeatureSet::AppleFamily3 | MetalFeatureSet::AppleFamily4 => {
-                (16384, 2048, 16384, 2048)
-            }
             _ => (8192, 2048, 8192, 2048),
         }
     }
 
     /// Build adapter info from device.
     fn build_adapter_info(device: &DeviceRef, caps: &MetalCaps) -> GpuAdapterInfo {
-        let device_type = if device.is_low_power() {
+        // Apple Silicon GPUs are integrated even when not flagged low-power.
+        let device_type = if device.is_low_power() || caps.is_apple_silicon {
             GpuDeviceType::Integrated
-        } else if caps.is_apple_silicon {
-            GpuDeviceType::Integrated // Apple Silicon is technically integrated
         } else {
             GpuDeviceType::Discrete
         };
@@ -664,64 +694,75 @@ impl MetalContext {
     }
 
     /// Get the Metal device.
+    #[must_use]
     pub fn device(&self) -> &DeviceRef {
         &self.device
     }
 
     /// Get the command queue.
+    #[must_use]
     pub fn command_queue(&self) -> &metal::CommandQueueRef {
         &self.command_queue
     }
 
     /// Get Metal capabilities.
-    pub fn metal_caps(&self) -> &MetalCaps {
+    #[must_use]
+    pub const fn metal_caps(&self) -> &MetalCaps {
         &self.caps
     }
 
     /// Create a new command buffer.
+    #[must_use]
     pub fn new_command_buffer(&self) -> metal::CommandBuffer {
         self.command_queue.new_command_buffer().to_owned()
     }
 
     /// Create a new render pass descriptor.
+    #[must_use]
     pub fn new_render_pass_descriptor() -> metal::RenderPassDescriptor {
         metal::RenderPassDescriptor::new().to_owned()
     }
 
     /// Create a new texture descriptor.
+    #[must_use]
     pub fn new_texture_descriptor() -> metal::TextureDescriptor {
         metal::TextureDescriptor::new()
     }
 
     /// Create a new buffer with data.
+    #[must_use]
     pub fn new_buffer_with_data(&self, data: &[u8]) -> metal::Buffer {
         self.device.new_buffer_with_data(
-            data.as_ptr() as *const _,
+            data.as_ptr().cast(),
             data.len() as u64,
             metal::MTLResourceOptions::StorageModeShared,
         )
     }
 
     /// Create a new buffer with size.
+    #[must_use]
     pub fn new_buffer(&self, size: u64) -> metal::Buffer {
         self.device
             .new_buffer(size, metal::MTLResourceOptions::StorageModeShared)
     }
 
     /// Create a new texture.
+    #[must_use]
     pub fn new_texture(&self, descriptor: &metal::TextureDescriptorRef) -> metal::Texture {
         self.device.new_texture(descriptor)
     }
 
     /// Create a new sampler state.
+    #[must_use]
     pub fn new_sampler_state(
         &self,
         descriptor: &metal::SamplerDescriptorRef,
     ) -> metal::SamplerState {
-        self.device.new_sampler_state(descriptor)
+        self.device.new_sampler(descriptor)
     }
 
     /// Create a new depth stencil state.
+    #[must_use]
     pub fn new_depth_stencil_state(
         &self,
         descriptor: &metal::DepthStencilDescriptorRef,
@@ -730,31 +771,39 @@ impl MetalContext {
     }
 
     /// Compile a shader library from source.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Metal compiler's error message if `source` fails to compile.
     pub fn new_library_with_source(&self, source: &str) -> Result<metal::Library, String> {
         let options = metal::CompileOptions::new();
-        self.device
-            .new_library_with_source(source, &options)
-            .map_err(|e| e.to_string())
+        self.device.new_library_with_source(source, &options)
     }
 
     /// Create a render pipeline state.
+    ///
+    /// # Errors
+    ///
+    /// Returns Metal's error message if the descriptor is invalid (e.g.
+    /// missing functions or incompatible attachment formats).
     pub fn new_render_pipeline_state(
         &self,
         descriptor: &metal::RenderPipelineDescriptorRef,
     ) -> Result<metal::RenderPipelineState, String> {
-        self.device
-            .new_render_pipeline_state(descriptor)
-            .map_err(|e| e.to_string())
+        self.device.new_render_pipeline_state(descriptor)
     }
 
     /// Create a compute pipeline state.
+    ///
+    /// # Errors
+    ///
+    /// Returns Metal's error message if `function` is not a valid kernel.
     pub fn new_compute_pipeline_state(
         &self,
         function: &metal::FunctionRef,
     ) -> Result<metal::ComputePipelineState, String> {
         self.device
             .new_compute_pipeline_state_with_function(function)
-            .map_err(|e| e.to_string())
     }
 }
 
