@@ -16,6 +16,13 @@ use std::sync::Arc;
 /// Corresponds to Skia's `SkPathEffect`.
 pub trait PathEffect: Send + Sync + std::fmt::Debug {
     /// Apply the effect to a path.
+    ///
+    /// Mirrors `SkPathEffect::filterPath`'s two outcomes:
+    /// - `Some(path)`: the effect applied and `path` is what gets drawn. An
+    ///   *empty* path means "draw nothing" (e.g. a 2D tiling whose source
+    ///   has empty bounds, or a 1D stamp along a zero-length path).
+    /// - `None`: the effect could not apply (`filterPath` returned false),
+    ///   so callers draw the source path unchanged.
     fn apply(&self, path: &Path) -> Option<Path>;
 
     /// Get the kind of path effect for debugging.
@@ -809,7 +816,13 @@ impl PathEffect for TrimEffect {
                 if start_dist >= end_dist {
                     return Some(Path::new());
                 }
-                measure.get_segment(start_dist, end_dist)
+                // A degenerate segment draws nothing; `None` would make the
+                // caller draw the untrimmed source instead.
+                Some(
+                    measure
+                        .get_segment(start_dist, end_dist)
+                        .unwrap_or_default(),
+                )
             }
             TrimMode::Inverted => {
                 if start_dist >= end_dist {
@@ -1078,7 +1091,8 @@ impl PathEffect for Path1DEffect {
         let length = measure.length();
 
         if length <= 0.0 {
-            return None;
+            // Sk1DPathEffect still succeeds here: no stamps, nothing drawn.
+            return Some(Path::new());
         }
 
         let mut distance = self.phase;
@@ -1163,7 +1177,9 @@ impl PathEffect for Path2DEffect {
 
         let bounds = src_path.bounds();
         if bounds.is_empty() {
-            return None;
+            // Sk2DPathEffect::filterPath succeeds with an empty result here
+            // (no tiles), so nothing is drawn rather than the source.
+            return Some(Path::new());
         }
         let mut builder = PathBuilder::new();
 
@@ -1257,7 +1273,9 @@ impl PathEffect for Line2DEffect {
 
         let bounds = src_path.bounds();
         if bounds.is_empty() {
-            return None;
+            // Sk2DPathEffect::filterPath succeeds with an empty result here
+            // (no tiles), so nothing is drawn rather than the source.
+            return Some(Path::new());
         }
         let mut builder = PathBuilder::new();
 
@@ -1376,6 +1394,55 @@ pub fn make_line_2d(width: Scalar, matrix: skia_rs_core::Matrix) -> Option<PathE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A horizontal line: non-empty path whose bounds have zero height.
+    fn flat_line() -> Path {
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 10.0).line_to(50.0, 10.0);
+        b.build()
+    }
+
+    /// A non-empty path with zero length.
+    fn zero_length() -> Path {
+        let mut b = PathBuilder::new();
+        b.move_to(5.0, 5.0).line_to(5.0, 5.0);
+        b.build()
+    }
+
+    fn square(size: Scalar) -> Path {
+        let mut b = PathBuilder::new();
+        b.add_rect(&skia_rs_core::Rect::from_xywh(0.0, 0.0, size, size));
+        b.build()
+    }
+
+    #[test]
+    fn effects_that_succeed_with_nothing_return_empty_not_none() {
+        // `None` makes callers draw the source unchanged; these cases succeed
+        // in Skia with an empty result, so nothing must be drawn.
+        let tile = Path2DEffect::new(skia_rs_core::Matrix::scale(4.0, 4.0), square(2.0)).unwrap();
+        let produced = tile.apply(&flat_line()).expect("2D effect applies");
+        assert!(produced.is_empty(), "empty-bounds source tiles to nothing");
+
+        let lines = Line2DEffect::new(1.0, skia_rs_core::Matrix::scale(4.0, 4.0)).unwrap();
+        let produced = lines.apply(&flat_line()).expect("line 2D effect applies");
+        assert!(
+            produced.is_empty(),
+            "empty-bounds source hatches to nothing"
+        );
+
+        let stamp = Path1DEffect::new(square(2.0), 5.0, 0.0, Path1DStyle::Translate).unwrap();
+        let produced = stamp.apply(&zero_length()).expect("1D effect applies");
+        assert!(produced.is_empty(), "zero-length source gets no stamps");
+    }
+
+    #[test]
+    fn effects_still_produce_geometry_for_real_sources() {
+        let tile = Path2DEffect::new(skia_rs_core::Matrix::scale(4.0, 4.0), square(2.0)).unwrap();
+        assert!(!tile.apply(&square(20.0)).unwrap().is_empty());
+
+        let stamp = Path1DEffect::new(square(2.0), 5.0, 0.0, Path1DStyle::Translate).unwrap();
+        assert!(!stamp.apply(&flat_line()).unwrap().is_empty());
+    }
 
     #[test]
     fn test_dash_effect() {
