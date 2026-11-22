@@ -1306,33 +1306,12 @@ const MAX_LATTICE_EXTENT: i64 = 1 << 16;
 /// See [`MAX_LATTICE_EXTENT`].
 const MAX_LATTICE_STAMPS: usize = 1 << 20;
 
-/// The lattice cells covered by `src`, as `(row, first_column, count)`
-/// spans, following `Sk2DPathEffect::filterPath`: the source is mapped into
-/// lattice space by `inverse`, its bounds are rounded to an integer rect, and
-/// the mapped path is scan-converted like `SkRegion::setPath` (non-AA, a cell
-/// is covered when its center `(x + 0.5, y + 0.5)` is inside, respecting the
-/// fill type). A source with no area covers no cells.
-///
-/// Rows and columns beyond [`MAX_LATTICE_EXTENT`] are not scanned.
-fn lattice_spans(src: &Path, inverse: &skia_rs_core::Matrix) -> Vec<(i32, i32, i32)> {
-    let mapped = src.transformed(inverse);
-    let b = mapped.bounds();
-    // SkRect::round (sk_float_round2int: floor(x + 0.5)).
-    let round = |v: Scalar| floor_to_i32(v + 0.5);
-    let (left, top, right, bottom) = (round(b.left), round(b.top), round(b.right), round(b.bottom));
-    if left >= right || top >= bottom {
-        return Vec::new();
-    }
-    // Truncate in i64 (the rounded edges saturate, so `right - left` could
-    // overflow i32); the clamped extents then fit comfortably in i32.
-    let clamp_end = |lo: i32, hi: i32| {
-        i32::try_from((i64::from(hi) - i64::from(lo)).min(MAX_LATTICE_EXTENT) + i64::from(lo))
-            .unwrap_or(hi)
-    };
-    let (right, bottom) = (clamp_end(left, right), clamp_end(top, bottom));
-
-    // Edges of the flattened path, with every contour implicitly closed.
-    let flat = flatten_path_to_lines(&mapped, 0.1);
+/// The lattice-space edges of `mapped`, flattened, with every contour
+/// implicitly closed, oriented downward as `(top, bottom, winding)` and
+/// sorted by their top. Horizontal edges are kept; they never cross a row
+/// center, so the scan skips them.
+fn lattice_edges(mapped: &Path) -> Vec<(Point, Point, i32)> {
+    let flat = flatten_path_to_lines(mapped, 0.1);
     let mut edges: Vec<(Point, Point)> = Vec::new();
     let (mut start, mut current) = (Point::zero(), Point::zero());
     for element in &flat {
@@ -1363,6 +1342,84 @@ fn lattice_spans(src: &Path, inverse: &skia_rs_core::Matrix) -> Vec<(i32, i32, i
         edges.push((current, start));
     }
 
+    let mut edges: Vec<(Point, Point, i32)> = edges
+        .into_iter()
+        .map(|(a, b)| if a.y < b.y { (a, b, 1) } else { (b, a, -1) })
+        .collect();
+    edges.sort_by(|p, q| p.0.y.total_cmp(&q.0.y));
+    edges
+}
+
+/// The inside intervals of one lattice row from its sorted `crossings`,
+/// per the fill rule; inverse fills take the complement within
+/// `[left, right)`.
+fn row_intervals(
+    crossings: &[(Scalar, i32)],
+    even_odd: bool,
+    inverse_fill: bool,
+    left: i32,
+    right: i32,
+) -> Vec<(Scalar, Scalar)> {
+    let mut intervals: Vec<(Scalar, Scalar)> = Vec::new();
+    let mut winding = 0;
+    let mut entered: Option<Scalar> = None;
+    for &(x, dir) in crossings {
+        winding += dir;
+        let inside = if even_odd {
+            winding % 2 != 0
+        } else {
+            winding != 0
+        };
+        match (inside, entered) {
+            (true, None) => entered = Some(x),
+            (false, Some(x0)) => {
+                intervals.push((x0, x));
+                entered = None;
+            }
+            _ => {}
+        }
+    }
+    if inverse_fill {
+        // The complement of the inside intervals within the lattice rect.
+        let mut complement = Vec::new();
+        let mut cursor = scalar_from_i32(left);
+        for &(x0, x1) in &intervals {
+            complement.push((cursor, x0));
+            cursor = x1;
+        }
+        complement.push((cursor, scalar_from_i32(right)));
+        intervals = complement;
+    }
+    intervals
+}
+
+/// The lattice cells covered by `src`, as `(row, first_column, count)`
+/// spans, following `Sk2DPathEffect::filterPath`: the source is mapped into
+/// lattice space by `inverse`, its bounds are rounded to an integer rect, and
+/// the mapped path is scan-converted like `SkRegion::setPath` (non-AA, a cell
+/// is covered when its center `(x + 0.5, y + 0.5)` is inside, respecting the
+/// fill type). A source with no area covers no cells.
+///
+/// Rows and columns beyond [`MAX_LATTICE_EXTENT`] are not scanned.
+fn lattice_spans(src: &Path, inverse: &skia_rs_core::Matrix) -> Vec<(i32, i32, i32)> {
+    let mapped = src.transformed(inverse);
+    let b = mapped.bounds();
+    // SkRect::round (sk_float_round2int: floor(x + 0.5)).
+    let round = |v: Scalar| floor_to_i32(v + 0.5);
+    let (left, top, right, bottom) = (round(b.left), round(b.top), round(b.right), round(b.bottom));
+    if left >= right || top >= bottom {
+        return Vec::new();
+    }
+    // Truncate in i64 (the rounded edges saturate, so `right - left` could
+    // overflow i32); the clamped extents then fit comfortably in i32.
+    let clamp_end = |lo: i32, hi: i32| {
+        i32::try_from((i64::from(hi) - i64::from(lo)).min(MAX_LATTICE_EXTENT) + i64::from(lo))
+            .unwrap_or(hi)
+    };
+    let (right, bottom) = (clamp_end(left, right), clamp_end(top, bottom));
+
+    let edges = lattice_edges(&mapped);
+
     let fill_type = mapped.fill_type();
     let even_odd = matches!(fill_type, FillType::EvenOdd | FillType::InverseEvenOdd);
     let inverse_fill = matches!(
@@ -1370,59 +1427,61 @@ fn lattice_spans(src: &Path, inverse: &skia_rs_core::Matrix) -> Vec<(i32, i32, i
         FillType::InverseWinding | FillType::InverseEvenOdd
     );
 
+    // Active-edge scan: edges enter the active list when the row reaches
+    // their top and leave once below, so each row only visits the edges
+    // that cross it.
+    let mut next_edge = 0;
+    let mut active: Vec<(Point, Point, i32)> = Vec::new();
+
     let mut spans = Vec::new();
     let mut crossings: Vec<(Scalar, i32)> = Vec::new();
+    let mut row_spans: Vec<(i32, i32)> = Vec::new();
     for y in top..bottom {
         let yc = scalar_from_i32(y) + 0.5;
+        while next_edge < edges.len() && edges[next_edge].0.y <= yc {
+            active.push(edges[next_edge]);
+            next_edge += 1;
+        }
+        active.retain(|(_, hi, _)| yc < hi.y);
+        if active.is_empty() && next_edge == edges.len() && !inverse_fill {
+            break;
+        }
         crossings.clear();
-        for &(a, b) in &edges {
-            let (lo, hi, dir) = if a.y < b.y { (a, b, 1) } else { (b, a, -1) };
-            if lo.y <= yc && yc < hi.y {
+        for &(lo, hi, dir) in &active {
+            if lo.y <= yc {
                 let x = ((yc - lo.y) / (hi.y - lo.y)).mul_add(hi.x - lo.x, lo.x);
                 crossings.push((x, dir));
             }
         }
         crossings.sort_by(|p, q| p.0.total_cmp(&q.0));
 
-        // Inside intervals along the row, per the fill rule.
-        let mut intervals: Vec<(Scalar, Scalar)> = Vec::new();
-        let mut winding = 0;
-        let mut entered: Option<Scalar> = None;
-        for &(x, dir) in &crossings {
-            winding += dir;
-            let inside = if even_odd {
-                winding % 2 != 0
-            } else {
-                winding != 0
-            };
-            match (inside, entered) {
-                (true, None) => entered = Some(x),
-                (false, Some(x0)) => {
-                    intervals.push((x0, x));
-                    entered = None;
-                }
-                _ => {}
-            }
-        }
-        if inverse_fill {
-            // The complement of the inside intervals within the lattice rect.
-            let mut complement = Vec::new();
-            let mut cursor = scalar_from_i32(left);
-            for &(x0, x1) in &intervals {
-                complement.push((cursor, x0));
-                cursor = x1;
-            }
-            complement.push((cursor, scalar_from_i32(right)));
-            intervals = complement;
-        }
+        let intervals = row_intervals(&crossings, even_odd, inverse_fill, left, right);
 
         // A cell x is covered when its center x + 0.5 lies in [x0, x1).
+        // Touching or overlapping runs merge into one span, as an SkRegion
+        // row does (two shapes sharing an edge can split the winding there).
+        row_spans.clear();
         for (x0, x1) in intervals {
             let first = ceil_to_i32(x0 - 0.5).max(left);
             let end = ceil_to_i32(x1 - 0.5).min(right);
             if first < end {
-                spans.push((y, first, end - first));
+                row_spans.push((first, end));
             }
+        }
+        row_spans.sort_unstable();
+        let mut merged: Option<(i32, i32)> = None;
+        for &(first, end) in &row_spans {
+            merged = match merged {
+                Some((m0, m1)) if first <= m1 => Some((m0, m1.max(end))),
+                Some((m0, m1)) => {
+                    spans.push((y, m0, m1 - m0));
+                    Some((first, end))
+                }
+                None => Some((first, end)),
+            };
+        }
+        if let Some((m0, m1)) = merged {
+            spans.push((y, m0, m1 - m0));
         }
     }
     spans
@@ -1700,6 +1759,27 @@ mod tests {
         assert_eq!(closes(&lines), 0);
         assert!(!lines.is_empty());
         assert_eq!(rec, StrokeRec::Stroke(2.0));
+    }
+
+    #[test]
+    fn line2d_merges_runs_split_by_a_shared_edge() {
+        // Two same-direction rects sharing the edge x = 6: under a 4x4
+        // lattice the left one covers only cell 0 and the right one cells
+        // 1..=9. An SkRegion row merges them into one run, so each hatch
+        // line starts at cell 0's center (x = 2), not at cell 1's (x = 6).
+        let mut b = PathBuilder::new();
+        b.add_rect(&skia_rs_core::Rect::new(0.0, 0.0, 6.0, 40.0));
+        b.add_rect(&skia_rs_core::Rect::new(6.0, 0.0, 40.0, 40.0));
+        let source = b.build();
+        let hatch = Line2DEffect::new(1.0, skia_rs_core::Matrix::scale(4.0, 4.0)).unwrap();
+        let mut rec = StrokeRec::Fill;
+        let lines = hatch.filter_path(&source, &mut rec).expect("applies");
+        let min_x = lines
+            .points()
+            .iter()
+            .map(|p| p.x)
+            .fold(Scalar::INFINITY, Scalar::min);
+        assert!((min_x - 2.0).abs() < 1e-4, "hatch starts at x = {min_x}");
     }
 
     #[test]
