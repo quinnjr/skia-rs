@@ -1042,7 +1042,10 @@ impl PathEffect for ComposeEffect {
         rec: &mut StrokeRec,
         cull: Option<&skia_rs_core::Rect>,
     ) -> Option<Path> {
-        let intermediate = self.inner.filter_path_culled(path, rec, cull);
+        // The outer effect measures the inner one's output (dash phase,
+        // trim lengths, stamp spacing), so the inner effect must produce its
+        // full, unculled geometry; only the outer one may cull.
+        let intermediate = self.inner.filter_path(path, rec);
         self.outer
             .filter_path_culled(intermediate.as_ref().unwrap_or(path), rec, cull)
     }
@@ -1263,9 +1266,9 @@ impl Path1DEffect {
 }
 
 /// The most points [`Path1DEffect`] emits (stamps times the stamp's point
-/// count, over all contours) before failing: a guard against non-finite or
+/// count, over all contours); further stamps are dropped. A guard against
 /// enormous path lengths and heavy stamps.
-const MAX_PATH1D_POINTS: Scalar = 4_194_304.0;
+const MAX_PATH1D_POINTS: usize = 4_194_304;
 
 /// `Sk1DPathEffect`'s per-contour stamp limit (`MAX_REASONABLE_ITERATIONS`):
 /// exceeding it fails the effect.
@@ -1285,20 +1288,11 @@ impl PathEffect for Path1DEffect {
         // without contours (an inverse-filled empty path must not flood
         // the clip), so there is no early failure here.
         let measure = PathMeasure::new(src_path);
-        // Output guard: stamps times the stamp's point count, over all
-        // contours (each contour starts at the phase).
-        let stamp_points =
-            scalar_from_i32(i32::try_from(self.path.points().len()).unwrap_or(i32::MAX));
-        let mut points: Scalar = 0.0;
-        for i in 0..measure.contour_count() {
-            let length = measure.contour_length(i).unwrap_or(0.0);
-            let stamps = (length - self.initial_offset).max(0.0) / self.advance;
-            let contour_points = stamps * stamp_points.max(1.0);
-            points += contour_points;
-            if !(points.is_finite() && points <= MAX_PATH1D_POINTS) {
-                return None;
-            }
-        }
+        // Output guard: at most MAX_PATH1D_POINTS points (stamps times the
+        // stamp's point count); past it the stamps are truncated, like the
+        // 2D effects, rather than failing (which would fill the source).
+        let stamp_points = self.path.points().len().max(1);
+        let mut stamps_left = (MAX_PATH1D_POINTS / stamp_points).max(1);
 
         // Sk1DPathEffect::onFilterPath: each contour restarts at the phase,
         // and more than MAX_REASONABLE_ITERATIONS stamps on one contour
@@ -1315,7 +1309,11 @@ impl PathEffect for Path1DEffect {
                 if governor == 0 {
                     return None;
                 }
+                if stamps_left == 0 {
+                    return Some(builder.build());
+                }
                 governor -= 1;
+                stamps_left -= 1;
                 if let Some((pos, tangent)) = measure.get_pos_tan_in_contour(i, distance) {
                     let transform = match self.style {
                         Path1DStyle::Translate => skia_rs_core::Matrix::translate(pos.x, pos.y),
@@ -1400,29 +1398,37 @@ impl Path2DEffect {
         });
         let spans = lattice_spans(src_path, &inverse, cull.as_ref());
 
-        // Spread the stamp budget evenly over the covered rows, so a
-        // truncated pattern still spans the whole source vertically. With
-        // more rows than stamps, every `stride`-th row gets one stamp.
-        let mut rows = spans.iter().map(|&(y, _, _)| y).collect::<Vec<_>>();
-        rows.dedup();
+        // Output budget: keep every stamp when the total fits. Otherwise
+        // share the budget across rows by need (water-filling: rows that
+        // need little keep everything, the rest share an equal cap), so a
+        // truncated pattern still spans the source. With more rows than
+        // stamps, every `stride`-th row gets one stamp.
         let budget = (MAX_LATTICE_POINTS / self.path.points().len().max(1)).max(1);
-        let stride = rows.len().div_ceil(budget).max(1);
-        let kept_rows = rows.len().div_ceil(stride).max(1);
-        let per_row = budget / kept_rows;
-        let kept: std::collections::HashSet<i32> = rows.iter().step_by(stride).copied().collect();
+        let mut row_need: Vec<(i32, usize)> = Vec::new();
+        for &(y, _, count) in &spans {
+            let count = usize::try_from(count).unwrap_or(0);
+            match row_need.last_mut() {
+                Some((row, need)) if *row == y => *need += count,
+                _ => row_need.push((y, count)),
+            }
+        }
+        let stride = row_need.len().div_ceil(budget).max(1);
+        let kept: Vec<(i32, usize)> = row_need.into_iter().step_by(stride).collect();
+        let row_cap = water_fill_cap(kept.iter().map(|&(_, need)| need), budget);
+        let kept_rows: std::collections::HashSet<i32> = kept.iter().map(|&(y, _)| y).collect();
 
         // SkPath2DPathEffect::next: the stamp is *translated* to each covered
         // cell's center mapped through the lattice matrix.
         let mut builder = PathBuilder::new();
         let (mut row, mut used) = (None, 0_usize);
         for (y, left, count) in spans {
-            if !kept.contains(&y) {
+            if !kept_rows.contains(&y) {
                 continue;
             }
             if row != Some(y) {
                 (row, used) = (Some(y), 0);
             }
-            let take = usize::try_from(count).unwrap_or(0).min(per_row - used);
+            let take = usize::try_from(count).unwrap_or(0).min(row_cap - used);
             used += take;
             for x in (left..).take(take) {
                 let loc = self.matrix.map_point(Point::new(
@@ -1564,6 +1570,28 @@ fn row_intervals(
         intervals = complement;
     }
     intervals
+}
+
+/// The largest per-row cap `c` such that `sum(min(need, c)) <= budget`
+/// (`usize::MAX` when everything fits): rows needing less than `c` keep all
+/// of their cells and the remainder is shared equally.
+fn water_fill_cap(needs: impl Iterator<Item = usize>, budget: usize) -> usize {
+    let mut needs: Vec<usize> = needs.collect();
+    if needs.iter().sum::<usize>() <= budget {
+        return usize::MAX;
+    }
+    needs.sort_unstable();
+    let mut remaining = budget;
+    let mut rows_left = needs.len();
+    for need in needs {
+        let fair = remaining / rows_left;
+        if need > fair {
+            return fair;
+        }
+        remaining -= need;
+        rows_left -= 1;
+    }
+    usize::MAX
 }
 
 /// The lattice cells covered by `src`, as `(row, first_column, count)`
@@ -2041,6 +2069,7 @@ mod tests {
         // Path1D: a non-finite or enormous stamp count fails too.
         let stamp = square(1.0);
         let one_d = Path1DEffect::new(stamp, 1.0, 0.0, Path1DStyle::Translate).unwrap();
+        // Over Skia's 100,000 stamps per contour: fails like Skia.
         assert!(one_d.apply(&long).is_none(), "1e8 stamps: gives up");
         let mut b = PathBuilder::new();
         b.move_to(0.0, 0.0).line_to(3e38, 3e38);
@@ -2098,8 +2127,10 @@ mod tests {
 
         let one_d = Path1DEffect::new(heavy, 1.0, 0.0, Path1DStyle::Translate).unwrap();
         let mut b = PathBuilder::new();
-        b.move_to(0.0, 0.0).line_to(1e5, 0.0);
-        assert!(one_d.apply(&b.build()).is_none(), "1e9 points: gives up");
+        b.move_to(0.0, 0.0).line_to(5e4, 0.0);
+        let stamped = one_d.apply(&b.build()).expect("truncates, not fails");
+        assert!(!stamped.is_empty());
+        assert!(stamped.points().len() <= MAX_PATH1D_POINTS);
     }
 
     #[test]
@@ -2194,6 +2225,43 @@ mod tests {
         let bands = hatch.apply(&b.build()).expect("applies");
         assert!(!bands.is_empty());
         assert!(bands.points().len() <= MAX_LATTICE_POINTS);
+    }
+
+    #[test]
+    fn path2d_keeps_every_stamp_when_the_total_fits() {
+        // An L: a 1-cell bar 2000 rows tall plus a 10000-cell base row.
+        // ~12000 stamps fit the budget, so the base row is complete.
+        let mut b = PathBuilder::new();
+        b.add_rect(&skia_rs_core::Rect::new(0.0, 0.0, 1.0, 2000.0));
+        b.add_rect(&skia_rs_core::Rect::new(0.0, 2000.0, 10000.0, 2001.0));
+        let tile = Path2DEffect::new(skia_rs_core::Matrix::IDENTITY, square(0.5)).unwrap();
+        let produced = tile.apply(&b.build()).expect("applies");
+        let stamps = produced
+            .iter()
+            .filter(|e| matches!(e, PathElement::Move(_)))
+            .count();
+        assert_eq!(stamps, 2000 + 10000);
+        assert_eq!(water_fill_cap([1, 1, 50].into_iter(), 10), 8);
+        assert_eq!(water_fill_cap([1, 1, 5].into_iter(), 10), usize::MAX);
+    }
+
+    #[test]
+    fn compose_does_not_cull_the_inner_effect() {
+        // A dash over a Line2D hatch must see the full hatch lines: culling
+        // the inner effect would move every dash with the clip.
+        let hatch: PathEffectRef =
+            Arc::new(Line2DEffect::new(1.0, skia_rs_core::Matrix::scale(4.0, 4.0)).unwrap());
+        let dash: PathEffectRef = Arc::new(DashEffect::new(vec![3.0, 3.0], 0.0).unwrap());
+        let composed = ComposeEffect::new(dash, hatch);
+        let source = square(400.0);
+        let cull = skia_rs_core::Rect::new(200.0, 0.0, 220.0, 400.0);
+        let mut rec = StrokeRec::Fill;
+        let culled = composed
+            .filter_path_culled(&source, &mut rec, Some(&cull))
+            .expect("applies");
+        let mut rec = StrokeRec::Fill;
+        let full = composed.filter_path(&source, &mut rec).expect("applies");
+        assert_eq!(culled.points(), full.points());
     }
 
     #[test]
