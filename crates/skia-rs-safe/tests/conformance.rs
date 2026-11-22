@@ -1,6 +1,9 @@
 //! Raster conformance: every case in `conformance/README.md` must match the
 //! committed reference image in `conformance/reference/` within tolerance.
 //!
+//! The references are skia-rs raster self-renders (regression baselines),
+//! not upstream Skia output; see `conformance/README.md`.
+//!
 //! Regenerate the references after an intentional rendering change with:
 //!
 //! ```text

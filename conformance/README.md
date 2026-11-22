@@ -3,6 +3,14 @@
 This directory holds the reference images used to check that rendering stays
 consistent across platforms and, eventually, across backends.
 
+> **What the references are:** `reference/*.png` are rendered by skia-rs's own
+> raster backend (`conformance_gen`), not by upstream Skia. They are regression
+> baselines: the `conformance` test catches unintended changes to raster output
+> and platform drift, but it does not by itself prove agreement with Skia.
+> Generating the references from the `skia/` submodule (the placeholder
+> `generate-reference` job in `.github/workflows/conformance.yml`) is the
+> planned step toward the Skia comparison that `AGENTS.md` calls for.
+
 ## Structure
 
 ```
