@@ -204,6 +204,47 @@ pub struct WgpuSurface {
 }
 
 impl WgpuSurface {
+    /// Resolve this multisampled surface into a one-shot single-sample
+    /// texture (recorded on `encoder`) so it can be copied to a buffer.
+    fn resolve_msaa(&self, encoder: &mut wgpu::CommandEncoder) -> wgpu::Texture {
+        let resolve_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("skia-rs msaa resolve"),
+            size: wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.texture.format(),
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let resolve_view = resolve_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // A Load-op render pass with resolve_target copies the MSAA
+        // contents down to the single-sample texture.
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("skia-rs msaa resolve pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.view,
+                    resolve_target: Some(&resolve_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+
+        resolve_texture
+    }
+
     /// Create a new wgpu surface.
     ///
     /// # Errors
@@ -350,6 +391,19 @@ impl GpuSurface for WgpuSurface {
 
     fn read_pixels(&self, dst: &mut [u8], dst_row_bytes: usize) -> bool {
         let bytes_per_pixel = self.format.bytes_per_pixel() as usize;
+
+        // Validate the destination before doing any GPU work: every row
+        // must fit, or the read fails rather than silently skipping rows.
+        let height = self.height as usize;
+        let Some(row_bytes) = readback_row_bytes(
+            self.width as usize,
+            height,
+            bytes_per_pixel,
+            dst.len(),
+            dst_row_bytes,
+        ) else {
+            return false;
+        };
         let aligned_bytes_per_row = (self.width as usize * bytes_per_pixel + 255) & !255;
         let buffer_size = aligned_bytes_per_row * self.height as usize;
         let Ok(bytes_per_row) = u32::try_from(aligned_bytes_per_row) else {
@@ -380,42 +434,7 @@ impl GpuSurface for WgpuSurface {
         // and is not warranted here.
         let resolve_texture_holder;
         let copy_texture_ref: &wgpu::Texture = if self.sample_count > 1 {
-            let resolve_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("skia-rs msaa resolve"),
-                size: wgpu::Extent3d {
-                    width: self.width,
-                    height: self.height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: self.texture.format(),
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let resolve_view = resolve_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-            // A Load-op render pass with resolve_target copies the MSAA
-            // contents down to the single-sample texture.
-            {
-                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("skia-rs msaa resolve pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.view,
-                        resolve_target: Some(&resolve_view),
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-            }
-
-            resolve_texture_holder = resolve_texture;
+            resolve_texture_holder = self.resolve_msaa(&mut encoder);
             &resolve_texture_holder
         } else {
             &self.texture
@@ -456,10 +475,9 @@ impl GpuSurface for WgpuSurface {
             let data = slice.get_mapped_range();
 
             // Copy row by row (handling alignment)
-            for y in 0..self.height as usize {
+            for y in 0..height {
                 let src_offset = y * aligned_bytes_per_row;
                 let dst_offset = y * dst_row_bytes;
-                let row_bytes = self.width as usize * bytes_per_pixel;
 
                 if dst_offset + row_bytes <= dst.len() && src_offset + row_bytes <= data.len() {
                     dst[dst_offset..dst_offset + row_bytes]
@@ -1341,6 +1359,27 @@ impl WgpuExecutor {
 // is actually consumed by the GPU.
 // ---------------------------------------------------------------------------
 
+/// The tightly packed row size of a `width x height` readback with
+/// `bytes_per_pixel`, if a `dst_len`-byte destination with `dst_row_bytes`
+/// stride can hold every row; `None` if any row would not fit.
+fn readback_row_bytes(
+    width: usize,
+    height: usize,
+    bytes_per_pixel: usize,
+    dst_len: usize,
+    dst_row_bytes: usize,
+) -> Option<usize> {
+    let row_bytes = width.checked_mul(bytes_per_pixel)?;
+    if dst_row_bytes < row_bytes && height > 1 {
+        return None;
+    }
+    let needed = match height.checked_sub(1) {
+        None => 0,
+        Some(last) => last.checked_mul(dst_row_bytes)?.checked_add(row_bytes)?,
+    };
+    (needed <= dst_len).then_some(row_bytes)
+}
+
 /// Surface-side stencil buffer attached to a `WgpuSurface` for stencil-cover
 /// rendering.
 pub struct WgpuStencilSurface {
@@ -1630,6 +1669,23 @@ impl GpuImageBackend for WgpuGpuImageBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readback_row_bytes_rejects_destinations_that_cannot_hold_every_row() {
+        // 4x3 RGBA: rows of 16 bytes.
+        assert_eq!(readback_row_bytes(4, 3, 4, 48, 16), Some(16));
+        // Padded stride: the last row only needs 16 bytes past 2 * 20.
+        assert_eq!(readback_row_bytes(4, 3, 4, 56, 20), Some(16));
+        // One row short / one byte short.
+        assert_eq!(readback_row_bytes(4, 3, 4, 32, 16), None);
+        assert_eq!(readback_row_bytes(4, 3, 4, 47, 16), None);
+        // Stride smaller than a row would overlap rows.
+        assert_eq!(readback_row_bytes(4, 3, 4, 1000, 8), None);
+        // Overflow is rejected, not wrapped.
+        assert_eq!(readback_row_bytes(usize::MAX, 2, 4, usize::MAX, 4), None);
+        // Empty images need no space.
+        assert_eq!(readback_row_bytes(4, 0, 4, 0, 16), Some(16));
+    }
 
     #[test]
     fn test_format_conversion() {
