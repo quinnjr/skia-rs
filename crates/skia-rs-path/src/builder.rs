@@ -85,7 +85,16 @@ impl PathBuilder {
     }
 
     /// Conic curve (weighted quadratic).
+    ///
+    /// Like `SkPath::conicTo`, unusable weights degrade to lines: a weight
+    /// that is not positive (or is NaN) adds a line to the end point, an
+    /// infinite weight adds lines through the control point, and a weight
+    /// of exactly 1 adds a quad.
     #[inline]
+    #[allow(
+        clippy::float_cmp,
+        reason = "SkPath::conicTo tests for exactly 1 (a plain quad)"
+    )]
     pub fn conic_to(
         &mut self,
         x1: Scalar,
@@ -94,6 +103,16 @@ impl PathBuilder {
         y2: Scalar,
         w: Scalar,
     ) -> &mut Self {
+        if w.is_nan() || w <= 0.0 {
+            return self.line_to(x2, y2);
+        }
+        if !w.is_finite() {
+            self.line_to(x1, y1);
+            return self.line_to(x2, y2);
+        }
+        if w == 1.0 {
+            return self.quad_to(x1, y1, x2, y2);
+        }
         self.ensure_move();
         self.path.verbs.push(Verb::Conic);
         self.path.points.push(Point::new(x1, y1));
@@ -665,6 +684,26 @@ fn angle_between(ux: Scalar, uy: Scalar, vx: Scalar, vy: Scalar) -> Scalar {
 mod tests {
     use super::*;
     use crate::{PathElement, Verb};
+
+    #[test]
+    fn conic_to_degrades_unusable_weights_like_skia() {
+        let verbs = |w: Scalar| {
+            let mut b = PathBuilder::new();
+            b.move_to(0.0, 0.0).conic_to(50.0, 0.0, 100.0, 100.0, w);
+            b.build().verbs().to_vec()
+        };
+        // SkPath::conicTo: !(w > 0) -> lineTo(end); infinite -> two lines;
+        // exactly 1 -> quadTo; anything else stays a conic.
+        assert_eq!(verbs(-1.0), [Verb::Move, Verb::Line]);
+        assert_eq!(verbs(0.0), [Verb::Move, Verb::Line]);
+        assert_eq!(verbs(Scalar::NAN), [Verb::Move, Verb::Line]);
+        assert_eq!(
+            verbs(Scalar::INFINITY),
+            [Verb::Move, Verb::Line, Verb::Line]
+        );
+        assert_eq!(verbs(1.0), [Verb::Move, Verb::Quad]);
+        assert_eq!(verbs(0.5), [Verb::Move, Verb::Conic]);
+    }
 
     #[test]
     fn add_round_rect_matches_skia_add_rrect_contour() {
