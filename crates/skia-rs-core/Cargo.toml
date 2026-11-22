@@ -15,7 +15,11 @@ readme = "README.md"
 [features]
 default = ["std"]
 std = []
-libm = []  # Reserved for no_std math functions
+# Deprecated no-op, kept only so dependents that enable it keep building.
+# It used to forward to `glam/libm`, but skia-rs-core never used glam and no
+# longer depends on it; enabling it changes nothing. Will be removed in the
+# next breaking release.
+libm = []
 serde = ["dep:serde", "bitflags/serde"]
 
 [dependencies]
