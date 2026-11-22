@@ -1325,6 +1325,47 @@ impl Matrix {
             || self.values[Self::PERSP_2] != 1.0
     }
 
+    /// Returns the largest factor by which the matrix scales any vector (the
+    /// larger singular value of its 2x2 linear part), or `None` if the
+    /// matrix has perspective or the result is not finite.
+    ///
+    /// Corresponds to Skia's `SkMatrix::getMaxScale` (which returns `-1`
+    /// where this returns `None`).
+    ///
+    /// # Examples
+    /// ```
+    /// use skia_rs_core::Matrix;
+    /// assert_eq!(Matrix::scale(3.0, 0.5).max_scale(), Some(3.0));
+    /// assert!((Matrix::rotate(1.0).max_scale().unwrap() - 1.0).abs() < 1e-6);
+    /// ```
+    #[must_use]
+    pub fn max_scale(&self) -> Option<Scalar> {
+        if self.has_perspective() {
+            return None;
+        }
+        let sx = self.values[Self::SCALE_X];
+        let kx = self.values[Self::SKEW_X];
+        let ky = self.values[Self::SKEW_Y];
+        let sy = self.values[Self::SCALE_Y];
+
+        // Eigenvalues of M^T M = [[a, b], [b, c]] are the squared singular
+        // values of M (SkMatrix::getMinMaxScaleFactors).
+        let a = sx * sx + ky * ky;
+        let b = sx * kx + sy * ky;
+        let c = kx * kx + sy * sy;
+        let b_sq = b * b;
+        let largest_sq = if b_sq <= SCALAR_NEARLY_ZERO * SCALAR_NEARLY_ZERO {
+            a.max(c)
+        } else {
+            let a_minus_c = a - c;
+            let half_sum = f32::midpoint(a, c);
+            let x = (a_minus_c * a_minus_c + 4.0 * b_sq).sqrt() * 0.5;
+            half_sum + x
+        };
+        let scale = largest_sq.sqrt();
+        scale.is_finite().then_some(scale)
+    }
+
     /// Returns true if the matrix contains only translation, rotation,
     /// reflection, and uniform scale, so it preserves angles and maps
     /// circles to circles.
@@ -1572,6 +1613,28 @@ mod tests {
         reason = "tests assert exact expected f32 results; exact equality is intentional here"
     )]
     use super::*;
+
+    #[test]
+    fn test_matrix_max_scale() {
+        let close = |a: Option<Scalar>, b: Scalar| (a.unwrap() - b).abs() < 1e-5;
+        assert!(close(Matrix::IDENTITY.max_scale(), 1.0));
+        assert!(close(Matrix::scale(100.0, 1.0).max_scale(), 100.0));
+        assert!(close(Matrix::scale(-3.0, 2.0).max_scale(), 3.0));
+        assert!(close(
+            Matrix::rotate(0.8)
+                .concat(&Matrix::scale(4.0, 2.0))
+                .max_scale(),
+            4.0
+        ));
+        // A shear [[1, 1], [0, 1]] stretches by the golden ratio.
+        assert!(close(
+            Matrix::skew(1.0, 0.0).max_scale(),
+            f32::midpoint(1.0, 5.0_f32.sqrt())
+        ));
+        let mut persp = Matrix::IDENTITY;
+        persp.values[Matrix::PERSP_1] = 0.01;
+        assert_eq!(persp.max_scale(), None);
+    }
 
     #[test]
     fn test_matrix_is_similarity() {
