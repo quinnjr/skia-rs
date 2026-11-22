@@ -1291,6 +1291,19 @@ impl PathEffect for Path1DEffect {
         // Output guard: at most MAX_PATH1D_POINTS points (stamps times the
         // stamp's point count); past it the stamps are truncated, like the
         // 2D effects, rather than failing (which would fill the source).
+        // Sk1DPathEffect fails when a contour needs more than
+        // MAX_REASONABLE_ITERATIONS stamps (or has a non-finite length).
+        // Decide that first, so the point budget below never turns Skia's
+        // failure into a truncated success.
+        let iteration_limit =
+            scalar_from_i32(i32::try_from(MAX_REASONABLE_ITERATIONS).unwrap_or(i32::MAX));
+        for i in 0..measure.contour_count() {
+            let length = measure.contour_length(i).unwrap_or(0.0);
+            let needed = ((length - self.initial_offset) / self.advance).ceil();
+            if !(needed.is_finite() && needed <= iteration_limit) {
+                return None;
+            }
+        }
         let stamp_points = self.path.points().len().max(1);
         let mut stamps_left = (MAX_PATH1D_POINTS / stamp_points).max(1);
 
@@ -2262,6 +2275,23 @@ mod tests {
         let mut rec = StrokeRec::Fill;
         let full = composed.filter_path(&source, &mut rec).expect("applies");
         assert_eq!(culled.points(), full.points());
+    }
+
+    #[test]
+    fn path1d_fails_like_skia_before_applying_the_point_budget() {
+        // A 100-point stamp every 1.0 along 150,000 units needs 150,000
+        // stamps: over Skia's 100,000 per contour, so the effect fails even
+        // though the point budget alone would have truncated it.
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0);
+        for i in 1..100 {
+            b.line_to(scalar_from_i32(i % 3) * 0.1, scalar_from_i32(i % 2) * 0.1);
+        }
+        let stamp = b.build();
+        let effect = Path1DEffect::new(stamp, 1.0, 0.0, Path1DStyle::Translate).unwrap();
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0).line_to(150_000.0, 0.0);
+        assert!(effect.apply(&b.build()).is_none());
     }
 
     #[test]
