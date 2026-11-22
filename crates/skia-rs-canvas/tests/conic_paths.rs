@@ -416,3 +416,30 @@ fn zero_radius_inverted_round_rect_dashes_like_draw_rect() {
     assert!(rect.iter().any(|&v| v > 0));
     assert_eq!(round, rect);
 }
+
+#[test]
+fn path_without_leading_move_starts_at_the_mapped_origin() {
+    // A contour with no leading move starts at the local origin; under a
+    // translate its first edge must start at the mapped origin, exactly as
+    // with an explicit move_to(0, 0).
+    let fill = |explicit_move: bool| {
+        let mut b = PathBuilder::new();
+        if explicit_move {
+            b.move_to(0.0, 0.0);
+        }
+        b.line_to(60.0, 0.0).line_to(60.0, 60.0).close();
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            canvas.translate(100.0, 100.0);
+            canvas.draw_path(&b.build(), &white(Style::Fill));
+        }
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).unwrap_or(Color::BLACK).red())
+            .collect::<Vec<_>>()
+    };
+    let explicit = fill(true);
+    assert!(explicit.iter().any(|&v| v > 0));
+    assert_eq!(fill(false), explicit);
+}

@@ -1178,6 +1178,25 @@ impl<'a> Rasterizer<'a> {
         }
     }
 
+    /// Draw one hairline curve segment from `start`: `eval` gives the local
+    /// point at `t`, `end` the exact end point. `points` is a reusable
+    /// buffer.
+    fn hairline_curve(
+        &mut self,
+        points: &mut Vec<Point>,
+        start: Point,
+        eval: impl Fn(Scalar) -> Point,
+        end: Point,
+        paint: &Paint,
+    ) {
+        flatten_curve_device_error(points, eval, end, &self.matrix);
+        let mut prev = start;
+        for &p in points.iter() {
+            self.draw_line(prev, p, paint);
+            prev = p;
+        }
+    }
+
     /// Stroke a path as a hairline (width 0) by walking its flattened
     /// segments with the line rasterizer.
     #[allow(
@@ -1185,12 +1204,10 @@ impl<'a> Rasterizer<'a> {
         reason = "t/mt (parameter and its complement) and per-segment prev_t/prev_mt are the standard Bezier-flattening parameter names"
     )]
     fn stroke_path_hairline(&mut self, path: &Path, paint: &Paint) {
-        use skia_rs_core::cast::scalar_from_i32;
-
         let mut current = Point::zero();
         let mut contour_start = Point::zero();
-        // Reused by every conic in the path (no per-segment allocation).
-        let mut conic_points: Vec<Point> = Vec::new();
+        // Reused by every curve in the path (no per-segment allocation).
+        let mut curve_points: Vec<Point> = Vec::new();
 
         for element in path {
             match element {
@@ -1202,53 +1219,40 @@ impl<'a> Rasterizer<'a> {
                     self.draw_line(current, p, paint);
                     current = p;
                 }
+                // Every curve is flattened against a device-pixel error bound
+                // (as in edge collection), so hairlines stay smooth under any
+                // CTM rather than showing fixed-step facets when magnified.
                 PathElement::Quad(ctrl, end) => {
-                    // Approximate with lines
-                    let steps = 16;
-                    for i in 1..=steps {
-                        let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                        let mt = 1.0 - t;
-                        let p = quad_point(t, mt, current, ctrl, end);
-                        self.draw_line(
-                            if i == 1 {
-                                current
-                            } else {
-                                let pt = scalar_from_i32(i - 1) / scalar_from_i32(steps);
-                                let pmt = 1.0 - pt;
-                                quad_point(pt, pmt, current, ctrl, end)
-                            },
-                            p,
-                            paint,
-                        );
-                    }
+                    let start = current;
+                    self.hairline_curve(
+                        &mut curve_points,
+                        start,
+                        |t| quad_point(t, 1.0 - t, start, ctrl, end),
+                        end,
+                        paint,
+                    );
                     current = end;
                 }
                 PathElement::Conic(ctrl, end, weight) => {
                     let start = current;
-                    flatten_curve_device_error(
-                        &mut conic_points,
+                    self.hairline_curve(
+                        &mut curve_points,
+                        start,
                         |t| conic_point(start, ctrl, end, weight, t),
                         end,
-                        &self.matrix,
+                        paint,
                     );
-                    let mut prev = current;
-                    for &p in &conic_points {
-                        self.draw_line(prev, p, paint);
-                        prev = p;
-                    }
                     current = end;
                 }
                 PathElement::Cubic(c1, c2, end) => {
-                    // Approximate with lines
-                    let steps = 24;
-                    let mut prev = current;
-                    for i in 1..=steps {
-                        let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                        let mt = 1.0 - t;
-                        let p = cubic_point(t, mt, current, c1, c2, end);
-                        self.draw_line(prev, p, paint);
-                        prev = p;
-                    }
+                    let start = current;
+                    self.hairline_curve(
+                        &mut curve_points,
+                        start,
+                        |t| cubic_point(t, 1.0 - t, start, c1, c2, end),
+                        end,
+                        paint,
+                    );
                     current = end;
                 }
                 PathElement::Close => {
@@ -1891,13 +1895,15 @@ fn flatten_curve_device_error(
 
 /// Maximum distance, in device pixels, between a conic and the polyline it is
 /// flattened to (Skia's path flattening tolerance).
-const CONIC_FLATTEN_TOLERANCE: Scalar = 0.25;
+pub(crate) const CONIC_FLATTEN_TOLERANCE: Scalar = 0.25;
 
 /// Collect edges from a path.
 fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
     let mut edges = Vec::new();
-    let mut current = Point::zero();
-    let mut contour_start = Point::zero();
+    // A path without a leading move starts at the local origin, so the
+    // device-space start is the *mapped* origin (matching the local one).
+    let mut current = matrix.map_point(Point::zero());
+    let mut contour_start = current;
     // Local-space counterparts, needed to flatten conics before a
     // perspective projection.
     let mut local_current = Point::zero();

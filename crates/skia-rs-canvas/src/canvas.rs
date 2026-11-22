@@ -1617,17 +1617,20 @@ impl<'a> Canvas<'a> {
         self.reset_matrix();
         match paint.style() {
             Style::Fill
-                if device_extra >= 2.0 * std::f32::consts::SQRT_2
+                if device_extra
+                    >= 2.0
+                        * (std::f32::consts::SQRT_2 + crate::raster::CONIC_FLATTEN_TOLERANCE)
                     && self.clip_has_binary_coverage()
                     && paint.alpha() >= 1.0
                     && paint.blend_mode() == skia_rs_paint::BlendMode::SrcOver
                     && paint.color_filter().is_none() =>
             {
-                // Opaque SrcOver with an outset of at least 2*sqrt(2) device
-                // px: a pixel crossed by the outline has every point within
-                // sqrt(2) px of it, so the stroke (half-width >= sqrt(2) px)
-                // fully covers every anti-aliased pixel along the original
-                // outline, and filling the exact
+                // Opaque SrcOver with an outset of at least
+                // 2 * (sqrt(2) + flattening tolerance) device px: a pixel
+                // crossed by the outline has every point within sqrt(2) px of
+                // it, and each flattened outline may sit up to the tolerance
+                // off the true curve, so the stroke fully covers every
+                // anti-aliased pixel along the filled outline, and filling the exact
                 // outline and then its stroke outline yields the union's
                 // coverage without a path-op union per glyph. Thinner outsets
                 // (small text) would composite edge pixels twice at partial
