@@ -962,6 +962,11 @@ impl<'a> Canvas<'a> {
     /// With a path effect, the circle is drawn as a path (starting at 3
     /// o'clock, clockwise, like `SkPath::addCircle`) so the effect applies.
     pub fn draw_circle(&mut self, center: Point, radius: Scalar, paint: &Paint) {
+        // SkCanvas::drawCircle quick-rejects non-finite bounds (before the
+        // radius clamp below would turn a NaN radius into a dot).
+        if !(center.x.is_finite() && center.y.is_finite() && radius.is_finite()) {
+            return;
+        }
         match &mut self.backing {
             Backing::Raster(_) if paint.path_effect().is_some() => {
                 // SkCanvas::drawCircle clamps a negative radius to 0 and
