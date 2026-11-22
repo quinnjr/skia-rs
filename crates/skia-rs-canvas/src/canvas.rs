@@ -871,11 +871,12 @@ impl<'a> Canvas<'a> {
     /// local clip bounds as `cullRect`). `None` when the matrix is singular.
     fn local_cull(&self, paint: &Paint) -> Option<Rect> {
         let inverse = self.total_matrix().invert()?;
-        let local = inverse.map_rect(&self.clip_bounds());
-        // Room for the stroke's miter/cap extent and AA fringe.
+        // Like computeConservativeLocalClipBounds: outset the device clip
+        // by a pixel (AA fringe, hairlines) before mapping it to local
+        // space, then add the stroke's miter/cap extent in local units.
+        let local = inverse.map_rect(&self.clip_bounds().inset(-1.0, -1.0));
         let stroke_extent = paint.stroke_width() * paint.stroke_miter().max(1.0);
-        let outset = stroke_extent + 1.0;
-        Some(local.inset(-outset, -outset))
+        Some(local.inset(-stroke_extent, -stroke_extent))
     }
 
     /// Rasterize `path`, applying the paint's path effect the way Skia's
@@ -2570,17 +2571,41 @@ pub enum VertexMode {
 // =============================================================================
 
 fn build_round_rect_path(rect: &Rect, rx: Scalar, ry: Scalar) -> Path {
+    use skia_rs_path::Verb;
+
     // SkCanvas::drawRoundRect: a plain drawRect unless both radii are
-    // positive, otherwise SkRRect::setRectXY -> SkPath::addRRect (uniform
-    // radius scaling, exact conic corners, and Skia's start point).
+    // positive, otherwise SkRRect::setRectXY (uniform radius scaling) and
+    // SkCanvas::onDrawRRect, which delegates rect-type rrects to drawRect
+    // and oval-type ones to drawOval (their start points differ from
+    // addRRect's), and adds the rest with addRRect.
     let mut builder = skia_rs_path::PathBuilder::new();
-    if rx > 0.0 && ry > 0.0 {
-        builder.add_round_rect(rect, rx, ry);
-    } else {
+    if !(rx > 0.0 && ry > 0.0) {
         // drawRect sorts the rect first (fixing start corner and direction).
         builder.add_rect(&sorted_rect(rect));
+        return builder.build();
     }
-    builder.build()
+    builder.add_round_rect(rect, rx, ry);
+    let round_rect = builder.build();
+    // add_round_rect emits a plain rect contour for rect-type rrects and a
+    // four-conic contour for oval-type ones.
+    let mut delegated = skia_rs_path::PathBuilder::new();
+    match round_rect.verbs() {
+        [Verb::Move, Verb::Line, Verb::Line, Verb::Line, Verb::Close] => {
+            delegated.add_rect(&sorted_rect(rect));
+        }
+        [
+            Verb::Move,
+            Verb::Conic,
+            Verb::Conic,
+            Verb::Conic,
+            Verb::Conic,
+            Verb::Close,
+        ] => {
+            delegated.add_oval(&sorted_rect(rect));
+        }
+        _ => return round_rect,
+    }
+    delegated.build()
 }
 
 fn build_arc_path(oval: &Rect, start_angle: Scalar, sweep_angle: Scalar, use_center: bool) -> Path {

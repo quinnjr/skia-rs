@@ -377,3 +377,32 @@ fn line_2d_hatches_the_visible_part_of_a_huge_source() {
     let lit = (0..64).filter(|&y| buffer.get_pixel(32, y).is_some_and(|c| c.red() > 128));
     assert!(lit.count() >= 4, "hatch lines cross the visible column");
 }
+
+#[test]
+fn round_rects_that_are_ovals_or_rects_dash_like_draw_oval_and_draw_rect() {
+    // SkCanvas::onDrawRRect hands oval- and rect-type rrects to drawOval /
+    // drawRect, so their dashes start where those start.
+    use skia_rs_core::Rect;
+
+    let draw = |f: &dyn Fn(&mut Canvas<'_>, &Paint)| {
+        let mut paint = Paint::new();
+        paint.set_color32(Color::WHITE);
+        paint.set_style(Style::Stroke);
+        paint.set_stroke_width(2.0);
+        paint.set_path_effect(Some(Arc::new(
+            DashEffect::new(vec![7.0, 5.0], 0.0).unwrap(),
+        )));
+        let mut buffer = PixelBuffer::new(64, 64);
+        f(&mut Canvas::new_raster(&mut buffer), &paint);
+        (0..64)
+            .flat_map(|y| (0..64).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).map_or(0, |c| c.red()))
+            .collect::<Vec<_>>()
+    };
+    let rect = Rect::from_xywh(10.0, 10.0, 40.0, 40.0);
+    assert_eq!(
+        draw(&|c, p| c.draw_round_rect(&rect, 20.0, 20.0, p)),
+        draw(&|c, p| c.draw_oval(&rect, p)),
+        "oval-type round rect dashes like draw_oval"
+    );
+}
