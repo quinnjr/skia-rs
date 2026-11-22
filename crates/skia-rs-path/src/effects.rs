@@ -264,19 +264,35 @@ impl DashEffect {
     /// `SkDashPath::InternalFilter` gives up (the effect fails) once the dash
     /// count, accumulated over the path's contours, exceeds `kMaxDashCount`
     /// (which also covers non-finite lengths).
-    fn dash_count_is_bounded(&self, path: &Path) -> bool {
+    ///
+    /// `flat` is the already-flattened source (lines only), so this is one
+    /// cheap pass over its segments rather than a second measurement.
+    fn dash_count_is_bounded(&self, flat: &Path) -> bool {
         const MAX_DASH_COUNT: Scalar = 1_000_000.0;
-        let measure = crate::PathMeasure::new(path);
         let on_intervals =
             scalar_from_i32(i32::try_from(self.intervals.len() / 2).unwrap_or(i32::MAX));
-        let mut dash_count: Scalar = 0.0;
-        for length in (0..measure.contour_count()).filter_map(|i| measure.contour_length(i)) {
-            dash_count += length * on_intervals / self.interval_sum;
-            if !(dash_count.is_finite() && dash_count <= MAX_DASH_COUNT) {
-                return false;
+        let (mut start, mut current) = (Point::zero(), Point::zero());
+        let mut length: Scalar = 0.0;
+        for element in flat {
+            match element {
+                PathElement::Move(p) => {
+                    (start, current) = (p, p);
+                }
+                PathElement::Line(p)
+                | PathElement::Quad(_, p)
+                | PathElement::Conic(_, p, _)
+                | PathElement::Cubic(_, _, p) => {
+                    length += current.distance(&p);
+                    current = p;
+                }
+                PathElement::Close => {
+                    length += current.distance(&start);
+                    current = start;
+                }
             }
         }
-        true
+        let dash_count = length * on_intervals / self.interval_sum;
+        dash_count.is_finite() && dash_count <= MAX_DASH_COUNT
     }
 
     fn dash_line(
@@ -343,13 +359,16 @@ impl PathEffect for DashEffect {
         reason = "faithful port of SkDashPath::InternalFilter's per-verb dash state machine"
     )]
     fn apply(&self, path: &Path) -> Option<Path> {
-        if path.is_empty() || !self.dash_count_is_bounded(path) {
+        if path.is_empty() {
             return None;
         }
 
         // Pre-flatten curves to lines so dash logic can transition mid-curve.
         let flattened = flatten_path_to_lines(path, 0.5);
         let path = &flattened;
+        if !self.dash_count_is_bounded(path) {
+            return None;
+        }
 
         let mut builder = PathBuilder::new();
         let mut current_pos = Point::zero();
@@ -1172,6 +1191,9 @@ pub struct Path1DEffect {
     advance: Scalar,
     /// Initial phase offset.
     phase: Scalar,
+    /// The distance along each contour of the first stamp: `phase` cleaned
+    /// up as `SkPath1DPathEffect`'s constructor does.
+    initial_offset: Scalar,
     /// How to place the stamped path.
     style: Path1DStyle,
 }
@@ -1194,6 +1216,7 @@ impl Path1DEffect {
         if !(advance.is_finite() && advance > 0.0 && phase.is_finite()) || path.is_empty() {
             return None;
         }
+        let requested_phase = phase;
         let mut phase = phase;
         if phase < 0.0 {
             phase = -phase;
@@ -1212,7 +1235,8 @@ impl Path1DEffect {
         Some(Self {
             path,
             advance,
-            phase,
+            phase: requested_phase,
+            initial_offset: phase,
             style,
         })
     }
@@ -1257,9 +1281,9 @@ impl PathEffect for Path1DEffect {
     fn apply(&self, src_path: &Path) -> Option<Path> {
         use crate::PathMeasure;
 
-        if src_path.is_empty() {
-            return None;
-        }
+        // Sk1DPathEffect::onFilterPath succeeds with nothing for a source
+        // without contours (an inverse-filled empty path must not flood
+        // the clip), so there is no early failure here.
         let measure = PathMeasure::new(src_path);
         // Output guard: stamps times the stamp's point count, over all
         // contours (each contour starts at the phase).
@@ -1268,7 +1292,7 @@ impl PathEffect for Path1DEffect {
         let mut points: Scalar = 0.0;
         for i in 0..measure.contour_count() {
             let length = measure.contour_length(i).unwrap_or(0.0);
-            let stamps = (length - self.phase).max(0.0) / self.advance;
+            let stamps = (length - self.initial_offset).max(0.0) / self.advance;
             let contour_points = stamps * stamp_points.max(1.0);
             points += contour_points;
             if !(points.is_finite() && points <= MAX_PATH1D_POINTS) {
@@ -1282,7 +1306,7 @@ impl PathEffect for Path1DEffect {
         let mut builder = PathBuilder::new();
         for i in 0..measure.contour_count() {
             let length = measure.contour_length(i).unwrap_or(0.0);
-            let mut distance = self.phase;
+            let mut distance = self.initial_offset;
             let mut governor = MAX_REASONABLE_ITERATIONS;
             loop {
                 if distance >= length {
@@ -1769,8 +1793,11 @@ impl PathEffect for Line2DEffect {
     fn apply(&self, src_path: &Path) -> Option<Path> {
         let lines = self.hatch_lines(src_path, None)?;
         let half_width = self.width / 2.0;
+        // Bands cost four points each (hatch_lines budgets two per line):
+        // sample evenly to stay within MAX_LATTICE_POINTS.
+        let stride = lines.len().div_ceil(MAX_LATTICE_POINTS / 4).max(1);
         let mut builder = PathBuilder::new();
-        for (p0, p1) in lines {
+        for (p0, p1) in lines.into_iter().step_by(stride) {
             let (dx, dy) = (p1.x - p0.x, p1.y - p0.y);
             let len = dx.hypot(dy);
             if len > 0.0 && half_width > 0.0 {
@@ -2140,6 +2167,33 @@ mod tests {
         let lines = hatch.filter_path(&b.build(), &mut rec).expect("applies");
         assert!(!lines.is_empty());
         assert!(lines.points().len() <= MAX_LATTICE_POINTS);
+    }
+
+    #[test]
+    fn path1d_succeeds_with_nothing_on_an_empty_source_and_keeps_its_phase() {
+        let mut b = PathBuilder::new();
+        b.fill_type(FillType::InverseWinding);
+        let empty = b.build();
+        let effect = Path1DEffect::new(square(1.0), 10.0, 3.0, Path1DStyle::Translate).unwrap();
+        let mut rec = StrokeRec::Fill;
+        let out = effect.filter_path(&empty, &mut rec).expect("succeeds");
+        assert!(out.is_empty());
+
+        // The getter returns the caller's phase, so rebuilding is lossless.
+        assert!((effect.phase() - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn line2d_apply_bands_stay_within_the_point_budget() {
+        let mut b = PathBuilder::new();
+        for i in 0..400 {
+            let x = scalar_from_i32(i) * 2.0;
+            b.add_rect(&skia_rs_core::Rect::new(x, 0.0, x + 1.0, 100.0));
+        }
+        let hatch = Line2DEffect::new(1.0, skia_rs_core::Matrix::scale(0.02, 0.02)).unwrap();
+        let bands = hatch.apply(&b.build()).expect("applies");
+        assert!(!bands.is_empty());
+        assert!(bands.points().len() <= MAX_LATTICE_POINTS);
     }
 
     #[test]
