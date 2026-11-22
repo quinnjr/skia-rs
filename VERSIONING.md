@@ -166,7 +166,11 @@ rust-version = "1.94"
 |---------|-----------|----------|------|
 | 0.1.x | 1.85 | m128 | 23.x |
 | 0.2.x | 1.85+ | m130 | 24.x |
+| 0.4.x | 1.85 | — | 23.x |
+| 0.5.x (unreleased) | 1.94 | — | 23.x |
 | 1.0.x | TBD | m135+ | TBD |
+
+"—": the targeted Skia milestone is not tracked for these releases.
 
 ---
 

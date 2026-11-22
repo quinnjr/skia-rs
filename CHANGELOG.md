@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking**: the minimum supported Rust version is now **1.94** (was
+  1.85; `geo` 0.33 and `napi-build` 2.3 already required 1.88, so 1.85 no
+  longer built). Per `VERSIONING.md` an MSRV bump is a minor version
+  change, so the next release is **0.5.0**. The workspace now uses the
+  MSRV-aware `resolver = "3"`.
+- **Breaking**: `skia-rs-core`'s `libm` feature is a deprecated no-op
+  (it only forwarded to the unused, now removed, `glam` dependency).
+- Unused dependencies were removed across the workspace; `skia-rs-gpu`
+  pulls in `skia-rs-codec` only with `wgpu-backend`.
+- `PathBuilder::add_round_rect` is now an exact port of
+  `SkPath::addRoundRect` (`SkRRect::setRectXY` + `addRRect`): conic
+  corners, uniform radius scaling, Skia's contour start point, oval/rect
+  degenerate cases, negative radii add nothing, non-finite input is
+  sanitized.
+- Path effects now run through `PathEffect::filter_path` with a
+  `StrokeRec`, matching `SkPathEffect::filterPath` (dash refuses filled
+  geometry, `Path1DEffect` fills its stamps, `Line2DEffect` strokes at its
+  own width, compose/sum share the record); several effects return an
+  empty path where Skia draws nothing.
+
+### Added
+
+- `Typeface::system_default()` loads the platform's default sans-serif
+  font (the text example now renders real text).
+- `Matrix::has_perspective`, `Matrix::is_similarity`, `Matrix::max_scale`.
+- `conformance_gen` example, raster reference images, and a `conformance`
+  test (the references are skia-rs self-renders, see `conformance/README.md`).
+
+### Fixed
+
+- Windows: `cargo test` no longer prints ~150 napi-sys symbol-load errors.
+- macOS: `skia-rs-python` links (extension-module link args); the Metal
+  backend builds against metal 0.29, detects Mac GPU families correctly,
+  and probes OS-version-dependent `MTLDevice` selectors instead of aborting
+  on older systems or iOS.
+- Rendering: conics honor their weight and every curve is flattened to a
+  0.25 device-px error under any CTM, including perspective; `draw_line`
+  honors stroke width and path effects; shapes (rect, oval, circle, round
+  rect, arc) apply path effects; fake bold (`Font::set_embolden`) renders;
+  hairlines use Skia's pixel centers; open contours fill as implicitly
+  closed; picture playback restores canvas state and ignores unbalanced
+  restores; text decoration intercepts no longer open false gaps.
+- C API: recording canvases record transforms instead of baking them into
+  geometry.
+- GPU: wgpu readback validates buffer sizes and avoids `u32` overflow.
+
 ## [0.4.0] - 2026-08-19
 
 ### Changed
