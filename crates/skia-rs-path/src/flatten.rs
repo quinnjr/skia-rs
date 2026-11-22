@@ -10,7 +10,7 @@
 )]
 #![allow(
     clippy::manual_midpoint,
-    reason = "faithful port of Skia's f32 averaging (SkScalarAve); f32::midpoint rounds via f64 and diverges from Skia"
+    reason = "hot flattening/tessellation loops port Skia's SkScalarAve, (a + b) * 0.5, which stays in f32; f32::midpoint widens to f64 and gives the same result unless a + b overflows f32 (|coords| > ~1.7e38)"
 )]
 
 use skia_rs_core::{Point, Scalar};
