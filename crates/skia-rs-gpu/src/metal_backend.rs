@@ -571,10 +571,47 @@ impl MetalContext {
     fn query_caps(device: &DeviceRef) -> MetalCaps {
         let is_apple_silicon = device.name().contains("Apple");
 
-        // Query limits
-        let max_buffer_length = device.max_buffer_length();
+        // Every query newer than the oldest supported OS (macOS 10.12 is
+        // Rust's x86_64 baseline) is probed first; sending an unknown
+        // selector raises an exception that aborts the process. Fallbacks
+        // are Metal's guaranteed minimums.
+        let has = |selector: &str| device_responds_to(device, selector);
+
+        // macOS 10.14 / iOS 12. Every Metal device supports >= 256 MiB.
+        let max_buffer_length = if has("maxBufferLength") {
+            device.max_buffer_length()
+        } else {
+            256 * 1024 * 1024
+        };
         let max_threads = device.max_threads_per_threadgroup();
-        let max_threadgroup_memory = device.max_threadgroup_memory_length();
+        // macOS 10.13 / iOS 11. Every Metal device supports >= 16 KiB.
+        let max_threadgroup_memory = if has("maxThreadgroupMemoryLength") {
+            device.max_threadgroup_memory_length()
+        } else {
+            16 * 1024
+        };
+        // macOS 10.13 / iOS 11.
+        let argument_buffer_tier = if has("argumentBuffersSupport") {
+            match device.argument_buffers_support() {
+                metal::MTLArgumentBuffersTier::Tier1 => 1,
+                metal::MTLArgumentBuffersTier::Tier2 => 2,
+            }
+        } else {
+            0
+        };
+        // macOS 10.13 / iOS 11.
+        let read_write_texture_tier = if has("readWriteTextureSupport") {
+            match device.read_write_texture_support() {
+                metal::MTLReadWriteTextureTier::TierNone => 0,
+                metal::MTLReadWriteTextureTier::Tier1 => 1,
+                metal::MTLReadWriteTextureTier::Tier2 => 2,
+            }
+        } else {
+            0
+        };
+        // isLowPower / isHeadless are macOS-only (absent on iOS).
+        let is_low_power = has("isLowPower") && device.is_low_power();
+        let is_headless = has("isHeadless") && device.is_headless();
 
         // Detect highest feature set
         let feature_set = Self::detect_feature_set(device);
@@ -593,8 +630,8 @@ impl MetalContext {
                 instancing_support: true,
             },
             feature_set: Some(feature_set),
-            is_low_power: device.is_low_power(),
-            is_headless: device.is_headless(),
+            is_low_power,
+            is_headless,
             is_apple_silicon,
             max_buffer_length,
             max_threads_per_threadgroup: max_threads.width * max_threads.height * max_threads.depth,
@@ -607,13 +644,11 @@ impl MetalContext {
             max_textures_per_stage: 128,
             max_buffers_per_stage: 31,
             // Both Tier1 and Tier2 support argument buffers; only the tier
-            // differs. The previous `!= Tier1` reported Tier1 devices as
-            // lacking argument buffers entirely, which is wrong.
-            argument_buffers: matches!(
-                device.argument_buffers_support(),
-                metal::MTLArgumentBuffersTier::Tier1 | metal::MTLArgumentBuffersTier::Tier2
-            ),
-            raster_order_groups: device.raster_order_groups_supported(),
+            // differs (0 means the query is unavailable on this OS).
+            argument_buffers: argument_buffer_tier > 0,
+            // macOS 10.13 / iOS 11.
+            raster_order_groups: has("rasterOrderGroupsSupported")
+                && device.raster_order_groups_supported(),
             float32_filtering: true, // Most Metal devices support this
             msaa_depth_resolve: true,
             // metal-rs exposes no sparse-texture query; sparse textures require the
@@ -625,15 +660,8 @@ impl MetalContext {
             ray_tracing: device_responds_to(device, "supportsRaytracing")
                 && device.supports_raytracing(),
             mesh_shaders: false, // Requires checking specific feature set
-            argument_buffer_tier: match device.argument_buffers_support() {
-                metal::MTLArgumentBuffersTier::Tier1 => 1,
-                metal::MTLArgumentBuffersTier::Tier2 => 2,
-            },
-            read_write_texture_tier: match device.read_write_texture_support() {
-                metal::MTLReadWriteTextureTier::TierNone => 0,
-                metal::MTLReadWriteTextureTier::Tier1 => 1,
-                metal::MTLReadWriteTextureTier::Tier2 => 2,
-            },
+            argument_buffer_tier,
+            read_write_texture_tier,
         }
     }
 
