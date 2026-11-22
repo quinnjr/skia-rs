@@ -1518,14 +1518,16 @@ impl<'a> Canvas<'a> {
         self.reset_matrix();
         match paint.style() {
             Style::Fill
-                if device_extra >= 2.0
+                if device_extra >= 2.0 * std::f32::consts::SQRT_2
                     && paint.alpha() >= 1.0
                     && paint.blend_mode() == skia_rs_paint::BlendMode::SrcOver
                     && paint.color_filter().is_none() =>
             {
-                // Opaque SrcOver with an outset of at least 2 device px: the
-                // stroke (half-width >= 1px) fully covers every anti-aliased
-                // pixel along the original outline, so filling the exact
+                // Opaque SrcOver with an outset of at least 2*sqrt(2) device
+                // px: a pixel crossed by the outline has every point within
+                // sqrt(2) px of it, so the stroke (half-width >= sqrt(2) px)
+                // fully covers every anti-aliased pixel along the original
+                // outline, and filling the exact
                 // outline and then its stroke outline yields the union's
                 // coverage without a path-op union per glyph. Thinner outsets
                 // (small text) would composite edge pixels twice at partial
@@ -1537,7 +1539,7 @@ impl<'a> Canvas<'a> {
                 self.draw_path(&device_path, &outset);
             }
             Style::Fill => {
-                // Translucent, non-SrcOver, or a sub-2px outset: the overlap
+                // Translucent, non-SrcOver, or a thinner outset: the overlap
                 // must be covered exactly once, so fill the union
                 // (StrokeAndFill).
                 let mut bold = paint.clone();
