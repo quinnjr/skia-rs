@@ -153,6 +153,14 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
+# On Windows, napi resolves Node-API symbols from the host process at load
+# time. Inside a plain `cargo test` executable (not node.exe) every lookup
+# fails, and napi-sys prints one "Load Node-API [...] failed" line per symbol
+# when debug assertions are on (~150 lines of noise). The failures are
+# harmless — the unit tests never call into Node-API — so silence them.
+[profile.dev.package.napi-sys]
+debug-assertions = false
+
 # Benchmark profile - optimized but with debug info for profiling
 [profile.bench]
 inherits = "release"
