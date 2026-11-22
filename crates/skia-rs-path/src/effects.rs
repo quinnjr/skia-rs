@@ -77,6 +77,20 @@ pub trait PathEffect: Send + Sync + std::fmt::Debug {
         self.apply(path)
     }
 
+    /// [`filter_path`](Self::filter_path) given the area that can be seen,
+    /// in the path's coordinate space (Skia's `cullRect` argument to
+    /// `filterPath`). Effects may skip output entirely outside `cull`; the
+    /// default ignores it.
+    fn filter_path_culled(
+        &self,
+        path: &Path,
+        rec: &mut StrokeRec,
+        cull: Option<&skia_rs_core::Rect>,
+    ) -> Option<Path> {
+        let _ = cull;
+        self.filter_path(path, rec)
+    }
+
     /// Get the kind of path effect for debugging.
     fn effect_kind(&self) -> PathEffectKind;
 }
@@ -247,6 +261,22 @@ impl DashEffect {
     /// (`is_on`, `interval_idx`, `remaining_in_interval`) across it. Used for
     /// both explicit line segments and the synthesized closing edge so the dash
     /// distance advances continuously (upstream `SkDashPath::InternalFilter`).
+    /// `SkDashPath::InternalFilter` gives up (the effect fails) when a
+    /// contour would need more than `kMaxDashCount` dashes, which also
+    /// covers non-finite contour lengths.
+    fn dash_count_is_bounded(&self, path: &Path) -> bool {
+        const MAX_DASH_COUNT: Scalar = 1_000_000.0;
+        let measure = crate::PathMeasure::new(path);
+        let on_intervals =
+            scalar_from_i32(i32::try_from(self.intervals.len() / 2).unwrap_or(i32::MAX));
+        (0..measure.contour_count())
+            .filter_map(|i| measure.contour_length(i))
+            .all(|length| {
+                let dashes = length * on_intervals / self.interval_sum;
+                dashes.is_finite() && dashes <= MAX_DASH_COUNT
+            })
+    }
+
     fn dash_line(
         &self,
         builder: &mut PathBuilder,
@@ -257,7 +287,9 @@ impl DashEffect {
         remaining_in_interval: &mut Scalar,
     ) {
         let segment_length = from.distance(&to);
-        if segment_length <= 0.0 {
+        // A non-finite length would never advance `t` (apply rejects such
+        // paths first; this keeps the loop safe on its own).
+        if !(segment_length.is_finite() && segment_length > 0.0) {
             return;
         }
         let mut t = 0.0;
@@ -309,7 +341,7 @@ impl PathEffect for DashEffect {
         reason = "faithful port of SkDashPath::InternalFilter's per-verb dash state machine"
     )]
     fn apply(&self, path: &Path) -> Option<Path> {
-        if path.is_empty() {
+        if path.is_empty() || !self.dash_count_is_bounded(path) {
             return None;
         }
 
@@ -983,6 +1015,17 @@ impl PathEffect for ComposeEffect {
             .filter_path(intermediate.as_ref().unwrap_or(path), rec)
     }
 
+    fn filter_path_culled(
+        &self,
+        path: &Path,
+        rec: &mut StrokeRec,
+        cull: Option<&skia_rs_core::Rect>,
+    ) -> Option<Path> {
+        let intermediate = self.inner.filter_path_culled(path, rec, cull);
+        self.outer
+            .filter_path_culled(intermediate.as_ref().unwrap_or(path), rec, cull)
+    }
+
     fn apply(&self, path: &Path) -> Option<Path> {
         let intermediate = self.inner.apply(path);
         self.outer.apply(intermediate.as_ref().unwrap_or(path))
@@ -1019,6 +1062,17 @@ impl PathEffect for SumEffect {
         // appends whatever each produced.
         let path1 = self.first.filter_path(path, rec);
         let path2 = self.second.filter_path(path, rec);
+        Self::combine(path1, path2)
+    }
+
+    fn filter_path_culled(
+        &self,
+        path: &Path,
+        rec: &mut StrokeRec,
+        cull: Option<&skia_rs_core::Rect>,
+    ) -> Option<Path> {
+        let path1 = self.first.filter_path_culled(path, rec, cull);
+        let path2 = self.second.filter_path_culled(path, rec, cull);
         Self::combine(path1, path2)
     }
 
@@ -1160,6 +1214,11 @@ impl Path1DEffect {
     }
 }
 
+/// The most stamps [`Path1DEffect`] places before failing (a guard against
+/// non-finite or enormous path lengths; Skia caps measured stamps only in
+/// fuzzer builds).
+const MAX_PATH1D_STAMPS: Scalar = 1_000_000.0;
+
 impl PathEffect for Path1DEffect {
     fn filter_path(&self, path: &Path, rec: &mut StrokeRec) -> Option<Path> {
         // SkPath1DPathEffect::onFilterPath: rec->setFillStyle(), then filter.
@@ -1181,6 +1240,13 @@ impl PathEffect for Path1DEffect {
         if length <= 0.0 {
             // Sk1DPathEffect still succeeds here: no stamps, nothing drawn.
             return Some(Path::new());
+        }
+        // A non-finite length never ends the walk, and an enormous one
+        // allocates without bound; fail like Skia's fuzzer-build cap on
+        // measured stamps (the source is then drawn unchanged).
+        let stamps = (length - self.phase.max(0.0)) / self.advance;
+        if !(stamps.is_finite() && stamps <= MAX_PATH1D_STAMPS) {
+            return None;
         }
 
         let mut distance = self.phase;
@@ -1257,24 +1323,38 @@ impl Path2DEffect {
     }
 }
 
-impl PathEffect for Path2DEffect {
-    fn apply(&self, src_path: &Path) -> Option<Path> {
+impl Path2DEffect {
+    /// `Sk2DPathEffect` tiling: a stamp at every lattice cell covered by the
+    /// source (limited to `cull` when given).
+    fn tile(&self, src_path: &Path, cull: Option<&skia_rs_core::Rect>) -> Option<Path> {
         // Sk2DPathEffect: a singular matrix fails the effect (the source is
         // drawn unchanged). An empty source succeeds with nothing (its
         // lattice rect is empty), so an inverse-filled empty path does not
         // flood the clip.
         let inverse = self.matrix.invert()?;
-        let spans = lattice_spans(src_path, &inverse);
+        // A stamp placed at `loc` is visible when `loc + stamp` meets the
+        // cull: widen the cull by the stamp's extent.
+        let b = self.path.bounds();
+        let cull = cull.map(|c| {
+            skia_rs_core::Rect::new(
+                c.left - b.right,
+                c.top - b.bottom,
+                c.right - b.left,
+                c.bottom - b.top,
+            )
+        });
+        let spans = lattice_spans(src_path, &inverse, cull.as_ref());
+
+        // Spread the point budget evenly over the covered rows, so a
+        // truncated pattern still spans the whole source vertically.
+        let mut rows = spans.iter().map(|&(y, _, _)| y).collect::<Vec<_>>();
+        rows.dedup();
+        let stamp_points = self.path.points().len().max(1);
+        let per_row = (MAX_LATTICE_POINTS / stamp_points / rows.len().max(1)).max(1);
 
         // SkPath2DPathEffect::next: the stamp is *translated* to each covered
         // cell's center mapped through the lattice matrix.
         let mut builder = PathBuilder::new();
-        // Spread the stamp budget evenly over the covered rows, so a
-        // truncated pattern still spans the whole source vertically.
-        let mut rows = spans.iter().map(|&(y, _, _)| y).collect::<Vec<_>>();
-        rows.dedup();
-        let per_row = (MAX_LATTICE_STAMPS / rows.len().max(1)).max(1);
-        let mut cells = Vec::new();
         let (mut row, mut used) = (None, 0_usize);
         for (y, left, count) in spans {
             if row != Some(y) {
@@ -1282,20 +1362,35 @@ impl PathEffect for Path2DEffect {
             }
             let take = usize::try_from(count).unwrap_or(0).min(per_row - used);
             used += take;
-            cells.extend((left..).take(take).map(|x| (x, y)));
-        }
-        for (x, y) in cells {
-            let loc = self.matrix.map_point(Point::new(
-                scalar_from_i32(x) + 0.5,
-                scalar_from_i32(y) + 0.5,
-            ));
-            builder.add_path(
-                &self
-                    .path
-                    .transformed(&skia_rs_core::Matrix::translate(loc.x, loc.y)),
-            );
+            for x in (left..).take(take) {
+                let loc = self.matrix.map_point(Point::new(
+                    scalar_from_i32(x) + 0.5,
+                    scalar_from_i32(y) + 0.5,
+                ));
+                builder.add_path(
+                    &self
+                        .path
+                        .transformed(&skia_rs_core::Matrix::translate(loc.x, loc.y)),
+                );
+            }
         }
         Some(builder.build())
+    }
+}
+
+impl PathEffect for Path2DEffect {
+    fn apply(&self, src_path: &Path) -> Option<Path> {
+        self.tile(src_path, None)
+    }
+
+    fn filter_path_culled(
+        &self,
+        path: &Path,
+        rec: &mut StrokeRec,
+        cull: Option<&skia_rs_core::Rect>,
+    ) -> Option<Path> {
+        let _ = rec;
+        self.tile(path, cull)
     }
 
     fn effect_kind(&self) -> PathEffectKind {
@@ -1309,13 +1404,16 @@ impl PathEffect for Path2DEffect {
 
 /// Resource guards for the 2D effects against pathological lattices: at
 /// most this many lattice rows and columns are scanned, and
-/// [`Path2DEffect`] places at most [`MAX_LATTICE_STAMPS`] stamps, budgeted
-/// evenly across the covered rows (each row keeps its leftmost cells). Beyond
-/// them the pattern is truncated (Skia has no limit outside fuzzer builds,
-/// where it caps spans at 100 cells).
+/// [`Path2DEffect`] emits at most [`MAX_LATTICE_POINTS`] points, budgeted
+/// evenly across the covered rows (each row keeps its leftmost cells). The
+/// scanned lattice rect is first limited to the visible (cull) area, when
+/// the caller provides one. Beyond these limits the pattern is truncated
+/// (Skia has no limit outside fuzzer builds, where it caps spans at 100
+/// cells).
 const MAX_LATTICE_EXTENT: i64 = 1 << 16;
-/// See [`MAX_LATTICE_EXTENT`].
-const MAX_LATTICE_STAMPS: usize = 1 << 20;
+/// See [`MAX_LATTICE_EXTENT`]: the most points [`Path2DEffect`] emits
+/// (stamps times the stamp's point count).
+const MAX_LATTICE_POINTS: usize = 1 << 21;
 
 /// The lattice-space edges of `mapped`, flattened, with every contour
 /// implicitly closed, oriented downward as `(top, bottom, winding)` and
@@ -1416,7 +1514,11 @@ fn row_intervals(
     clippy::suboptimal_flops,
     reason = "unfused arithmetic like SkRegion's edge walk; mul_add rounds differently"
 )]
-fn lattice_spans(src: &Path, inverse: &skia_rs_core::Matrix) -> Vec<(i32, i32, i32)> {
+fn lattice_spans(
+    src: &Path,
+    inverse: &skia_rs_core::Matrix,
+    cull: Option<&skia_rs_core::Rect>,
+) -> Vec<(i32, i32, i32)> {
     if src.is_empty() {
         return Vec::new();
     }
@@ -1425,6 +1527,21 @@ fn lattice_spans(src: &Path, inverse: &skia_rs_core::Matrix) -> Vec<(i32, i32, i
     // SkRect::round (sk_float_round2int: floor(x + 0.5)).
     let round = |v: Scalar| floor_to_i32(v + 0.5);
     let (left, top, right, bottom) = (round(b.left), round(b.top), round(b.right), round(b.bottom));
+    // Limit to the cull area in lattice space, outset by a cell (a cell's
+    // output can reach past its center by up to a cell). Cells outside it
+    // produce nothing visible.
+    let (left, top, right, bottom) = match cull {
+        Some(cull) if cull.is_finite() => {
+            let c = inverse.map_rect(cull);
+            (
+                left.max(floor_to_i32(c.left).saturating_sub(1)),
+                top.max(floor_to_i32(c.top).saturating_sub(1)),
+                right.min(ceil_to_i32(c.right).saturating_add(1)),
+                bottom.min(ceil_to_i32(c.bottom).saturating_add(1)),
+            )
+        }
+        _ => (left, top, right, bottom),
+    };
     if left >= right || top >= bottom {
         return Vec::new();
     }
@@ -1547,11 +1664,15 @@ impl Line2DEffect {
     /// span of more than one covered lattice cell, from the first cell's
     /// center to one past the last, mapped through the lattice matrix.
     /// `None` when the lattice matrix is singular.
-    fn hatch_lines(&self, src_path: &Path) -> Option<Vec<(Point, Point)>> {
+    fn hatch_lines(
+        &self,
+        src_path: &Path,
+        cull: Option<&skia_rs_core::Rect>,
+    ) -> Option<Vec<(Point, Point)>> {
         // As in Sk2DPathEffect, only a singular matrix fails; an empty
         // source succeeds with no lines.
         let inverse = self.matrix.invert()?;
-        let lines = lattice_spans(src_path, &inverse)
+        let lines = lattice_spans(src_path, &inverse, cull)
             .into_iter()
             .filter(|&(_, _, count)| count > 1)
             .map(|(v, u, count)| {
@@ -1573,7 +1694,19 @@ impl PathEffect for Line2DEffect {
     /// with the record set to stroke them at the effect's width
     /// (`rec->setStrokeStyle(fWidth)`). A failure leaves the record alone.
     fn filter_path(&self, path: &Path, rec: &mut StrokeRec) -> Option<Path> {
-        let lines = self.hatch_lines(path)?;
+        self.filter_path_culled(path, rec, None)
+    }
+
+    /// As [`filter_path`](PathEffect::filter_path), skipping hatch lines
+    /// outside `cull` (widened by the line width).
+    fn filter_path_culled(
+        &self,
+        path: &Path,
+        rec: &mut StrokeRec,
+        cull: Option<&skia_rs_core::Rect>,
+    ) -> Option<Path> {
+        let cull = cull.map(|c| c.inset(-self.width, -self.width));
+        let lines = self.hatch_lines(path, cull.as_ref())?;
         rec.set_stroke_style(self.width);
         let mut builder = PathBuilder::new();
         for (p0, p1) in lines {
@@ -1587,7 +1720,7 @@ impl PathEffect for Line2DEffect {
     /// of the effect's width (empty for a zero width, which is a hairline
     /// hatch that only `filter_path`'s stroke record can express).
     fn apply(&self, src_path: &Path) -> Option<Path> {
-        let lines = self.hatch_lines(src_path)?;
+        let lines = self.hatch_lines(src_path, None)?;
         let half_width = self.width / 2.0;
         let mut builder = PathBuilder::new();
         for (p0, p1) in lines {
@@ -1817,6 +1950,57 @@ mod tests {
 
         let tile = Path2DEffect::new(lattice, square(1.0)).unwrap();
         assert!(tile.apply(&empty).expect("succeeds").is_empty());
+    }
+
+    #[test]
+    fn dash_and_1d_effects_fail_on_unbounded_output() {
+        // SkDashPath: more than kMaxDashCount (1e6) dashes per contour fails.
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0).line_to(1e8, 0.0);
+        let long = b.build();
+        let dash = DashEffect::new(vec![5.0, 5.0], 0.0).unwrap();
+        assert!(dash.apply(&long).is_none(), "1e7 dashes: gives up");
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0).line_to(1000.0, 0.0);
+        assert!(dash.apply(&b.build()).is_some(), "100 dashes: fine");
+
+        // Path1D: a non-finite or enormous stamp count fails too.
+        let stamp = square(1.0);
+        let one_d = Path1DEffect::new(stamp, 1.0, 0.0, Path1DStyle::Translate).unwrap();
+        assert!(one_d.apply(&long).is_none(), "1e8 stamps: gives up");
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0).line_to(3e38, 3e38);
+        assert!(
+            one_d.apply(&b.build()).is_none(),
+            "infinite length: gives up"
+        );
+    }
+
+    #[test]
+    fn path2d_output_is_bounded_by_points() {
+        // A 13-point stamp over ~1M covered cells stays within the point
+        // budget instead of emitting 13M points.
+        let mut b = PathBuilder::new();
+        b.add_circle(0.0, 0.0, 0.5);
+        let circle = b.build();
+        let per_stamp = circle.points().len();
+        let tile = Path2DEffect::new(skia_rs_core::Matrix::scale(2.0, 2.0), circle).unwrap();
+        let produced = tile.apply(&square(2000.0)).expect("applies");
+        assert!(produced.points().len() <= MAX_LATTICE_POINTS + per_stamp);
+        assert!(!produced.is_empty());
+    }
+
+    #[test]
+    fn two_d_effects_skip_cells_outside_the_cull() {
+        let hatch = Line2DEffect::new(1.0, skia_rs_core::Matrix::scale(4.0, 4.0)).unwrap();
+        let cull = skia_rs_core::Rect::new(0.0, 0.0, 40.0, 40.0);
+        let mut rec = StrokeRec::Fill;
+        let lines = hatch
+            .filter_path_culled(&square(4000.0), &mut rec, Some(&cull))
+            .expect("applies");
+        // Only rows near the cull remain (each still spans the source).
+        let max_y = lines.points().iter().map(|p| p.y).fold(0.0, Scalar::max);
+        assert!(!lines.is_empty() && max_y < 60.0, "max y = {max_y}");
     }
 
     #[test]
