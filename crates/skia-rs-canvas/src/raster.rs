@@ -597,8 +597,23 @@ impl<'a> Rasterizer<'a> {
         }
     }
 
-    /// Draw a line using Bresenham's algorithm (aliased) or Wu's algorithm (anti-aliased).
+    /// Draw a line segment.
+    ///
+    /// Matches `SkCanvas::drawLine`, which is `drawPoints(kLines_PointMode)`:
+    /// the segment is always stroked (the paint's style is ignored) using
+    /// the paint's stroke width, cap and join. A stroke width of zero is a
+    /// hairline, drawn with Bresenham's algorithm (aliased) or Wu's
+    /// algorithm (anti-aliased).
     pub fn draw_line(&mut self, p0: Point, p1: Point, paint: &Paint) {
+        if paint.stroke_width() > 0.0 {
+            let mut b = PathBuilder::new();
+            b.move_to(p0.x, p0.y).line_to(p1.x, p1.y);
+            let mut stroke = paint.clone();
+            stroke.set_style(Style::Stroke);
+            self.draw_path(&b.build(), &stroke);
+            return;
+        }
+
         if paint.is_anti_alias() {
             self.draw_line_aa(p0, p1, paint);
         } else {
