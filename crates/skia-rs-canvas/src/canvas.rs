@@ -943,33 +943,36 @@ impl<'a> Canvas<'a> {
     /// Draw a path.
     ///
     /// If the [`Paint`] has a [`PathEffect`] attached (via
-    /// [`Paint::set_path_effect`]), the effect is applied to the path before
-    /// it is rasterized / recorded. Effects that produce an empty path
-    /// (e.g. [`TrimEffect`] with a zero interval) are silently skipped.
+    /// [`Paint::set_path_effect`]), rasterizing follows Skia's
+    /// `FillPathWithPaint`: the effect filters the path through a
+    /// [`StrokeRec`] built from the paint, and the result is drawn with the
+    /// style and width that record ends up with (e.g. `Path1DEffect` stamps
+    /// are filled, `Line2DEffect` strokes at its own width, dashing a filled
+    /// paint fails). If the effect fails, the original path is drawn, still with
+    /// the updated record. An effect that succeeds with an empty path draws
+    /// nothing.
+    ///
+    /// Recording canvases store the original path and paint, so the effect
+    /// is applied once, at playback.
     ///
     /// [`PathEffect`]: skia_rs_path::PathEffect
-    /// [`TrimEffect`]: skia_rs_path::TrimEffect
+    /// [`StrokeRec`]: skia_rs_path::StrokeRec
     pub fn draw_path(&mut self, path: &Path, paint: &Paint) {
         match &mut self.backing {
             Backing::Raster(_) => {
-                // If the paint carries a path effect, apply it first and
-                // rasterize the effected path with the style the effect
-                // requests (SkStrokeRec): e.g. Path1D stamps are filled and
-                // Line2D strokes at its own width. If the effect cannot apply,
-                // draw the input path unchanged, like a failed filterPath.
-                let effected = paint
-                    .path_effect()
-                    .and_then(|e| e.apply(path).map(|p| (p, e.style_override())));
-                match effected {
-                    Some((effected_path, style)) => {
-                        let styled = paint_with_effect_style(paint, style);
-                        let styled = styled.as_ref().unwrap_or(paint);
-                        self.with_rasterizer(|raster| raster.draw_path(&effected_path, styled));
-                    }
-                    None => {
-                        self.with_rasterizer(|raster| raster.draw_path(path, paint));
-                    }
-                }
+                let Some(effect) = paint.path_effect() else {
+                    self.with_rasterizer(|raster| raster.draw_path(path, paint));
+                    return;
+                };
+                // skpathutils::FillPathWithPaint: filter through the paint's
+                // stroke record; on failure draw the source, but with the
+                // record as the effect left it.
+                let mut rec = stroke_rec_from_paint(paint);
+                let filtered = effect.filter_path(path, &mut rec);
+                let final_path = filtered.as_ref().unwrap_or(path);
+                let styled = paint_with_stroke_rec(paint, rec);
+                let styled = styled.as_ref().unwrap_or(paint);
+                self.with_rasterizer(|raster| raster.draw_path(final_path, styled));
             }
             Backing::Recording(commands) => {
                 // Record the original path, like SkPicture: the paint still
@@ -2349,28 +2352,41 @@ impl Canvas<'_> {
     }
 }
 
-/// The paint to draw a path effect's output with, after applying the
-/// effect's [`EffectStyle`](skia_rs_path::EffectStyle) the way Skia's
-/// `filterPath` rewrites the `SkStrokeRec`. Returns `None` when the paint is
-/// used unchanged.
-fn paint_with_effect_style(paint: &Paint, style: skia_rs_path::EffectStyle) -> Option<Paint> {
+/// The [`StrokeRec`](skia_rs_path::StrokeRec) a paint starts with when a
+/// path effect filters its geometry (`SkStrokeRec(const SkPaint&)`).
+fn stroke_rec_from_paint(paint: &Paint) -> skia_rs_path::StrokeRec {
     use skia_rs_paint::Style;
-    use skia_rs_path::EffectStyle;
+    use skia_rs_path::StrokeRec;
 
-    match style {
-        EffectStyle::Inherit => None,
-        EffectStyle::Fill => {
-            let mut fill = paint.clone();
-            fill.set_style(Style::Fill);
-            Some(fill)
-        }
-        EffectStyle::Stroke(width) => {
-            let mut stroke = paint.clone();
-            stroke.set_style(Style::Stroke);
-            stroke.set_stroke_width(width);
-            Some(stroke)
-        }
+    let width = paint.stroke_width();
+    match paint.style() {
+        Style::Stroke if width > 0.0 => StrokeRec::Stroke(width),
+        Style::Stroke => StrokeRec::Hairline,
+        Style::StrokeAndFill if width > 0.0 => StrokeRec::StrokeAndFill(width),
+        // A zero-width stroke-and-fill is just a fill (SkStrokeRec::init).
+        Style::Fill | Style::StrokeAndFill => StrokeRec::Fill,
     }
+}
+
+/// The paint to draw with after a path effect left `rec` as it is, or
+/// `None` if the paint already matches it.
+fn paint_with_stroke_rec(paint: &Paint, rec: skia_rs_path::StrokeRec) -> Option<Paint> {
+    use skia_rs_paint::Style;
+    use skia_rs_path::StrokeRec;
+
+    if rec == stroke_rec_from_paint(paint) {
+        return None;
+    }
+    let (style, width) = match rec {
+        StrokeRec::Fill => (Style::Fill, paint.stroke_width()),
+        StrokeRec::Hairline => (Style::Stroke, 0.0),
+        StrokeRec::Stroke(width) => (Style::Stroke, width),
+        StrokeRec::StrokeAndFill(width) => (Style::StrokeAndFill, width),
+    };
+    let mut styled = paint.clone();
+    styled.set_style(style);
+    styled.set_stroke_width(width);
+    Some(styled)
 }
 
 /// Extra outline width Skia adds to emboldened ("fake bold") glyphs.

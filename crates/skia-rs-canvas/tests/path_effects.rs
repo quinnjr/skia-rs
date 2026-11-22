@@ -151,3 +151,66 @@ fn recorded_emboldened_text_replays_per_command_at_the_right_place() {
         "replay must not apply the CTM twice"
     );
 }
+
+#[test]
+fn dash_on_a_filled_paint_fills_the_whole_shape() {
+    // SkDashPath::InternalFilter refuses Fill/StrokeAndFill geometry, so a
+    // filled rect with a dash effect is filled in full, not as dash slivers.
+    use skia_rs_core::Rect;
+
+    let mut paint = dashed_paint(vec![10.0, 5.0]);
+    paint.set_style(Style::Fill);
+    let mut b = PathBuilder::new();
+    b.add_rect(&Rect::from_xywh(10.0, 2.0, 100.0, 16.0));
+    let mut via_path = PixelBuffer::new(W, H);
+    Canvas::new_raster(&mut via_path).draw_path(&b.build(), &paint);
+
+    for x in 12..108 {
+        assert!(
+            lit(&via_path, x, 10),
+            "filled dashed path must be solid at x={x}"
+        );
+    }
+}
+
+#[test]
+fn zero_length_line_draws_cap_dots_like_skia() {
+    // A zero-length segment with round or square caps paints a dot of the
+    // stroke width; with butt caps it paints nothing.
+    use skia_rs_paint::StrokeCap;
+
+    let dot = |cap: StrokeCap| {
+        let mut paint = Paint::new();
+        paint.set_color(Color::WHITE.into());
+        paint.set_style(Style::Stroke);
+        paint.set_stroke_width(10.0);
+        paint.set_stroke_cap(cap);
+        let mut buffer = PixelBuffer::new(W, H);
+        Canvas::new_raster(&mut buffer).draw_line(
+            Point::new(50.0, 10.0),
+            Point::new(50.0, 10.0),
+            &paint,
+        );
+        (0..H)
+            .flat_map(|y| (0..W).map(move |x| (x, y)))
+            .filter(|&(x, y)| lit(&buffer, x, y))
+            .count()
+    };
+
+    let round = dot(StrokeCap::Round);
+    let square = dot(StrokeCap::Square);
+    assert!(
+        round >= 60,
+        "round cap should paint a ~10px dot, got {round}"
+    );
+    assert!(
+        square >= 90,
+        "square cap should paint a ~10x10 dot, got {square}"
+    );
+    assert!(square > round, "a square dot covers more than a round one");
+    assert_eq!(
+        dot(StrokeCap::Butt),
+        0,
+        "butt caps draw nothing for a point"
+    );
+}

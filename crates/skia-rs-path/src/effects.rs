@@ -11,33 +11,45 @@ use skia_rs_core::cast::{ceil_to_i32, floor_to_i32, scalar_from_i32};
 use skia_rs_core::{Point, Scalar};
 use std::sync::Arc;
 
-/// How a path effect rewrites the paint's stroke style for its output.
+/// The stroke parameters a path effect can read and rewrite while filtering.
 ///
-/// Corresponds to the `SkStrokeRec` changes Skia's effects make in
-/// `filterPath`: `Sk1DPathEffect` switches to fill (its stamps are shapes),
-/// `SkLine2DPathEffect` strokes at its own width, and most effects leave the
-/// paint's style alone.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum EffectStyle {
-    /// Keep the paint's style (fill, stroke, or stroke-and-fill).
-    #[default]
-    Inherit,
-    /// Fill the effect's output (`SkStrokeRec::setFillStyle`).
+/// Corresponds to Skia's `SkStrokeRec` (style and width only; cap, join and
+/// miter stay on the paint). Effects inspect it (e.g. dashing refuses filled
+/// geometry) and change it (e.g. `Sk1DPathEffect` switches to fill), and the
+/// caller draws the result with whatever the record says afterwards, even
+/// when the effect itself failed (`skpathutils::FillPathWithPaint`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StrokeRec {
+    /// Fill the geometry.
     Fill,
-    /// Stroke the effect's output at this width, ignoring the paint's
-    /// stroke width (`SkStrokeRec::setStrokeStyle(width)`). Zero is a
-    /// hairline.
+    /// Stroke with a zero-width (1 device pixel) hairline.
+    Hairline,
+    /// Stroke with the given width (> 0).
     Stroke(Scalar),
+    /// Fill and stroke with the given width (> 0).
+    StrokeAndFill(Scalar),
 }
 
-impl EffectStyle {
-    /// This override, or `fallback` if this one inherits.
+impl StrokeRec {
+    /// True for [`Fill`](Self::Fill) (`SkStrokeRec::isFillStyle`).
     #[must_use]
-    pub const fn or(self, fallback: Self) -> Self {
-        match self {
-            Self::Inherit => fallback,
-            other => other,
-        }
+    pub const fn is_fill_style(&self) -> bool {
+        matches!(self, Self::Fill)
+    }
+
+    /// Switch to filling (`SkStrokeRec::setFillStyle`).
+    pub const fn set_fill_style(&mut self) {
+        *self = Self::Fill;
+    }
+
+    /// Switch to stroking at `width`; zero means hairline
+    /// (`SkStrokeRec::setStrokeStyle(width, false)`).
+    pub const fn set_stroke_style(&mut self, width: Scalar) {
+        *self = if width == 0.0 {
+            Self::Hairline
+        } else {
+            Self::Stroke(width)
+        };
     }
 }
 
@@ -55,11 +67,14 @@ pub trait PathEffect: Send + Sync + std::fmt::Debug {
     ///   so callers draw the source path unchanged.
     fn apply(&self, path: &Path) -> Option<Path>;
 
-    /// How the paint's style must change when drawing the output of a
-    /// successful [`apply`](Self::apply). Defaults to
-    /// [`EffectStyle::Inherit`].
-    fn style_override(&self) -> EffectStyle {
-        EffectStyle::Inherit
+    /// Apply the effect the way Skia's `SkPathEffect::filterPath` does:
+    /// reading and updating the stroke record `rec`, which the caller then
+    /// uses to draw the result (or the source, if this returns `None`).
+    ///
+    /// The default applies [`apply`](Self::apply) and leaves `rec` alone.
+    fn filter_path(&self, path: &Path, rec: &mut StrokeRec) -> Option<Path> {
+        let _ = rec;
+        self.apply(path)
     }
 
     /// Get the kind of path effect for debugging.
@@ -280,6 +295,15 @@ impl DashEffect {
 }
 
 impl PathEffect for DashEffect {
+    fn filter_path(&self, path: &Path, rec: &mut StrokeRec) -> Option<Path> {
+        // SkDashPath::InternalFilter does nothing for geometry that wants to
+        // be filled (Fill or StrokeAndFill): the source is drawn unchanged.
+        if matches!(rec, StrokeRec::Fill | StrokeRec::StrokeAndFill(_)) {
+            return None;
+        }
+        self.apply(path)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "faithful port of SkDashPath::InternalFilter's per-verb dash state machine"
@@ -951,14 +975,17 @@ impl ComposeEffect {
 }
 
 impl PathEffect for ComposeEffect {
-    fn style_override(&self) -> EffectStyle {
-        // SkComposePathEffect runs inner then outer on one SkStrokeRec.
-        self.outer.style_override().or(self.inner.style_override())
+    fn filter_path(&self, path: &Path, rec: &mut StrokeRec) -> Option<Path> {
+        // SkComposePathEffect: inner then outer on one SkStrokeRec; if the
+        // inner effect fails, the outer one still runs on the source.
+        let intermediate = self.inner.filter_path(path, rec);
+        self.outer
+            .filter_path(intermediate.as_ref().unwrap_or(path), rec)
     }
 
     fn apply(&self, path: &Path) -> Option<Path> {
-        let intermediate = self.inner.apply(path)?;
-        self.outer.apply(&intermediate)
+        let intermediate = self.inner.apply(path);
+        self.outer.apply(intermediate.as_ref().unwrap_or(path))
     }
 
     fn effect_kind(&self) -> PathEffectKind {
@@ -987,15 +1014,25 @@ impl SumEffect {
 }
 
 impl PathEffect for SumEffect {
-    fn style_override(&self) -> EffectStyle {
-        // SkSumPathEffect runs first then second on one SkStrokeRec.
-        self.second.style_override().or(self.first.style_override())
+    fn filter_path(&self, path: &Path, rec: &mut StrokeRec) -> Option<Path> {
+        // SkSumPathEffect always runs both, in order, on one SkStrokeRec and
+        // appends whatever each produced.
+        let path1 = self.first.filter_path(path, rec);
+        let path2 = self.second.filter_path(path, rec);
+        Self::combine(path1, path2)
     }
 
     fn apply(&self, path: &Path) -> Option<Path> {
-        let path1 = self.first.apply(path);
-        let path2 = self.second.apply(path);
+        Self::combine(self.first.apply(path), self.second.apply(path))
+    }
 
+    fn effect_kind(&self) -> PathEffectKind {
+        PathEffectKind::Sum
+    }
+}
+
+impl SumEffect {
+    fn combine(path1: Option<Path>, path2: Option<Path>) -> Option<Path> {
         match (path1, path2) {
             (Some(p1), Some(p2)) => {
                 // Combine the paths
@@ -1007,10 +1044,6 @@ impl PathEffect for SumEffect {
             (Some(p), None) | (None, Some(p)) => Some(p),
             (None, None) => None,
         }
-    }
-
-    fn effect_kind(&self) -> PathEffectKind {
-        PathEffectKind::Sum
     }
 }
 
@@ -1128,9 +1161,10 @@ impl Path1DEffect {
 }
 
 impl PathEffect for Path1DEffect {
-    fn style_override(&self) -> EffectStyle {
-        // SkPath1DPathEffect::onFilterPath: rec->setFillStyle().
-        EffectStyle::Fill
+    fn filter_path(&self, path: &Path, rec: &mut StrokeRec) -> Option<Path> {
+        // SkPath1DPathEffect::onFilterPath: rec->setFillStyle(), then filter.
+        rec.set_fill_style();
+        self.apply(path)
     }
 
     fn apply(&self, src_path: &Path) -> Option<Path> {
@@ -1321,9 +1355,12 @@ impl Line2DEffect {
 }
 
 impl PathEffect for Line2DEffect {
-    fn style_override(&self) -> EffectStyle {
-        // SkLine2DPathEffect::onFilterPath: rec->setStrokeStyle(fWidth).
-        EffectStyle::Stroke(self.width)
+    fn filter_path(&self, path: &Path, rec: &mut StrokeRec) -> Option<Path> {
+        // SkLine2DPathEffect::onFilterPath: on success,
+        // rec->setStrokeStyle(fWidth); a failure leaves the record alone.
+        let filtered = self.apply(path)?;
+        rec.set_stroke_style(self.width);
+        Some(filtered)
     }
 
     fn apply(&self, src_path: &Path) -> Option<Path> {
@@ -1518,29 +1555,54 @@ mod tests {
     }
 
     #[test]
-    fn style_overrides_match_skia_stroke_rec_changes() {
+    fn filter_path_updates_the_stroke_rec_like_skia() {
         let stamp: PathEffectRef =
             Arc::new(Path1DEffect::new(square(2.0), 5.0, 0.0, Path1DStyle::Translate).unwrap());
         let hatch: PathEffectRef =
             Arc::new(Line2DEffect::new(3.0, skia_rs_core::Matrix::scale(4.0, 4.0)).unwrap());
+        let bad_hatch: PathEffectRef =
+            Arc::new(Line2DEffect::new(3.0, skia_rs_core::Matrix::scale(0.0, 0.0)).unwrap());
         let dash: PathEffectRef = Arc::new(DashEffect::new(vec![4.0, 2.0], 0.0).unwrap());
 
-        assert_eq!(stamp.style_override(), EffectStyle::Fill);
-        assert_eq!(hatch.style_override(), EffectStyle::Stroke(3.0));
-        assert_eq!(dash.style_override(), EffectStyle::Inherit);
+        // Path1D switches to fill; Line2D strokes at its own width.
+        let mut rec = StrokeRec::Hairline;
+        assert!(stamp.filter_path(&flat_line(), &mut rec).is_some());
+        assert_eq!(rec, StrokeRec::Fill);
+        let mut rec = StrokeRec::Fill;
+        assert!(hatch.filter_path(&square(20.0), &mut rec).is_some());
+        assert_eq!(rec, StrokeRec::Stroke(3.0));
 
-        // Compose runs inner then outer: outer's override wins, otherwise
-        // inner's carries through.
-        let outer_wins = ComposeEffect::new(Arc::clone(&hatch), Arc::clone(&stamp));
-        assert_eq!(outer_wins.style_override(), EffectStyle::Stroke(3.0));
-        let inner_carries = ComposeEffect::new(Arc::clone(&dash), Arc::clone(&stamp));
-        assert_eq!(inner_carries.style_override(), EffectStyle::Fill);
+        // A failed Line2D leaves the record untouched.
+        let mut rec = StrokeRec::Fill;
+        assert!(bad_hatch.filter_path(&square(20.0), &mut rec).is_none());
+        assert_eq!(rec, StrokeRec::Fill);
 
-        // Sum runs first then second: second's override wins.
-        let second_wins = SumEffect::new(Arc::clone(&stamp), Arc::clone(&hatch));
-        assert_eq!(second_wins.style_override(), EffectStyle::Stroke(3.0));
-        let first_carries = SumEffect::new(stamp, dash);
-        assert_eq!(first_carries.style_override(), EffectStyle::Fill);
+        // Dash refuses filled geometry and dashes strokes.
+        let mut rec = StrokeRec::Fill;
+        assert!(dash.filter_path(&flat_line(), &mut rec).is_none());
+        let mut rec = StrokeRec::StrokeAndFill(2.0);
+        assert!(dash.filter_path(&flat_line(), &mut rec).is_none());
+        let mut rec = StrokeRec::Stroke(2.0);
+        assert!(dash.filter_path(&flat_line(), &mut rec).is_some());
+
+        // Sum: a failing child must not restyle the other child's output.
+        let sum = SumEffect::new(Arc::clone(&stamp), Arc::clone(&bad_hatch));
+        let mut rec = StrokeRec::Hairline;
+        assert!(sum.filter_path(&flat_line(), &mut rec).is_some());
+        assert_eq!(rec, StrokeRec::Fill, "stamps stay filled");
+
+        // Compose: a failing inner effect leaves the outer to run on the
+        // source (SkComposePathEffect), instead of failing the whole effect.
+        let compose = ComposeEffect::new(Arc::clone(&dash), Arc::clone(&bad_hatch));
+        let mut rec = StrokeRec::Stroke(2.0);
+        let dashed = compose
+            .filter_path(&flat_line(), &mut rec)
+            .expect("outer dash still runs on the source");
+        assert!(
+            dashed.verb_count() > flat_line().verb_count(),
+            "source got dashed"
+        );
+        assert!(compose.apply(&flat_line()).is_some());
     }
 
     #[test]
