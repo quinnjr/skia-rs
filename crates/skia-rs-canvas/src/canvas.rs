@@ -1435,6 +1435,8 @@ impl<'a> Canvas<'a> {
         font: &skia_rs_text::Font,
         paint: &Paint,
     ) {
+        use skia_rs_paint::Style;
+
         let path = outline.transformed(&Matrix::translate(x, y));
         if !font.is_embolden() {
             self.draw_path(&path, paint);
@@ -1442,17 +1444,70 @@ impl<'a> Canvas<'a> {
         }
 
         let extra = fake_bold_extra(font.size());
-        let mut bold = paint.clone();
-        match paint.style() {
-            skia_rs_paint::Style::Fill => {
-                bold.set_style(skia_rs_paint::Style::StrokeAndFill);
-                bold.set_stroke_width(extra);
+        let ctm = *self.total_matrix();
+        let ctm_scale = ctm.determinant().abs().sqrt();
+
+        // Plain paints are emboldened in device space so that flattening
+        // the stroke outline happens at device-pixel tolerance (a local-space
+        // outline would show facets under a scaling matrix). Shaders and
+        // mask/image filters depend on the local matrix, so those keep the
+        // local-space path below.
+        let device_safe = paint.shader().is_none()
+            && paint.mask_filter().is_none()
+            && paint.image_filter().is_none()
+            && paint.path_effect().is_none()
+            && ctm_scale.is_finite()
+            && ctm_scale > 0.0;
+        if !device_safe {
+            let mut bold = paint.clone();
+            match paint.style() {
+                Style::Fill => {
+                    bold.set_style(Style::StrokeAndFill);
+                    bold.set_stroke_width(extra);
+                }
+                Style::Stroke | Style::StrokeAndFill => {
+                    bold.set_stroke_width(paint.stroke_width() + extra);
+                }
             }
-            skia_rs_paint::Style::Stroke | skia_rs_paint::Style::StrokeAndFill => {
-                bold.set_stroke_width(paint.stroke_width() + extra);
+            self.draw_path(&path, &bold);
+            return;
+        }
+
+        let device_path = path.transformed(&ctm);
+        let device_extra = extra * ctm_scale;
+        self.save();
+        self.reset_matrix();
+        match paint.style() {
+            Style::Fill
+                if paint.alpha() >= 1.0
+                    && paint.blend_mode() == skia_rs_paint::BlendMode::SrcOver
+                    && paint.color_filter().is_none() =>
+            {
+                // Opaque SrcOver: filling the exact outline and then its
+                // stroke outline covers the same pixels as their union, with
+                // no visible double blend, and avoids a path-op union per
+                // glyph.
+                self.draw_path(&device_path, paint);
+                let mut outset = paint.clone();
+                outset.set_style(Style::Stroke);
+                outset.set_stroke_width(device_extra);
+                self.draw_path(&device_path, &outset);
+            }
+            Style::Fill => {
+                // Translucent or non-SrcOver: the overlap must be covered
+                // exactly once, so fill the union (StrokeAndFill).
+                let mut bold = paint.clone();
+                bold.set_style(Style::StrokeAndFill);
+                bold.set_stroke_width(device_extra);
+                self.draw_path(&device_path, &bold);
+            }
+            Style::Stroke | Style::StrokeAndFill => {
+                let mut bold = paint.clone();
+                bold.set_stroke_width((paint.stroke_width() + extra) * ctm_scale);
+                self.draw_path(&device_path, &bold);
             }
         }
-        self.draw_path(&path, &bold);
+        self.restore();
     }
 
     /// Draw positioned text with alignment.

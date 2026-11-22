@@ -214,3 +214,50 @@ fn embolden_thickens_glyphs_in_every_draw_path() {
         }
     }
 }
+
+#[test]
+fn embolden_under_scale_adds_coverage_and_never_double_blends() {
+    // Emboldening is done in device space; under a 3x canvas scale both the
+    // opaque fast path and the translucent union path must thicken the
+    // glyph, and the translucent path must cover each pixel exactly once.
+    let render = |embolden: bool, alpha: u8| {
+        let mut font = demo_font(40.0);
+        font.set_embolden(embolden);
+        let mut paint = Paint::new();
+        paint.set_color32(Color::from_argb(alpha, 255, 255, 255));
+        paint.set_anti_alias(true);
+        let mut buffer = PixelBuffer::new(300, 300);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            canvas.scale(3.0, 3.0);
+            canvas.draw_string("A", 20.0, 80.0, &font, &paint);
+        }
+        let mut lit = 0usize;
+        let mut max_red = 0u8;
+        for y in 0..300 {
+            for x in 0..300 {
+                let red = buffer.get_pixel(x, y).unwrap_or(Color::BLACK).red();
+                max_red = max_red.max(red);
+                if red > 0 {
+                    lit += 1;
+                }
+            }
+        }
+        (lit, max_red)
+    };
+
+    for alpha in [255u8, 128] {
+        let (regular, regular_max) = render(false, alpha);
+        let (bold, bold_max) = render(true, alpha);
+        assert!(regular > 0, "alpha {alpha}: regular glyph must paint");
+        assert!(
+            bold > regular,
+            "alpha {alpha}: embolden must add coverage (regular={regular}, bold={bold})"
+        );
+        assert!(
+            bold_max <= regular_max.saturating_add(1),
+            "alpha {alpha}: bold glyph must not double-blend the fill/stroke \
+             overlap (regular max={regular_max}, bold max={bold_max})"
+        );
+    }
+}
