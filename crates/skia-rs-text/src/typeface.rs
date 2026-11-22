@@ -330,18 +330,22 @@ impl Typeface {
     /// and shared font bytes), so per-typeface caches keep hitting.
     ///
     /// Returns `None` when none of the well-known font files exists, e.g. in
-    /// a minimal container without fonts installed.
+    /// a minimal container without fonts installed. A failed lookup is not
+    /// cached, so each such call re-probes the (few) candidate paths.
     #[must_use]
     pub fn system_default() -> Option<Self> {
-        static TYPEFACE: OnceLock<Option<Typeface>> = OnceLock::new();
+        // Only a successful load is cached: a font installed or mounted after
+        // a failed lookup is picked up by the next call. If two threads load
+        // concurrently, `get_or_init` keeps the first and both share it.
+        static TYPEFACE: OnceLock<Typeface> = OnceLock::new();
 
-        TYPEFACE
-            .get_or_init(|| {
-                system_default_font_candidates()
-                    .into_iter()
-                    .find_map(|path| Self::from_data(std::fs::read(path).ok()?))
-            })
-            .clone()
+        if let Some(cached) = TYPEFACE.get() {
+            return Some(cached.clone());
+        }
+        let loaded = system_default_font_candidates()
+            .into_iter()
+            .find_map(|path| Self::from_data(std::fs::read(path).ok()?))?;
+        Some(TYPEFACE.get_or_init(|| loaded).clone())
     }
 
     /// Create a typeface from font data.
