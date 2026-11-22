@@ -1189,6 +1189,8 @@ impl<'a> Rasterizer<'a> {
 
         let mut current = Point::zero();
         let mut contour_start = Point::zero();
+        // Reused by every conic in the path (no per-segment allocation).
+        let mut conic_points: Vec<Point> = Vec::new();
 
         for element in path {
             match element {
@@ -1222,15 +1224,14 @@ impl<'a> Rasterizer<'a> {
                     current = end;
                 }
                 PathElement::Conic(ctrl, end, weight) => {
-                    let mut points = Vec::new();
                     flatten_conic_device_error(
-                        &mut points,
+                        &mut conic_points,
                         [current, ctrl, end],
                         weight,
                         &self.matrix,
                     );
                     let mut prev = current;
-                    for p in points {
+                    for &p in &conic_points {
                         self.draw_line(prev, p, paint);
                         prev = p;
                     }
@@ -1795,14 +1796,14 @@ fn cubic_point(t: Scalar, mt: Scalar, p0: Point, p1: Point, p2: Point, p3: Point
 /// return the new current point.
 fn push_conic_edges(
     edges: &mut Vec<Edge>,
+    scratch: &mut Vec<Point>,
     mut current: Point,
     conic: [Point; 3],
     weight: Scalar,
     matrix: &Matrix,
 ) -> Point {
-    let mut points = Vec::new();
-    flatten_conic_device_error(&mut points, conic, weight, matrix);
-    for p in points {
+    flatten_conic_device_error(scratch, conic, weight, matrix);
+    for &p in scratch.iter() {
         let p = matrix.map_point(p);
         if let Some(edge) = Edge::new(current, p) {
             edges.push(edge);
@@ -1813,7 +1814,9 @@ fn push_conic_edges(
 }
 
 /// Flatten a conic (`[start, ctrl, end]` in local space) into local-space
-/// polyline points (excluding `start`), subdividing until every piece
+/// polyline points (excluding `start`), replacing the contents of `out`
+/// (a reusable buffer, so hot paths do not allocate per conic), subdividing
+/// until every piece
 /// deviates from the true curve by at most [`CONIC_FLATTEN_TOLERANCE`]
 /// *device* pixels under `matrix`.
 ///
@@ -1841,9 +1844,15 @@ fn flatten_conic_device_error(
         )
     };
 
-    // Iterative subdivision over [t0, t1] intervals (depth-first, in order).
-    let mut stack = vec![(0.0_f32, 1.0_f32, 0_u32)];
-    while let Some((t0, t1, depth)) = stack.pop() {
+    out.clear();
+    // Iterative depth-first subdivision over [t0, t1] intervals, in curve
+    // order. Each pop pushes at most two entries one level deeper, so the
+    // stack never holds more than MAX_DEPTH + 1 entries: a fixed array.
+    let mut stack = [(0.0_f32, 1.0_f32, 0_u32); MAX_DEPTH as usize + 1];
+    let mut len = 1;
+    while len > 0 {
+        len -= 1;
+        let (t0, t1, depth) = stack[len];
         let tm = f32::midpoint(t0, t1);
         let d0 = matrix.map_point(eval(t0));
         let d1 = matrix.map_point(eval(t1));
@@ -1856,8 +1865,9 @@ fn flatten_conic_device_error(
         } else {
             // Push the second half first so the first half is processed
             // next, keeping the output in curve order.
-            stack.push((tm, t1, depth + 1));
-            stack.push((t0, tm, depth + 1));
+            stack[len] = (tm, t1, depth + 1);
+            stack[len + 1] = (t0, tm, depth + 1);
+            len += 2;
         }
     }
 }
@@ -1881,6 +1891,8 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
     // perspective projection.
     let mut local_current = Point::zero();
     let mut local_contour_start = Point::zero();
+    // Reused by every conic in the path (no per-segment allocation).
+    let mut conic_scratch: Vec<Point> = Vec::new();
 
     for element in path {
         let local_start = local_current;
@@ -1925,7 +1937,14 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
             }
             PathElement::Conic(ctrl, end, weight) => {
                 let conic = [local_start, ctrl, end];
-                current = push_conic_edges(&mut edges, current, conic, weight, matrix);
+                current = push_conic_edges(
+                    &mut edges,
+                    &mut conic_scratch,
+                    current,
+                    conic,
+                    weight,
+                    matrix,
+                );
             }
             PathElement::Cubic(c1, c2, end) => {
                 let c1 = matrix.map_point(c1);

@@ -857,6 +857,7 @@ impl<'a> Canvas<'a> {
     /// all: a region (integer rectangles) or a rectangle with pixel-aligned
     /// edges. Anti-aliased mask clips and fractional rectangles have
     /// partial coverage.
+    #[cfg(feature = "text")]
     fn clip_has_binary_coverage(&self) -> bool {
         match self.clip_stack.current() {
             crate::clip::ClipState::Region(_) => true,
