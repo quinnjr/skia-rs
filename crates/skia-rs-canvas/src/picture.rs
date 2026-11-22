@@ -51,11 +51,17 @@ impl Picture {
     /// The canvas's CTM at the start of playback is captured so that recorded
     /// `SetMatrix` commands compose with it (`setMatrix(initialCTM * recorded)`,
     /// per `SkCanvasPriv`/`SkPicturePlayback`) instead of clobbering it.
+    ///
+    /// Like `SkPicturePlayback` (via `SkAutoCanvasRestore`), playback is
+    /// wrapped in a save/restore, so a recording with unbalanced saves or a
+    /// leftover transform cannot leak state into the caller's later draws.
     pub fn playback(&self, canvas: &mut Canvas) {
+        let restore_count = canvas.save();
         let initial = *canvas.total_matrix();
         for command in &self.commands {
             command.execute_with_base(canvas, &initial);
         }
+        canvas.restore_to_count(restore_count);
     }
 
     /// Get the approximate byte size of this picture.
@@ -640,6 +646,30 @@ mod tests {
     use crate::raster::PixelBuffer;
 
     #[test]
+    fn playback_does_not_leak_unbalanced_state() {
+        // A recording that saves and translates without restoring must not
+        // change the playback canvas's matrix or save count afterwards
+        // (SkPicturePlayback runs under SkAutoCanvasRestore).
+        let picture = Picture::from_parts(
+            vec![
+                DrawCommand::Save,
+                DrawCommand::Translate { dx: 8.0, dy: 0.0 },
+            ],
+            Rect::from_xywh(0.0, 0.0, 16.0, 16.0),
+        );
+        let mut buffer = PixelBuffer::new(16, 16);
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.translate(1.0, 2.0);
+        let matrix_before = *canvas.total_matrix();
+        let saves_before = canvas.save_count();
+
+        picture.playback(&mut canvas);
+
+        assert_eq!(*canvas.total_matrix(), matrix_before);
+        assert_eq!(canvas.save_count(), saves_before);
+    }
+
+    #[test]
     fn test_clip_op_recorded_and_replayed() {
         // A Difference clip recorded through Canvas must replay as Difference,
         // not silently as Intersect.
@@ -758,16 +788,24 @@ mod tests {
 
     #[test]
     fn test_picture_playback() {
+        // The recorded translate applies to the recorded draws during
+        // playback, and the canvas state is restored afterwards (SkRecordDraw
+        // runs under SkAutoCanvasRestore).
         let mut recorder = PictureRecorder::new();
         let canvas = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, 100.0, 100.0));
         canvas.translate(10.0, 20.0);
+        canvas.draw_rect(&Rect::from_xywh(0.0, 0.0, 5.0, 5.0), &Paint::new());
         let picture = recorder.finish_recording().unwrap();
 
-        let mut canvas = Canvas::new(100, 100);
-        picture.playback(&mut canvas);
-        // Verify canvas was modified
-        let matrix = canvas.total_matrix();
-        assert!(!matrix.is_identity());
+        let mut buffer = PixelBuffer::new(100, 100);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            picture.playback(&mut canvas);
+            assert!(canvas.total_matrix().is_identity(), "state restored");
+        }
+        let alpha = |x, y| buffer.get_pixel(x, y).map_or(0, |c| c.alpha());
+        assert!(alpha(12, 22) > 0, "rect drawn at the translated position");
+        assert_eq!(alpha(2, 2), 0, "nothing drawn at the untranslated position");
     }
 
     #[test]
