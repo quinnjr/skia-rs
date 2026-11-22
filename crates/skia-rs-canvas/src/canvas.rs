@@ -804,23 +804,13 @@ impl<'a> Canvas<'a> {
                 }
             }
             PointMode::Polygon => {
-                // SkDraw::drawPoints: the polyline is one open path
-                // (addPoly) stroked once, so vertices get joins rather than
-                // caps, a dash keeps its phase across vertices, and a
-                // translucent wide stroke blends once. (A hairline is drawn
-                // segment by segment, so its shared vertex pixels can still
-                // be blended twice.)
-                if points.len() < 2 {
-                    return;
+                // SkDraw::drawPoints (wide strokes): each consecutive pair is
+                // drawn as its own SkPath::Line, so every segment has its
+                // own caps (no joins), overlapping segments blend
+                // independently, and a dash restarts on each segment.
+                for pair in points.windows(2) {
+                    self.draw_line(pair[0], pair[1], paint);
                 }
-                let mut builder = skia_rs_path::PathBuilder::new();
-                builder.move_to(points[0].x, points[0].y);
-                for p in &points[1..] {
-                    builder.line_to(p.x, p.y);
-                }
-                let mut stroke = paint.clone();
-                stroke.set_style(skia_rs_paint::Style::Stroke);
-                self.draw_path(&builder.build(), &stroke);
             }
         }
     }
@@ -3211,18 +3201,13 @@ mod tests {
                 &paint,
             );
         }
-        // Polygon mode is one stroked open path (SkDraw::drawPoints addPoly),
-        // so it records a single DrawPath rather than a line per segment.
+        // Polygon mode draws each segment as its own line
+        // (SkDraw::drawPoints), so n points record n - 1 lines.
         assert_eq!(
             cmds.iter()
-                .filter(|cmd| matches!(cmd, DrawCommand::DrawPath { .. }))
+                .filter(|cmd| matches!(cmd, DrawCommand::DrawLine { .. }))
                 .count(),
-            1
-        );
-        assert!(
-            !cmds
-                .iter()
-                .any(|cmd| matches!(cmd, DrawCommand::DrawLine { .. }))
+            2
         );
     }
 

@@ -94,17 +94,15 @@ fn hairline_circle_path_stays_on_the_circle() {
 }
 
 #[test]
-fn polygon_points_stroke_one_joined_path() {
-    // SkDraw::drawPoints(kPolygon) strokes one open path: the corner gets a
-    // miter join (not two butt caps leaving a notch) and the overlap of the
-    // two segments is blended once.
+fn polygon_points_stroke_each_segment_separately() {
+    // SkDraw::drawPoints(kPolygon) draws every consecutive pair as its own
+    // SkPath::Line: with butt caps the outer corner is notched (no join),
+    // as in Skia.
     use skia_rs_canvas::PointMode;
     use skia_rs_core::Point;
     use skia_rs_paint::{StrokeCap, StrokeJoin};
 
-    let mut paint = Paint::new();
-    paint.set_color32(Color::from_argb(128, 255, 255, 255));
-    paint.set_style(Style::Stroke);
+    let mut paint = white(Style::Stroke);
     paint.set_stroke_width(10.0);
     paint.set_stroke_cap(StrokeCap::Butt);
     paint.set_stroke_join(StrokeJoin::Miter);
@@ -120,19 +118,15 @@ fn polygon_points_stroke_one_joined_path() {
         &paint,
     );
 
-    let red = |x, y| buffer.get_pixel(x, y).unwrap_or(Color::BLACK).red();
-    // Outer corner (x 100..105, y 15..20) is covered only by the miter join.
-    assert!(red(103, 17) > 0, "the corner must be mitered, not notched");
-    // Where the segments overlap, coverage must not be blended twice.
-    let overlap = red(98, 22);
-    let single = red(50, 20);
-    assert!(single > 0);
+    // The outer corner square (x 100..105, y 15..20) belongs to neither
+    // butt-capped segment.
     assert!(
-        overlap <= single.saturating_add(2),
-        "overlap blended twice: {overlap} vs single-coverage {single}"
+        !lit(&buffer, 103, 17),
+        "the corner must be notched, not joined"
     );
+    assert!(lit(&buffer, 50, 20), "first segment drawn");
+    assert!(lit(&buffer, 100, 60), "second segment drawn");
 }
-
 #[test]
 fn circle_under_perspective_matches_the_projected_curve() {
     // A perspective map changes a conic's weight, so mapping its control
