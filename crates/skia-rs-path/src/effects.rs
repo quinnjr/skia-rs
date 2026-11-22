@@ -1484,7 +1484,9 @@ impl PathEffect for Path2DEffect {
 // =============================================================================
 
 /// Resource guards for the 2D effects against pathological lattices: at
-/// most this many lattice rows and columns are scanned, and
+/// most this many lattice rows are scanned (sampled evenly over the source
+/// when it has more, so the pattern still covers it), columns are limited
+/// to [`MAX_LATTICE_COLUMNS`] (only to keep counts in `i32`), and
 /// [`Line2DEffect`] emits at most half that many lines, sampled evenly, and
 /// [`Path2DEffect`] emits at most [`MAX_LATTICE_POINTS`] points, budgeted
 /// evenly across the covered rows (each row keeps its leftmost cells; with
@@ -1494,6 +1496,9 @@ impl PathEffect for Path2DEffect {
 /// (Skia has no limit outside fuzzer builds, where it caps spans at 100
 /// cells).
 const MAX_LATTICE_EXTENT: i64 = 1 << 16;
+/// See [`MAX_LATTICE_EXTENT`]: the column limit, which only keeps span
+/// counts in `i32` (columns do not add to the scan cost).
+const MAX_LATTICE_COLUMNS: i64 = 1 << 30;
 /// See [`MAX_LATTICE_EXTENT`]: the most points [`Path2DEffect`] emits
 /// (stamps times the stamp's point count).
 const MAX_LATTICE_POINTS: usize = 1 << 21;
@@ -1650,13 +1655,17 @@ fn lattice_spans(
     if left >= right || top >= bottom {
         return Vec::new();
     }
-    // Truncate in i64 (the rounded edges saturate, so `right - left` could
-    // overflow i32); the clamped extents then fit comfortably in i32.
-    let clamp_end = |lo: i32, hi: i32| {
-        i32::try_from((i64::from(hi) - i64::from(lo)).min(MAX_LATTICE_EXTENT) + i64::from(lo))
-            .unwrap_or(hi)
-    };
-    let (right, bottom) = (clamp_end(left, right), clamp_end(top, bottom));
+    // Measure in i64 (the rounded edges saturate, so `right - left` could
+    // overflow i32). Columns are clamped to keep counts in i32; rows beyond
+    // the scan limit are sampled with a stride instead of cut off.
+    let right = i32::try_from(
+        (i64::from(right) - i64::from(left)).min(MAX_LATTICE_COLUMNS) + i64::from(left),
+    )
+    .unwrap_or(right);
+    let height = i64::from(bottom) - i64::from(top);
+    let row_stride = usize::try_from((height + MAX_LATTICE_EXTENT - 1) / MAX_LATTICE_EXTENT)
+        .unwrap_or(usize::MAX)
+        .max(1);
 
     let edges = lattice_edges(&mapped);
 
@@ -1676,7 +1685,7 @@ fn lattice_spans(
     let mut spans = Vec::new();
     let mut crossings: Vec<(Scalar, i32)> = Vec::new();
     let mut row_spans: Vec<(i32, i32)> = Vec::new();
-    for y in top..bottom {
+    for y in (top..bottom).step_by(row_stride) {
         let yc = scalar_from_i32(y) + 0.5;
         while next_edge < edges.len() && edges[next_edge].0.y <= yc {
             active.push(edges[next_edge]);
@@ -2292,6 +2301,20 @@ mod tests {
         let mut b = PathBuilder::new();
         b.move_to(0.0, 0.0).line_to(150_000.0, 0.0);
         assert!(effect.apply(&b.build()).is_none());
+    }
+
+    #[test]
+    fn tall_lattices_are_sampled_over_the_whole_source() {
+        // 100,000 lattice rows (over the 65,536-row scan limit) with no cull:
+        // rows are sampled evenly, so the hatch still reaches the bottom of
+        // the source instead of stopping at y = 655.
+        let mut b = PathBuilder::new();
+        b.add_rect(&skia_rs_core::Rect::new(0.0, 0.0, 10.0, 1000.0));
+        let hatch = Line2DEffect::new(0.005, skia_rs_core::Matrix::scale(0.01, 0.01)).unwrap();
+        let mut rec = StrokeRec::Fill;
+        let lines = hatch.filter_path(&b.build(), &mut rec).expect("applies");
+        let max_y = lines.points().iter().map(|p| p.y).fold(0.0, Scalar::max);
+        assert!(max_y > 990.0, "hatch reaches y = {max_y}");
     }
 
     #[test]
