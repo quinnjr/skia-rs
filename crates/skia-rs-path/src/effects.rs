@@ -1214,10 +1214,10 @@ impl Path1DEffect {
     }
 }
 
-/// The most stamps [`Path1DEffect`] places before failing (a guard against
-/// non-finite or enormous path lengths; Skia caps measured stamps only in
-/// fuzzer builds).
-const MAX_PATH1D_STAMPS: Scalar = 1_000_000.0;
+/// The most points [`Path1DEffect`] emits (stamps times the stamp's point
+/// count) before failing: a guard against non-finite or enormous path
+/// lengths (Skia caps measured stamps only in fuzzer builds).
+const MAX_PATH1D_POINTS: Scalar = 4_194_304.0;
 
 impl PathEffect for Path1DEffect {
     fn filter_path(&self, path: &Path, rec: &mut StrokeRec) -> Option<Path> {
@@ -1245,7 +1245,10 @@ impl PathEffect for Path1DEffect {
         // allocates without bound; fail like Skia's fuzzer-build cap on
         // measured stamps (the source is then drawn unchanged).
         let stamps = (length - self.phase.max(0.0)) / self.advance;
-        if !(stamps.is_finite() && stamps <= MAX_PATH1D_STAMPS) {
+        let stamp_points =
+            scalar_from_i32(i32::try_from(self.path.points().len()).unwrap_or(i32::MAX));
+        let points = stamps * stamp_points.max(1.0);
+        if !(points.is_finite() && points <= MAX_PATH1D_POINTS) {
             return None;
         }
 
@@ -1345,18 +1348,25 @@ impl Path2DEffect {
         });
         let spans = lattice_spans(src_path, &inverse, cull.as_ref());
 
-        // Spread the point budget evenly over the covered rows, so a
-        // truncated pattern still spans the whole source vertically.
+        // Spread the stamp budget evenly over the covered rows, so a
+        // truncated pattern still spans the whole source vertically. With
+        // more rows than stamps, every `stride`-th row gets one stamp.
         let mut rows = spans.iter().map(|&(y, _, _)| y).collect::<Vec<_>>();
         rows.dedup();
-        let stamp_points = self.path.points().len().max(1);
-        let per_row = (MAX_LATTICE_POINTS / stamp_points / rows.len().max(1)).max(1);
+        let budget = (MAX_LATTICE_POINTS / self.path.points().len().max(1)).max(1);
+        let stride = rows.len().div_ceil(budget).max(1);
+        let kept_rows = rows.len().div_ceil(stride).max(1);
+        let per_row = budget / kept_rows;
+        let kept: std::collections::HashSet<i32> = rows.iter().step_by(stride).copied().collect();
 
         // SkPath2DPathEffect::next: the stamp is *translated* to each covered
         // cell's center mapped through the lattice matrix.
         let mut builder = PathBuilder::new();
         let (mut row, mut used) = (None, 0_usize);
         for (y, left, count) in spans {
+            if !kept.contains(&y) {
+                continue;
+            }
             if row != Some(y) {
                 (row, used) = (Some(y), 0);
             }
@@ -1405,7 +1415,8 @@ impl PathEffect for Path2DEffect {
 /// Resource guards for the 2D effects against pathological lattices: at
 /// most this many lattice rows and columns are scanned, and
 /// [`Path2DEffect`] emits at most [`MAX_LATTICE_POINTS`] points, budgeted
-/// evenly across the covered rows (each row keeps its leftmost cells). The
+/// evenly across the covered rows (each row keeps its leftmost cells; with
+/// more rows than stamps, rows are sampled evenly). The
 /// scanned lattice rect is first limited to the visible (cull) area, when
 /// the caller provides one. Beyond these limits the pattern is truncated
 /// (Skia has no limit outside fuzzer builds, where it caps spans at 100
@@ -2001,6 +2012,31 @@ mod tests {
         // Only rows near the cull remain (each still spans the source).
         let max_y = lines.points().iter().map(|p| p.y).fold(0.0, Scalar::max);
         assert!(!lines.is_empty() && max_y < 60.0, "max y = {max_y}");
+    }
+
+    #[test]
+    fn heavy_stamps_respect_the_point_budgets() {
+        // A 10k-point stamp: Path2D over many rows must stay within the point
+        // budget (sampling rows), and Path1D must fail rather than emit
+        // ~1e9 points.
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0);
+        for i in 1..10_000 {
+            b.line_to(scalar_from_i32(i % 7) * 0.01, scalar_from_i32(i % 5) * 0.01);
+        }
+        let heavy = b.build();
+        let per_stamp = heavy.points().len();
+
+        let tile =
+            Path2DEffect::new(skia_rs_core::Matrix::scale(1.0, 0.01), heavy.clone()).unwrap();
+        let produced = tile.apply(&square(100.0)).expect("applies");
+        assert!(!produced.is_empty());
+        assert!(produced.points().len() <= MAX_LATTICE_POINTS + per_stamp);
+
+        let one_d = Path1DEffect::new(heavy, 1.0, 0.0, Path1DStyle::Translate).unwrap();
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0).line_to(1e5, 0.0);
+        assert!(one_d.apply(&b.build()).is_none(), "1e9 points: gives up");
     }
 
     #[test]
