@@ -1267,10 +1267,16 @@ impl PathEffect for Path2DEffect {
         // (the source is drawn unchanged) even when the bounds are empty.
         let inverse = self.matrix.invert()?;
 
+        // Sk2DPathEffect::filterPath maps the source into lattice space and
+        // rounds its bounds to integers; only an empty *lattice* rect means
+        // no tiles (it then succeeds with an empty result). A zero-area
+        // source can still span lattice cells (e.g. a horizontal line under
+        // a rotated lattice).
         let bounds = src_path.bounds();
-        if bounds.is_empty() {
-            // Sk2DPathEffect::filterPath succeeds with an empty result here
-            // (no tiles), so nothing is drawn rather than the source.
+        let lattice = inverse.map_rect(&bounds);
+        if lattice.left.round() >= lattice.right.round()
+            || lattice.top.round() >= lattice.bottom.round()
+        {
             return Some(Path::new());
         }
         let mut builder = PathBuilder::new();
@@ -1372,10 +1378,16 @@ impl PathEffect for Line2DEffect {
         // (the source is drawn unchanged) even when the bounds are empty.
         let inverse = self.matrix.invert()?;
 
+        // Sk2DPathEffect::filterPath maps the source into lattice space and
+        // rounds its bounds to integers; only an empty *lattice* rect means
+        // no tiles (it then succeeds with an empty result). A zero-area
+        // source can still span lattice cells (e.g. a horizontal line under
+        // a rotated lattice).
         let bounds = src_path.bounds();
-        if bounds.is_empty() {
-            // Sk2DPathEffect::filterPath succeeds with an empty result here
-            // (no tiles), so nothing is drawn rather than the source.
+        let lattice = inverse.map_rect(&bounds);
+        if lattice.left.round() >= lattice.right.round()
+            || lattice.top.round() >= lattice.bottom.round()
+        {
             return Some(Path::new());
         }
         let mut builder = PathBuilder::new();
@@ -1531,6 +1543,18 @@ mod tests {
         let stamp = Path1DEffect::new(square(2.0), 5.0, 0.0, Path1DStyle::Translate).unwrap();
         let produced = stamp.apply(&zero_length()).expect("1D effect applies");
         assert!(produced.is_empty(), "zero-length source gets no stamps");
+    }
+
+    #[test]
+    fn line2d_hatches_a_zero_area_source_under_a_rotated_lattice() {
+        // Emptiness is decided in lattice space (Sk2DPathEffect): a
+        // horizontal line has zero-area bounds, but under a 45-degree
+        // lattice it spans several cells and must be hatched.
+        let lattice = skia_rs_core::Matrix::rotate(std::f32::consts::FRAC_PI_4)
+            .concat(&skia_rs_core::Matrix::scale(4.0, 4.0));
+        let hatch = Line2DEffect::new(1.0, lattice).unwrap();
+        let produced = hatch.apply(&flat_line()).expect("line 2D effect applies");
+        assert!(!produced.is_empty(), "rotated lattice must hatch the line");
     }
 
     #[test]
