@@ -102,7 +102,6 @@ jobs:
 
       - name: Run doc tests
         run: cargo test --workspace --doc
-        continue-on-error: true
 
   # ==========================================================================
   # MSRV Check (Minimum Supported Rust Version)
@@ -142,12 +141,12 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # `--cfg docsrs` (doc(cfg) badges) needs nightly and is exercised by
+      # docs.rs itself; here we just require warning-free docs on stable.
       - name: Build docs
         run: cargo doc --workspace --no-deps
-        continue-on-error: true
         env:
-          # Allow doc warnings but not errors
-          RUSTDOCFLAGS: --cfg docsrs
+          RUSTDOCFLAGS: -D warnings
 
   # ==========================================================================
   # Benchmarks (validation only)
@@ -287,21 +286,22 @@ jobs:
         with:
           key: conformance-${{ matrix.backend }}-${{ matrix.os }}
 
-      # Install Vulkan SDK on Linux
-      - name: Install Vulkan SDK (Linux)
+      # Install the Vulkan loader/tools on Linux. The runner image is Ubuntu
+      # 24.04 (noble); Mesa's lavapipe (mesa-vulkan-drivers, below) provides a
+      # software Vulkan ICD, so the LunarG SDK is not needed.
+      - name: Install Vulkan (Linux)
         if: matrix.backend == 'vulkan' && matrix.os == 'ubuntu-latest'
         run: |
-          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
-          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
           sudo apt-get update
-          sudo apt-get install -y vulkan-sdk
+          sudo apt-get install -y libvulkan-dev vulkan-tools glslang-tools
 
-      # Install Mesa for software rendering on Linux (for CI)
+      # Install Mesa for software rendering on Linux (for CI). Package names
+      # are for Ubuntu 24.04: the transitional libegl1-mesa no longer exists.
       - name: Install Mesa (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y mesa-utils libgl1-mesa-dri libegl1-mesa libgbm1
+          sudo apt-get install -y mesa-utils libgl1-mesa-dri libegl1 libegl-mesa0 libgbm1 mesa-vulkan-drivers
 
       # Install ImageMagick for image comparison
       - name: Install ImageMagick
