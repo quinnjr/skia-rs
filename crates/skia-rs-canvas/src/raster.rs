@@ -585,18 +585,8 @@ impl<'a> Rasterizer<'a> {
         let x = round_to_i32(transformed.x - 0.5);
         let y = round_to_i32(transformed.y - 0.5);
 
-        let coverage = self.get_clip_coverage(x, y);
-        if coverage > 0 {
-            let color = premultiply_color(paint.color32());
-            if coverage == 255 {
-                self.buffer.blend_pixel(x, y, color, paint.blend_mode());
-            } else {
-                // Apply clip coverage to the premultiplied color (all channels).
-                let adjusted_color = apply_coverage(color, coverage);
-                self.buffer
-                    .blend_pixel(x, y, adjusted_color, paint.blend_mode());
-            }
-        }
+        let source = self.make_source(paint);
+        self.blit_pixel_cov(x, y, 255, &source, paint.blend_mode());
     }
 
     /// Draw a line segment.
@@ -634,7 +624,7 @@ impl<'a> Rasterizer<'a> {
         use skia_rs_core::cast::{floor_to_i32, scalar_from_i32};
 
         let (mut start, mut end) = (self.matrix.map_point(p0), self.matrix.map_point(p1));
-        let color = premultiply_color(paint.color32());
+        let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
         let horizontal = (end.x - start.x).abs() > (end.y - start.y).abs();
         if !horizontal {
@@ -672,13 +662,7 @@ impl<'a> Rasterizer<'a> {
             } else {
                 (row, major)
             };
-            let coverage = self.get_clip_coverage(x, y);
-            if coverage == 255 {
-                self.buffer.blend_pixel(x, y, color, blend_mode);
-            } else if coverage > 0 {
-                let adjusted = apply_coverage(color, coverage);
-                self.buffer.blend_pixel(x, y, adjusted, blend_mode);
-            }
+            self.blit_pixel_cov(x, y, 255, &source, blend_mode);
             minor += slope;
         }
     }
@@ -701,7 +685,7 @@ impl<'a> Rasterizer<'a> {
         let mut x1 = t1.x - 0.5;
         let mut y1 = t1.y - 0.5;
 
-        let color = premultiply_color(paint.color32());
+        let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
 
         let steep = (y1 - y0).abs() > (x1 - x0).abs();
@@ -730,11 +714,23 @@ impl<'a> Rasterizer<'a> {
         let ypxl1 = floor_to_i32(yend);
 
         if steep {
-            self.plot_aa(ypxl1, xpxl1, (1.0 - fpart(yend)) * xgap, color, blend_mode);
-            self.plot_aa(ypxl1 + 1, xpxl1, fpart(yend) * xgap, color, blend_mode);
+            self.plot_aa(
+                ypxl1,
+                xpxl1,
+                (1.0 - fpart(yend)) * xgap,
+                &source,
+                blend_mode,
+            );
+            self.plot_aa(ypxl1 + 1, xpxl1, fpart(yend) * xgap, &source, blend_mode);
         } else {
-            self.plot_aa(xpxl1, ypxl1, (1.0 - fpart(yend)) * xgap, color, blend_mode);
-            self.plot_aa(xpxl1, ypxl1 + 1, fpart(yend) * xgap, color, blend_mode);
+            self.plot_aa(
+                xpxl1,
+                ypxl1,
+                (1.0 - fpart(yend)) * xgap,
+                &source,
+                blend_mode,
+            );
+            self.plot_aa(xpxl1, ypxl1 + 1, fpart(yend) * xgap, &source, blend_mode);
         }
 
         let mut intery = yend + gradient;
@@ -747,11 +743,23 @@ impl<'a> Rasterizer<'a> {
         let ypxl2 = floor_to_i32(yend);
 
         if steep {
-            self.plot_aa(ypxl2, xpxl2, (1.0 - fpart(yend)) * xgap, color, blend_mode);
-            self.plot_aa(ypxl2 + 1, xpxl2, fpart(yend) * xgap, color, blend_mode);
+            self.plot_aa(
+                ypxl2,
+                xpxl2,
+                (1.0 - fpart(yend)) * xgap,
+                &source,
+                blend_mode,
+            );
+            self.plot_aa(ypxl2 + 1, xpxl2, fpart(yend) * xgap, &source, blend_mode);
         } else {
-            self.plot_aa(xpxl2, ypxl2, (1.0 - fpart(yend)) * xgap, color, blend_mode);
-            self.plot_aa(xpxl2, ypxl2 + 1, fpart(yend) * xgap, color, blend_mode);
+            self.plot_aa(
+                xpxl2,
+                ypxl2,
+                (1.0 - fpart(yend)) * xgap,
+                &source,
+                blend_mode,
+            );
+            self.plot_aa(xpxl2, ypxl2 + 1, fpart(yend) * xgap, &source, blend_mode);
         }
 
         // Main loop, limited to the device along the major axis.
@@ -765,15 +773,15 @@ impl<'a> Rasterizer<'a> {
         if steep {
             for x in first..past_last {
                 let y = floor_to_i32(intery);
-                self.plot_aa(y, x, 1.0 - fpart(intery), color, blend_mode);
-                self.plot_aa(y + 1, x, fpart(intery), color, blend_mode);
+                self.plot_aa(y, x, 1.0 - fpart(intery), &source, blend_mode);
+                self.plot_aa(y + 1, x, fpart(intery), &source, blend_mode);
                 intery += gradient;
             }
         } else {
             for x in first..past_last {
                 let y = floor_to_i32(intery);
-                self.plot_aa(x, y, 1.0 - fpart(intery), color, blend_mode);
-                self.plot_aa(x, y + 1, fpart(intery), color, blend_mode);
+                self.plot_aa(x, y, 1.0 - fpart(intery), &source, blend_mode);
+                self.plot_aa(x, y + 1, fpart(intery), &source, blend_mode);
                 intery += gradient;
             }
         }
@@ -781,9 +789,17 @@ impl<'a> Rasterizer<'a> {
 
     /// Plot a pixel with coverage for anti-aliasing.
     #[inline]
-    fn plot_aa(&mut self, x: i32, y: i32, coverage: f32, color: Color, blend_mode: BlendMode) {
+    fn plot_aa(
+        &mut self,
+        x: i32,
+        y: i32,
+        coverage: f32,
+        source: &PixelSource<'_>,
+        blend_mode: BlendMode,
+    ) {
         let clip_coverage = self.get_clip_coverage(x, y);
         if clip_coverage > 0 {
+            let color = source_color_at(source, x, y);
             // Combine line AA coverage with clip coverage
             let combined_coverage = coverage * (f32::from(clip_coverage) / 255.0);
             self.buffer
@@ -953,7 +969,7 @@ impl<'a> Rasterizer<'a> {
         if left >= right || top >= bottom {
             return;
         }
-        let source = PixelSource::Solid(premultiply_color(paint.color32()));
+        let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
         if right - left <= 2 || bottom - top <= 2 {
             for y in top..bottom {
@@ -1017,38 +1033,11 @@ impl<'a> Rasterizer<'a> {
 
     /// Draw a stroked circle.
     pub fn stroke_circle(&mut self, center: Point, radius: Scalar, paint: &Paint) {
-        use skia_rs_core::cast::round_to_i32;
-        let tc = self.matrix.map_point(center);
-        let cx = round_to_i32(tc.x);
-        let cy = round_to_i32(tc.y);
-        let r = round_to_i32(radius * self.matrix.scale_x().abs());
-
-        let color = premultiply_color(paint.color32());
-        let blend_mode = paint.blend_mode();
-
-        let mut x = 0;
-        let mut y = r;
-        let mut d = 1 - r;
-
-        while x <= y {
-            // Plot pixels in all 8 octants
-            self.buffer.blend_pixel(cx + x, cy + y, color, blend_mode);
-            self.buffer.blend_pixel(cx - x, cy + y, color, blend_mode);
-            self.buffer.blend_pixel(cx + x, cy - y, color, blend_mode);
-            self.buffer.blend_pixel(cx - x, cy - y, color, blend_mode);
-            self.buffer.blend_pixel(cx + y, cy + x, color, blend_mode);
-            self.buffer.blend_pixel(cx - y, cy + x, color, blend_mode);
-            self.buffer.blend_pixel(cx + y, cy - x, color, blend_mode);
-            self.buffer.blend_pixel(cx - y, cy - x, color, blend_mode);
-
-            x += 1;
-            if d < 0 {
-                d += 2 * x + 1;
-            } else {
-                y -= 1;
-                d += 2 * (x - y) + 1;
-            }
-        }
+        // Skia strokes circles as conic paths (a hairline circle goes
+        // through hair_path), which also honors the clip and shader.
+        let mut b = PathBuilder::new();
+        b.add_circle(center.x, center.y, radius);
+        self.stroke_path(&b.build(), paint);
     }
 
     /// Draw a circle (filled or stroked based on paint style).
@@ -1093,7 +1082,7 @@ impl<'a> Rasterizer<'a> {
         let cy = tc.y;
         let r = radius * self.matrix.scale_x().abs();
 
-        let color = premultiply_color(paint.color32());
+        let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
 
         // Calculate bounding box
@@ -1124,7 +1113,7 @@ impl<'a> Rasterizer<'a> {
                         };
 
                         if coverage > 0.0 {
-                            self.plot_aa(px, py, coverage, color, blend_mode);
+                            self.plot_aa(px, py, coverage, &source, blend_mode);
                         }
                     }
                 }
@@ -1163,7 +1152,7 @@ impl<'a> Rasterizer<'a> {
                         let coverage = outer_coverage - inner_coverage;
 
                         if coverage > 0.0 {
-                            self.plot_aa(px, py, coverage, color, blend_mode);
+                            self.plot_aa(px, py, coverage, &source, blend_mode);
                         }
                     }
                 }
@@ -2033,7 +2022,9 @@ impl HairlineCaps {
     /// Extend a segment's start (`at_start`) and/or end (`at_end`) by the cap
     /// outset along its device-space tangent. Control points that coincide
     /// with the end point move with it; a fully degenerate segment moves its
-    /// end point horizontally (+x at the start, -x at the end), as Skia does.
+    /// end point horizontally by the outset (+x at the start, -x at the end):
+    /// Skia sets the tangent to (1, 0) / (-1, 0) and then adds
+    /// `tangent * capOutset`, as for any other tangent.
     fn extend(&self, pts: &mut [Point], at_start: bool, at_end: bool) {
         if !(at_start || at_end) {
             return;

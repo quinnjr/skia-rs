@@ -763,3 +763,98 @@ fn far_off_hairlines_only_walk_the_device() {
         );
     }
 }
+
+/// A white paint with a horizontal red-to-blue gradient across the canvas.
+fn gradient_hairline(anti_alias: bool) -> Paint {
+    use skia_rs_core::{Color4f, Point};
+    use skia_rs_paint::{LinearGradient, TileMode};
+    use std::sync::Arc;
+
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    paint.set_anti_alias(anti_alias);
+    paint.set_shader(Some(Arc::new(LinearGradient::new(
+        Point::new(0.0, 0.0),
+        Point::new(200.0, 0.0),
+        vec![
+            Color4f::new(1.0, 0.0, 0.0, 1.0),
+            Color4f::new(0.0, 0.0, 1.0, 1.0),
+        ],
+        None,
+        TileMode::Clamp,
+    ))));
+    paint
+}
+
+/// Whether the most strongly drawn pixel within two columns of `(x, y)`
+/// follows the gradient: red-dominant on the left half, blue-dominant on
+/// the right (a white, unshaded pixel has equal red and blue).
+fn shaded(buffer: &PixelBuffer, x: i32, y: i32) -> bool {
+    let strength = |c: Color| u32::from(c.red()) + u32::from(c.blue());
+    let pixel = (x - 2..=x + 2)
+        .filter_map(|px| buffer.get_pixel(px, y))
+        .max_by_key(|c| strength(*c))
+        .unwrap_or(Color::BLACK);
+    if strength(pixel) == 0 {
+        return false;
+    }
+    let (red, blue) = (pixel.red(), pixel.blue());
+    if x < 100 { red > blue } else { blue > red }
+}
+
+#[test]
+fn hairline_drawers_use_the_paint_shader() {
+    use skia_rs_core::Point;
+
+    for anti_alias in [false, true] {
+        let paint = gradient_hairline(anti_alias);
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.draw_line(Point::new(10.0, 20.5), Point::new(190.0, 20.5), &paint);
+        canvas.draw_rect(&Rect::new(10.0, 40.0, 190.0, 60.0), &paint);
+        canvas.draw_circle(Point::new(100.5, 130.5), 50.0, &paint);
+        for (x, y) in [
+            (20, 20),
+            (180, 20),
+            (20, 40),
+            (180, 40),
+            (50, 130),
+            (150, 130),
+        ] {
+            assert!(shaded(&buffer, x, y), "aa={anti_alias}: ({x}, {y}) shaded");
+        }
+    }
+}
+
+#[test]
+fn hairline_points_use_the_paint_shader() {
+    use skia_rs_core::Point;
+
+    let paint = gradient_hairline(false);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    let mut canvas = Canvas::new_raster(&mut buffer);
+    canvas.draw_point(Point::new(20.5, 10.5), &paint);
+    canvas.draw_point(Point::new(180.5, 10.5), &paint);
+    assert!(shaded(&buffer, 20, 10) && shaded(&buffer, 180, 10));
+}
+
+#[test]
+fn aliased_hairline_circle_respects_the_clip() {
+    use skia_rs_core::Point;
+
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    let mut canvas = Canvas::new_raster(&mut buffer);
+    canvas.clip_rect(
+        &Rect::new(0.0, 0.0, 100.0, 200.0),
+        skia_rs_canvas::ClipOp::Intersect,
+        false,
+    );
+    canvas.draw_circle(Point::new(100.5, 100.5), 50.0, &paint);
+    assert!(lit(&buffer, 50, 100), "left side inside the clip is drawn");
+    assert!(
+        !lit(&buffer, 150, 100),
+        "right side outside the clip is not"
+    );
+}
