@@ -853,6 +853,20 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Whether the current clip covers every pixel either fully or not at
+    /// all: a region (integer rectangles) or a rectangle with pixel-aligned
+    /// edges. Anti-aliased mask clips and fractional rectangles have
+    /// partial coverage.
+    fn clip_has_binary_coverage(&self) -> bool {
+        match self.clip_stack.current() {
+            crate::clip::ClipState::Region(_) => true,
+            crate::clip::ClipState::Rect(r) => [r.left, r.top, r.right, r.bottom]
+                .iter()
+                .all(|v| v.fract() == 0.0),
+            crate::clip::ClipState::Mask(_) | crate::clip::ClipState::RegionAndMask(..) => false,
+        }
+    }
+
     /// Rasterize `path`, applying the paint's path effect the way Skia's
     /// `skpathutils::FillPathWithPaint` does: filter through the paint's
     /// stroke record, and draw the result (or the source, if the effect
@@ -1593,6 +1607,7 @@ impl<'a> Canvas<'a> {
         match paint.style() {
             Style::Fill
                 if device_extra >= 2.0 * std::f32::consts::SQRT_2
+                    && self.clip_has_binary_coverage()
                     && paint.alpha() >= 1.0
                     && paint.blend_mode() == skia_rs_paint::BlendMode::SrcOver
                     && paint.color_filter().is_none() =>
@@ -1605,7 +1620,9 @@ impl<'a> Canvas<'a> {
                 // outline and then its stroke outline yields the union's
                 // coverage without a path-op union per glyph. Thinner outsets
                 // (small text) would composite edge pixels twice at partial
-                // coverage, so they take the union path below.
+                // coverage, and so would a clip with partial (anti-aliased)
+                // coverage, since it applies to each draw; both take the union
+                // path below.
                 self.draw_path(&device_path, paint);
                 let mut outset = paint.clone();
                 outset.set_style(Style::Stroke);

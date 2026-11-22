@@ -309,3 +309,61 @@ fn embolden_under_non_uniform_scale_strokes_in_local_space() {
         }
     }
 }
+
+#[test]
+fn embolden_under_an_anti_aliased_clip_blends_once() {
+    // An anti-aliased clip applies its partial coverage to every draw, so
+    // the fill-then-stroke fast path would composite clip-edge pixels twice
+    // (1 - (1 - c)^2 > c). Bold text must never be brighter than a single
+    // solid draw through the same clip.
+    use skia_rs_canvas::ClipOp;
+    use skia_rs_core::{Point, Rect};
+
+    let clip = {
+        let mut b = skia_rs_path::PathBuilder::new();
+        b.add_circle(150.0, 150.0, 90.0);
+        b.build()
+    };
+    let mut paint = Paint::new();
+    paint.set_color(Color::WHITE.into());
+    paint.set_anti_alias(true);
+
+    let render = |draw: &dyn Fn(&mut Canvas<'_>)| {
+        let mut buffer = PixelBuffer::new(300, 300);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            canvas.clip_path(&clip, ClipOp::Intersect, true);
+            draw(&mut canvas);
+        }
+        buffer
+    };
+
+    let mut font = demo_font(160.0); // outset 160/32 = 5px: fast-path sized
+    font.set_embolden(true);
+    let text = render(&|c| {
+        c.draw_glyphs(
+            &[1],
+            &[Point::zero()],
+            Point::new(60.0, 250.0),
+            &font,
+            &paint,
+        );
+    });
+    let solid = render(&|c| c.draw_rect(&Rect::from_xywh(0.0, 0.0, 300.0, 300.0), &paint));
+
+    let mut painted = 0;
+    for y in 0..300 {
+        for x in 0..300 {
+            let t = text.get_pixel(x, y).unwrap_or(Color::BLACK).red();
+            let s = solid.get_pixel(x, y).unwrap_or(Color::BLACK).red();
+            assert!(
+                t <= s.saturating_add(1),
+                "pixel ({x},{y}) blended twice: text {t} > clip coverage {s}"
+            );
+            if t > 0 {
+                painted += 1;
+            }
+        }
+    }
+    assert!(painted > 0, "the bold glyph must paint inside the clip");
+}
