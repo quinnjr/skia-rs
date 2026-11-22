@@ -495,3 +495,69 @@ fn hairlines_use_pixel_centers_at_half_coordinates() {
         assert_eq!(red(51), 0, "aa={anti_alias}: row 51 untouched");
     }
 }
+
+#[test]
+fn thin_translucent_stroke_blends_each_pixel_once() {
+    // A 1px translucent AA stroke must be one coverage pass: drawing it as
+    // a segment-by-segment hairline would blend every joint pixel twice
+    // and bead the outline.
+    use skia_rs_core::Point;
+
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(1.0);
+    paint.set_anti_alias(true);
+    paint.set_color32(Color::from_argb(128, 255, 255, 255));
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_circle(Point::new(100.0, 100.0), 60.0, &paint);
+
+    let max = (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .map(|(x, y)| buffer.get_pixel(x, y).unwrap_or(Color::BLACK).red())
+        .max()
+        .unwrap();
+    assert!(max > 0, "the circle must be drawn");
+    assert!(
+        max <= 130,
+        "a pixel was blended twice: red {max} > single 50% coverage"
+    );
+}
+
+#[test]
+fn thin_stroke_keeps_the_paint_shader() {
+    // A 1px AA stroke must still be shaded: converting it to a solid-color
+    // hairline would drop the gradient.
+    use skia_rs_core::{Color4f, Point};
+    use skia_rs_paint::{LinearGradient, TileMode};
+    use std::sync::Arc;
+
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(1.0);
+    paint.set_anti_alias(true);
+    paint.set_shader(Some(Arc::new(LinearGradient::new(
+        Point::new(10.0, 0.0),
+        Point::new(190.0, 0.0),
+        vec![
+            Color4f::new(1.0, 0.0, 0.0, 1.0),
+            Color4f::new(0.0, 0.0, 1.0, 1.0),
+        ],
+        None,
+        TileMode::Clamp,
+    ))));
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_line(
+        Point::new(10.0, 50.5),
+        Point::new(190.0, 50.5),
+        &paint,
+    );
+
+    let left = buffer.get_pixel(20, 50).unwrap_or(Color::BLACK);
+    let right = buffer.get_pixel(180, 50).unwrap_or(Color::BLACK);
+    assert!(
+        left.red() > left.blue(),
+        "left end follows the gradient: {left:?}"
+    );
+    assert!(
+        right.blue() > right.red(),
+        "right end follows the gradient: {right:?}"
+    );
+}

@@ -1155,42 +1155,20 @@ impl<'a> Rasterizer<'a> {
     /// normal (matrix-aware, clipped, AA-aware) fill pipeline. Width 0
     /// remains a hairline.
     fn stroke_path(&mut self, path: &Path, paint: &Paint) {
-        if paint.stroke_width() <= 0.0 {
-            self.stroke_path_hairline(path, paint);
+        // Positive widths always fill the stroke outline, even sub-pixel
+        // ones. Skia's SkDrawTreatAsHairline instead draws thin AA strokes
+        // with its hairline blitters, but those support shaders, caps and
+        // single-coverage polylines; this rasterizer's hairlines do not.
+        // Filling the anti-aliased outline gives the same coverage while
+        // keeping the paint's shader/filters, the caps, and one blend per
+        // pixel.
+        if paint.stroke_width() > 0.0 {
+            if let Some(outline) = stroke_outline(path, paint) {
+                self.fill_path(&outline, paint);
+            }
             return;
         }
-        if let Some(coverage) = self.thin_stroke_coverage(paint) {
-            // A sub-pixel anti-aliased stroke is drawn as a hairline whose
-            // alpha is scaled by its device width, instead of an outline
-            // too thin to cover pixel centers.
-            // The width must become 0: the hairline walk draws segments with
-            // draw_line, which strokes any positive width as a path again.
-            let mut hairline = paint.clone();
-            hairline.set_alpha(paint.alpha() * coverage);
-            hairline.set_stroke_width(0.0);
-            self.stroke_path_hairline(path, &hairline);
-            return;
-        }
-        if let Some(outline) = stroke_outline(path, paint) {
-            self.fill_path(&outline, paint);
-        }
-    }
-
-    /// Port of Skia's `SkDrawTreatAsHairline` for a positive stroke width:
-    /// an anti-aliased stroke whose width maps to at most one device pixel
-    /// along both axes (and no perspective) is drawn as a hairline, with
-    /// coverage equal to the average mapped width. Non-AA strokes are never
-    /// converted, as in Skia.
-    fn thin_stroke_coverage(&self, paint: &Paint) -> Option<Scalar> {
-        if !paint.is_anti_alias() || self.matrix.has_perspective() {
-            return None;
-        }
-        let w = paint.stroke_width();
-        let m = &self.matrix;
-        // Map the vectors (w, 0) and (0, w) through the linear part.
-        let len0 = (m.scale_x() * w).hypot(m.skew_y() * w);
-        let len1 = (m.skew_x() * w).hypot(m.scale_y() * w);
-        (len0 <= 1.0 && len1 <= 1.0).then(|| f32::midpoint(len0, len1))
+        self.stroke_path_hairline(path, paint);
     }
 
     /// `StrokeAndFill`: fill the union of the fill geometry and the stroke
