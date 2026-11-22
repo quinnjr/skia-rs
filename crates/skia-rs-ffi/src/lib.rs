@@ -3031,7 +3031,7 @@ pub struct sk_recording_canvas_t {
     alive: Arc<AtomicBool>,
 }
 
-/// Resolve a recording-canvas handle to its active `(recorder, state)` pair.
+/// Resolve a recording-canvas handle to its recorder's `(commands, state)`.
 ///
 /// Returns `None` if the handle is null, the recorder that created it has
 /// since been deleted (checked via the shared `alive` flag *before* the
@@ -3041,16 +3041,22 @@ pub struct sk_recording_canvas_t {
 /// `finish_recording`) is absent.
 unsafe fn resolve_recording_canvas<'a>(
     canvas: *mut sk_recording_canvas_t,
-) -> Option<(&'a mut sk_picture_recorder_t, &'a mut CanvasState)> {
+) -> Option<(
+    &'a mut Vec<skia_rs_canvas::DrawCommand>,
+    &'a mut CanvasState,
+)> {
     let rc = canvas.as_mut()?;
     if !rc.alive.load(Ordering::Acquire) {
         return None;
     }
     let rec = rc.recorder.as_mut()?;
-    // Split borrow: `rec.state` and `rec` otherwise alias.
-    let state_ptr: *mut Option<CanvasState> = &raw mut rec.state;
-    let state = (&mut *state_ptr).as_mut()?;
-    Some((rec, state))
+    // Hand out two *disjoint* field borrows (the command list and the canvas
+    // state) rather than the whole recorder plus a pointer into it, so no
+    // two live `&mut` overlap.
+    let sk_picture_recorder_t {
+        commands, state, ..
+    } = rec;
+    Some((commands, state.as_mut()?))
 }
 
 /// Begin recording into a fresh picture.
@@ -3131,10 +3137,10 @@ pub unsafe extern "C" fn sk_picture_recorder_finish_recording(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_recording_canvas_save(canvas: *mut sk_recording_canvas_t) -> i32 {
     catch_panic(|| {
-        let Some((rec, state)) = resolve_recording_canvas(canvas) else {
+        let Some((commands, state)) = resolve_recording_canvas(canvas) else {
             return 0;
         };
-        rec.commands.push(skia_rs_canvas::DrawCommand::Save);
+        commands.push(skia_rs_canvas::DrawCommand::Save);
         let frame = CanvasSaveFrame {
             matrix: state.matrix,
             clip_len: state.clips.len(),
@@ -3149,11 +3155,11 @@ pub unsafe extern "C" fn sk_recording_canvas_save(canvas: *mut sk_recording_canv
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_recording_canvas_restore(canvas: *mut sk_recording_canvas_t) {
     catch_panic_void(|| {
-        let Some((rec, state)) = resolve_recording_canvas(canvas) else {
+        let Some((commands, state)) = resolve_recording_canvas(canvas) else {
             return;
         };
         if let Some(frame) = state.stack.pop() {
-            rec.commands.push(skia_rs_canvas::DrawCommand::Restore);
+            commands.push(skia_rs_canvas::DrawCommand::Restore);
             state.matrix = frame.matrix;
             state.clips.truncate(frame.clip_len);
             state.save_count = state.save_count.saturating_sub(1);
@@ -3169,11 +3175,10 @@ pub unsafe extern "C" fn sk_recording_canvas_translate(
     dy: f32,
 ) {
     catch_panic_void(|| {
-        let Some((rec, state)) = resolve_recording_canvas(canvas) else {
+        let Some((commands, state)) = resolve_recording_canvas(canvas) else {
             return;
         };
-        rec.commands
-            .push(skia_rs_canvas::DrawCommand::Translate { dx, dy });
+        commands.push(skia_rs_canvas::DrawCommand::Translate { dx, dy });
         state.matrix = state.matrix.concat(&Matrix::translate(dx, dy));
     });
 }
@@ -3188,14 +3193,14 @@ pub unsafe extern "C" fn sk_recording_canvas_draw_rect(
     paint: *const sk_paint_t,
 ) {
     catch_panic_void(|| {
-        let Some((rec, _)) = resolve_recording_canvas(canvas) else {
+        let Some((commands, _)) = resolve_recording_canvas(canvas) else {
             return;
         };
         let Some(r) = rect.as_ref() else { return };
         let Some(p) = RefCounted::get_ref(paint).cloned() else {
             return;
         };
-        rec.commands.push(skia_rs_canvas::DrawCommand::DrawRect {
+        commands.push(skia_rs_canvas::DrawCommand::DrawRect {
             rect: Rect::from(*r),
             paint: p,
         });
@@ -3210,7 +3215,7 @@ pub unsafe extern "C" fn sk_recording_canvas_draw_path(
     paint: *const sk_paint_t,
 ) {
     catch_panic_void(|| {
-        let Some((rec, _)) = resolve_recording_canvas(canvas) else {
+        let Some((commands, _)) = resolve_recording_canvas(canvas) else {
             return;
         };
         let Some(path_ref) = RefCounted::get_ref(path).cloned() else {
@@ -3219,7 +3224,7 @@ pub unsafe extern "C" fn sk_recording_canvas_draw_path(
         let Some(p) = RefCounted::get_ref(paint).cloned() else {
             return;
         };
-        rec.commands.push(skia_rs_canvas::DrawCommand::DrawPath {
+        commands.push(skia_rs_canvas::DrawCommand::DrawPath {
             path: path_ref,
             paint: p,
         });
