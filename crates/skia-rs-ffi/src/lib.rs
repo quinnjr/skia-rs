@@ -1930,6 +1930,10 @@ pub unsafe extern "C" fn sk_canvas_get_height(canvas: *const sk_canvas_t) -> i32
 }
 
 /// Save the current transformation matrix and clip stack.
+///
+/// Returns the same value as `SkCanvas::save()`: the save count *before*
+/// this call in Skia's 1-based counting (1 for the first save, 2 for a
+/// nested one, ...). Returns 0 if `canvas` is null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_canvas_save(canvas: *mut sk_canvas_t) -> i32 {
     catch_panic(|| {
@@ -3116,6 +3120,10 @@ pub unsafe extern "C" fn sk_picture_recorder_finish_recording(
 }
 
 /// Push a save onto the recording canvas's state.
+///
+/// Returns the same value as `SkCanvas::save()`: the save count *before*
+/// this call in Skia's 1-based counting (1 for the first save). Returns 0
+/// if the handle is null or its recorder was deleted.
 ///
 /// Like `SkPicture`, the recording stores the save and later transform ops
 /// as commands and keeps geometry in local coordinates, so playback composes

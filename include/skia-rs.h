@@ -826,6 +826,10 @@ int32_t sk_canvas_get_width(const struct sk_canvas_t *canvas);
 int32_t sk_canvas_get_height(const struct sk_canvas_t *canvas);
 
 // Save the current transformation matrix and clip stack.
+//
+// Returns the same value as `SkCanvas::save()`: the save count *before*
+// this call in Skia's 1-based counting (1 for the first save, 2 for a
+// nested one, ...). Returns 0 if `canvas` is null.
 int32_t sk_canvas_save(struct sk_canvas_t *canvas);
 
 // Save a layer — pushes a save frame that records the layer bounds and
@@ -1175,6 +1179,10 @@ void sk_recording_canvas_release(struct sk_recording_canvas_t *canvas);
 sk_picture_t *sk_picture_recorder_finish_recording(struct sk_picture_recorder_t *r);
 
 // Push a save onto the recording canvas's state.
+//
+// Returns the same value as `SkCanvas::save()`: the save count *before*
+// this call in Skia's 1-based counting (1 for the first save). Returns 0
+// if the handle is null or its recorder was deleted.
 //
 // Like `SkPicture`, the recording stores the save and later transform ops
 // as commands and keeps geometry in local coordinates, so playback composes
