@@ -1269,10 +1269,21 @@ impl PathEffect for Path2DEffect {
         // SkPath2DPathEffect::next: the stamp is *translated* to each covered
         // cell's center mapped through the lattice matrix.
         let mut builder = PathBuilder::new();
-        let cells = spans
-            .into_iter()
-            .flat_map(|(y, left, count)| (left..left + count).map(move |x| (x, y)))
-            .take(MAX_LATTICE_STAMPS);
+        // Spread the stamp budget evenly over the covered rows, so a
+        // truncated pattern still spans the whole source vertically.
+        let mut rows = spans.iter().map(|&(y, _, _)| y).collect::<Vec<_>>();
+        rows.dedup();
+        let per_row = (MAX_LATTICE_STAMPS / rows.len().max(1)).max(1);
+        let mut cells = Vec::new();
+        let (mut row, mut used) = (None, 0_usize);
+        for (y, left, count) in spans {
+            if row != Some(y) {
+                (row, used) = (Some(y), 0);
+            }
+            let take = usize::try_from(count).unwrap_or(0).min(per_row - used);
+            used += take;
+            cells.extend((left..).take(take).map(|x| (x, y)));
+        }
         for (x, y) in cells {
             let loc = self.matrix.map_point(Point::new(
                 scalar_from_i32(x) + 0.5,
@@ -1298,7 +1309,8 @@ impl PathEffect for Path2DEffect {
 
 /// Resource guards for the 2D effects against pathological lattices: at
 /// most this many lattice rows and columns are scanned, and
-/// [`Path2DEffect`] places at most [`MAX_LATTICE_STAMPS`] stamps. Beyond
+/// [`Path2DEffect`] places at most [`MAX_LATTICE_STAMPS`] stamps, budgeted
+/// evenly across the covered rows (each row keeps its leftmost cells). Beyond
 /// them the pattern is truncated (Skia has no limit outside fuzzer builds,
 /// where it caps spans at 100 cells).
 const MAX_LATTICE_EXTENT: i64 = 1 << 16;
@@ -1400,6 +1412,10 @@ fn row_intervals(
 /// fill type). A source with no area covers no cells.
 ///
 /// Rows and columns beyond [`MAX_LATTICE_EXTENT`] are not scanned.
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "unfused arithmetic like SkRegion's edge walk; mul_add rounds differently"
+)]
 fn lattice_spans(src: &Path, inverse: &skia_rs_core::Matrix) -> Vec<(i32, i32, i32)> {
     if src.is_empty() {
         return Vec::new();
@@ -1451,7 +1467,7 @@ fn lattice_spans(src: &Path, inverse: &skia_rs_core::Matrix) -> Vec<(i32, i32, i
         crossings.clear();
         for &(lo, hi, dir) in &active {
             if lo.y <= yc {
-                let x = ((yc - lo.y) / (hi.y - lo.y)).mul_add(hi.x - lo.x, lo.x);
+                let x = (yc - lo.y) / (hi.y - lo.y) * (hi.x - lo.x) + lo.x;
                 crossings.push((x, dir));
             }
         }
