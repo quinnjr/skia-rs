@@ -2498,36 +2498,10 @@ pub enum VertexMode {
 // =============================================================================
 
 fn build_round_rect_path(rect: &Rect, rx: Scalar, ry: Scalar) -> Path {
-    use skia_rs_path::PathBuilder;
-
-    // Quarter-circle conics of weight sqrt(2)/2 — the exact circular-arc
-    // geometry Skia uses for round rect corners.
-    const W: Scalar = std::f32::consts::FRAC_1_SQRT_2;
-
-    let mut builder = PathBuilder::new();
-    if rx <= 0.0 || ry <= 0.0 || rect.is_empty() {
-        builder.add_rect(rect);
-        return builder.build();
-    }
-
-    // SkRRect::setRectXY: when the radii exceed half the rect dimensions,
-    // BOTH are scaled down by the same factor so the corner arcs still fit.
-    let scale = (rect.width() / (2.0 * rx))
-        .min(rect.height() / (2.0 * ry))
-        .min(1.0);
-    let rx = rx * scale;
-    let ry = ry * scale;
-
-    builder.move_to(rect.left + rx, rect.top);
-    builder.line_to(rect.right - rx, rect.top);
-    builder.conic_to(rect.right, rect.top, rect.right, rect.top + ry, W);
-    builder.line_to(rect.right, rect.bottom - ry);
-    builder.conic_to(rect.right, rect.bottom, rect.right - rx, rect.bottom, W);
-    builder.line_to(rect.left + rx, rect.bottom);
-    builder.conic_to(rect.left, rect.bottom, rect.left, rect.bottom - ry, W);
-    builder.line_to(rect.left, rect.top + ry);
-    builder.conic_to(rect.left, rect.top, rect.left + rx, rect.top, W);
-    builder.close();
+    // SkCanvas::drawRoundRect -> SkRRect::setRectXY -> SkPath::addRRect:
+    // uniform radius scaling, exact conic corners, and Skia's start point.
+    let mut builder = skia_rs_path::PathBuilder::new();
+    builder.add_round_rect(rect, rx, ry);
     builder.build()
 }
 

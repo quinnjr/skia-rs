@@ -12,10 +12,6 @@ use skia_rs_core::{Point, Rect, Scalar};
 /// sqrt(2)/2, the conic weight for a 90-degree circular arc.
 const OVAL_CONIC_WEIGHT: Scalar = std::f32::consts::FRAC_1_SQRT_2;
 
-/// Cubic-bezier control-point factor approximating a circular arc with a
-/// rounded-rect corner radius (Skia's `SK_ScalarRoot2Over2` derived constant).
-const ROUND_RECT_KAPPA: Scalar = 0.552_284_8;
-
 /// Builder for constructing paths.
 #[derive(Debug, Clone, Default)]
 pub struct PathBuilder {
@@ -178,55 +174,37 @@ impl PathBuilder {
         ))
     }
 
-    /// Add a rounded rectangle.
+    /// Add a rounded rectangle, like Skia's
+    /// `SkPath::addRoundRect(rect, rx, ry, SkPathDirection::kCW)`.
+    ///
+    /// Zero radii add a plain rectangle. Radii larger than half the rect are
+    /// scaled down together (`SkRRect::setRectXY`). Corners are exact
+    /// quarter-ellipse conics (weight `sqrt(2)/2`), and the contour starts at
+    /// `(left, bottom - ry)` going clockwise (`SkPath::addRRect`'s default
+    /// start index 6), so dashes and trims line up with Skia.
     pub fn add_round_rect(&mut self, rect: &Rect, rx: Scalar, ry: Scalar) -> &mut Self {
-        if rx <= 0.0 || ry <= 0.0 {
+        const W: Scalar = std::f32::consts::FRAC_1_SQRT_2;
+
+        if rx <= 0.0 || ry <= 0.0 || rect.is_empty() {
             return self.add_rect(rect);
         }
 
-        let rx = rx.min(rect.width() / 2.0);
-        let ry = ry.min(rect.height() / 2.0);
+        let scale = (rect.width() / (2.0 * rx))
+            .min(rect.height() / (2.0 * ry))
+            .min(1.0);
+        let rx = rx * scale;
+        let ry = ry * scale;
+        let (l, t, r, b) = (rect.left, rect.top, rect.right, rect.bottom);
 
-        let kx = rx * ROUND_RECT_KAPPA;
-        let ky = ry * ROUND_RECT_KAPPA;
-
-        self.move_to(rect.left + rx, rect.top)
-            .line_to(rect.right - rx, rect.top)
-            .cubic_to(
-                rect.right - rx + kx,
-                rect.top,
-                rect.right,
-                rect.top + ry - ky,
-                rect.right,
-                rect.top + ry,
-            )
-            .line_to(rect.right, rect.bottom - ry)
-            .cubic_to(
-                rect.right,
-                rect.bottom - ry + ky,
-                rect.right - rx + kx,
-                rect.bottom,
-                rect.right - rx,
-                rect.bottom,
-            )
-            .line_to(rect.left + rx, rect.bottom)
-            .cubic_to(
-                rect.left + rx - kx,
-                rect.bottom,
-                rect.left,
-                rect.bottom - ry + ky,
-                rect.left,
-                rect.bottom - ry,
-            )
-            .line_to(rect.left, rect.top + ry)
-            .cubic_to(
-                rect.left,
-                rect.top + ry - ky,
-                rect.left + rx - kx,
-                rect.top,
-                rect.left + rx,
-                rect.top,
-            )
+        self.move_to(l, b - ry)
+            .line_to(l, t + ry)
+            .conic_to(l, t, l + rx, t, W)
+            .line_to(r - rx, t)
+            .conic_to(r, t, r, t + ry, W)
+            .line_to(r, b - ry)
+            .conic_to(r, b, r - rx, b, W)
+            .line_to(l + rx, b)
+            .conic_to(l, b, l, b - ry, W)
             .close()
     }
 
@@ -632,7 +610,52 @@ fn angle_between(ux: Scalar, uy: Scalar, vx: Scalar, vy: Scalar) -> Scalar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Verb;
+    use crate::{PathElement, Verb};
+
+    #[test]
+    fn add_round_rect_matches_skia_add_rrect_contour() {
+        // SkPath::addRRect(rrect, kCW) starts at index 6, (left, bottom - ry),
+        // runs up the left edge, and alternates line / conic corner.
+        let mut b = PathBuilder::new();
+        b.add_round_rect(&Rect::from_xywh(10.0, 10.0, 100.0, 50.0), 10.0, 8.0);
+        let path = b.build();
+
+        let elements: Vec<PathElement> = path.iter().collect();
+        assert_eq!(elements[0], PathElement::Move(Point::new(10.0, 52.0)));
+        assert_eq!(elements[1], PathElement::Line(Point::new(10.0, 18.0)));
+        let w = std::f32::consts::FRAC_1_SQRT_2;
+        assert_eq!(
+            elements[2],
+            PathElement::Conic(Point::new(10.0, 10.0), Point::new(20.0, 10.0), w)
+        );
+        let verbs: Vec<Verb> = path.verbs().to_vec();
+        assert_eq!(
+            verbs,
+            [
+                Verb::Move,
+                Verb::Line,
+                Verb::Conic,
+                Verb::Line,
+                Verb::Conic,
+                Verb::Line,
+                Verb::Conic,
+                Verb::Line,
+                Verb::Conic,
+                Verb::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn add_round_rect_scales_oversized_radii_uniformly() {
+        // SkRRect::setRectXY scales both radii by the same factor: a 40x20
+        // rect with radii (40, 40) gets min(40/80, 20/80) = 0.25 -> (10, 10).
+        let mut b = PathBuilder::new();
+        b.add_round_rect(&Rect::from_xywh(0.0, 0.0, 40.0, 20.0), 40.0, 40.0);
+        let path = b.build();
+        let first = path.iter().next();
+        assert_eq!(first, Some(PathElement::Move(Point::new(0.0, 10.0))));
+    }
 
     #[test]
     fn test_line_after_close_injects_move() {
