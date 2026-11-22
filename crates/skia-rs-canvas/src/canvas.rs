@@ -1462,12 +1462,16 @@ impl<'a> Canvas<'a> {
         let ctm = *self.total_matrix();
         let ctm_scale = ctm.determinant().abs().sqrt();
 
-        // Plain paints are emboldened in device space so that flattening
-        // the stroke outline happens at device-pixel tolerance (a local-space
-        // outline would show facets under a scaling matrix). Shaders and
-        // mask/image filters depend on the local matrix, so those keep the
-        // local-space path below.
-        let device_safe = paint.shader().is_none()
+        // Skia strokes the fake-bold outset in local space, so the CTM
+        // shapes it. When the CTM is a similarity (uniform scale + rotation/
+        // reflection), stroking in device space with the width scaled by
+        // sqrt(|det|) is geometrically identical, and flattening the outline
+        // happens at device-pixel tolerance instead of showing facets under
+        // magnification. Any other CTM (non-uniform scale, skew,
+        // perspective), and paints whose shader, filters, or path effect
+        // depend on the local matrix, keep the local-space path below.
+        let device_safe = ctm.is_similarity()
+            && paint.shader().is_none()
             && paint.mask_filter().is_none()
             && paint.image_filter().is_none()
             && paint.path_effect().is_none()

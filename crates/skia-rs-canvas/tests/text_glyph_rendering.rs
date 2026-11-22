@@ -261,3 +261,51 @@ fn embolden_under_scale_adds_coverage_and_never_double_blends() {
         );
     }
 }
+
+#[test]
+fn embolden_under_non_uniform_scale_strokes_in_local_space() {
+    // Skia strokes the fake-bold outset in local space, so a non-uniform
+    // CTM stretches it. Under scale(4, 1) emboldened text must match a
+    // local-space StrokeAndFill of the outline with Skia's outset
+    // (40pt -> 40 * 1/32 = 1.25), not a uniform device-space stroke.
+    use skia_rs_core::{Matrix, Point};
+
+    let size = 40.0;
+    let origin = Point::new(5.0, 60.0);
+    let mut paint = Paint::new();
+    paint.set_color(Color::WHITE.into());
+
+    let mut bold_font = demo_font(size);
+    bold_font.set_embolden(true);
+    let mut actual = PixelBuffer::new(300, 100);
+    {
+        let mut canvas = Canvas::new_raster(&mut actual);
+        canvas.scale(4.0, 1.0);
+        canvas.draw_glyphs(&[1], &[Point::zero()], origin, &bold_font, &paint);
+    }
+
+    let outline = demo_font(size)
+        .glyph_path(1)
+        .expect("demo.ttf glyph 1 has an outline")
+        .transformed(&Matrix::translate(origin.x, origin.y));
+    let mut expected_paint = paint.clone();
+    expected_paint.set_style(skia_rs_paint::Style::StrokeAndFill);
+    expected_paint.set_stroke_width(size / 32.0);
+    let mut expected = PixelBuffer::new(300, 100);
+    {
+        let mut canvas = Canvas::new_raster(&mut expected);
+        canvas.scale(4.0, 1.0);
+        canvas.draw_path(&outline, &expected_paint);
+    }
+
+    assert!(lit_pixels(&actual, 300, 100) > 0);
+    for y in 0..100 {
+        for x in 0..300 {
+            assert_eq!(
+                actual.get_pixel(x, y),
+                expected.get_pixel(x, y),
+                "pixel ({x},{y}) differs from Skia's local-space outset"
+            );
+        }
+    }
+}
