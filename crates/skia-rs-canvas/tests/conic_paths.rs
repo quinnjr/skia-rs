@@ -443,3 +443,55 @@ fn path_without_leading_move_starts_at_the_mapped_origin() {
     assert!(explicit.iter().any(|&v| v > 0));
     assert_eq!(fill(false), explicit);
 }
+
+#[test]
+fn thin_antialiased_stroke_draws_as_a_coverage_scaled_hairline() {
+    // SkDrawTreatAsHairline: an anti-aliased stroke at most 1 device px wide
+    // is a hairline with alpha scaled by its width, not an outline too thin
+    // to cover any pixel center.
+    use skia_rs_core::Point;
+
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.5);
+    paint.set_anti_alias(true);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_line(
+        Point::new(10.0, 50.5),
+        Point::new(150.0, 50.5),
+        &paint,
+    );
+
+    let row: Vec<u8> = (20..140)
+        .map(|x| buffer.get_pixel(x, 50).unwrap_or(Color::BLACK).red())
+        .collect();
+    assert!(row.iter().all(|&v| v > 0), "the thin line must be visible");
+    let max = *row.iter().max().unwrap();
+    assert!(
+        (100..=150).contains(&max),
+        "a 0.5px line should draw at about half coverage, got {max}"
+    );
+}
+
+#[test]
+fn hairlines_use_pixel_centers_at_half_coordinates() {
+    // Pixel row j covers [j, j+1) with its center at j + 0.5 (as in Skia),
+    // so a horizontal hairline at y = 50.5 lies entirely on row 50, with or
+    // without anti-aliasing.
+    use skia_rs_core::Point;
+
+    for anti_alias in [false, true] {
+        let mut paint = white(Style::Stroke);
+        paint.set_stroke_width(0.0);
+        paint.set_anti_alias(anti_alias);
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        Canvas::new_raster(&mut buffer).draw_line(
+            Point::new(10.0, 50.5),
+            Point::new(150.0, 50.5),
+            &paint,
+        );
+        let red = |y: i32| buffer.get_pixel(80, y).unwrap_or(Color::BLACK).red();
+        assert_eq!(red(50), 255, "aa={anti_alias}: row 50 carries the line");
+        assert_eq!(red(49), 0, "aa={anti_alias}: row 49 untouched");
+        assert_eq!(red(51), 0, "aa={anti_alias}: row 51 untouched");
+    }
+}

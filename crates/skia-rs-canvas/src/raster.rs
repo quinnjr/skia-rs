@@ -624,13 +624,16 @@ impl<'a> Rasterizer<'a> {
     /// Draw line without anti-aliasing (Bresenham).
     fn draw_line_aliased(&mut self, p0: Point, p1: Point, paint: &Paint) {
         use skia_rs_core::cast::round_to_i32;
+        // Pixel (i, j) covers [i, i+1) x [j, j+1) with its center at
+        // (i + 0.5, j + 0.5), as in Skia, so the pixel containing a point is
+        // round(coordinate - 0.5): a line at y = 50.5 lies on row 50.
         let t0 = self.matrix.map_point(p0);
         let t1 = self.matrix.map_point(p1);
 
-        let mut x0 = round_to_i32(t0.x);
-        let mut y0 = round_to_i32(t0.y);
-        let x1 = round_to_i32(t1.x);
-        let y1 = round_to_i32(t1.y);
+        let mut x0 = round_to_i32(t0.x - 0.5);
+        let mut y0 = round_to_i32(t0.y - 0.5);
+        let x1 = round_to_i32(t1.x - 0.5);
+        let y1 = round_to_i32(t1.y - 0.5);
 
         let dx = (x1 - x0).abs();
         let dy = -(y1 - y0).abs();
@@ -671,13 +674,16 @@ impl<'a> Rasterizer<'a> {
     /// Draw line with anti-aliasing using Wu's algorithm.
     fn draw_line_aa(&mut self, p0: Point, p1: Point, paint: &Paint) {
         use skia_rs_core::cast::floor_to_i32;
+        // Wu's algorithm assumes pixel i is centered at i; Skia's pixel
+        // centers are at i + 0.5. Shift by half a pixel so a line at
+        // y = 50.5 lands entirely on row 50 (SkScan_Antihair).
         let t0 = self.matrix.map_point(p0);
         let t1 = self.matrix.map_point(p1);
 
-        let mut x0 = t0.x;
-        let mut y0 = t0.y;
-        let mut x1 = t1.x;
-        let mut y1 = t1.y;
+        let mut x0 = t0.x - 0.5;
+        let mut y0 = t0.y - 0.5;
+        let mut x1 = t1.x - 0.5;
+        let mut y1 = t1.y - 0.5;
 
         let color = premultiply_color(paint.color32());
         let blend_mode = paint.blend_mode();
@@ -1149,13 +1155,42 @@ impl<'a> Rasterizer<'a> {
     /// normal (matrix-aware, clipped, AA-aware) fill pipeline. Width 0
     /// remains a hairline.
     fn stroke_path(&mut self, path: &Path, paint: &Paint) {
-        if paint.stroke_width() > 0.0 {
-            if let Some(outline) = stroke_outline(path, paint) {
-                self.fill_path(&outline, paint);
-            }
+        if paint.stroke_width() <= 0.0 {
+            self.stroke_path_hairline(path, paint);
             return;
         }
-        self.stroke_path_hairline(path, paint);
+        if let Some(coverage) = self.thin_stroke_coverage(paint) {
+            // A sub-pixel anti-aliased stroke is drawn as a hairline whose
+            // alpha is scaled by its device width, instead of an outline
+            // too thin to cover pixel centers.
+            // The width must become 0: the hairline walk draws segments with
+            // draw_line, which strokes any positive width as a path again.
+            let mut hairline = paint.clone();
+            hairline.set_alpha(paint.alpha() * coverage);
+            hairline.set_stroke_width(0.0);
+            self.stroke_path_hairline(path, &hairline);
+            return;
+        }
+        if let Some(outline) = stroke_outline(path, paint) {
+            self.fill_path(&outline, paint);
+        }
+    }
+
+    /// Port of Skia's `SkDrawTreatAsHairline` for a positive stroke width:
+    /// an anti-aliased stroke whose width maps to at most one device pixel
+    /// along both axes (and no perspective) is drawn as a hairline, with
+    /// coverage equal to the average mapped width. Non-AA strokes are never
+    /// converted, as in Skia.
+    fn thin_stroke_coverage(&self, paint: &Paint) -> Option<Scalar> {
+        if !paint.is_anti_alias() || self.matrix.has_perspective() {
+            return None;
+        }
+        let w = paint.stroke_width();
+        let m = &self.matrix;
+        // Map the vectors (w, 0) and (0, w) through the linear part.
+        let len0 = (m.scale_x() * w).hypot(m.skew_y() * w);
+        let len1 = (m.skew_x() * w).hypot(m.scale_y() * w);
+        (len0 <= 1.0 && len1 <= 1.0).then(|| f32::midpoint(len0, len1))
     }
 
     /// `StrokeAndFill`: fill the union of the fill geometry and the stroke
