@@ -87,6 +87,34 @@ impl PathMeasure {
         ))
     }
 
+    /// Position and unit tangent at `distance` along contour `index` alone
+    /// (pinned to `[0, contour length]`), like `SkContourMeasure::getPosTan`
+    /// on that contour. `None` for a NaN distance or a missing contour.
+    #[must_use]
+    pub fn get_pos_tan_in_contour(&self, index: usize, distance: Scalar) -> Option<(Point, Point)> {
+        let contour = self.contours.get(index)?;
+        if distance.is_nan() || contour.length <= 0.0 {
+            return None;
+        }
+        let offset = distance.clamp(0.0, contour.length);
+        let seg = Self::segment_at(contour, offset);
+        let seg_start_cum = seg.cumulative - seg.length;
+        let t = if seg.length > 0.0 {
+            ((offset - seg_start_cum) / seg.length).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (dx, dy) = (seg.end.x - seg.start.x, seg.end.y - seg.start.y);
+        let pos = Point::new(dx.mul_add(t, seg.start.x), dy.mul_add(t, seg.start.y));
+        let len = dx.hypot(dy);
+        let tangent = if len > 0.0 {
+            Point::new(dx / len, dy / len)
+        } else {
+            Point::new(1.0, 0.0)
+        };
+        Some((pos, tangent))
+    }
+
     /// Get the tangent (unit direction vector) at a distance along the path.
     ///
     /// The distance is pinned to `[0, length]` (like `SkContourMeasure::getPosTan`);

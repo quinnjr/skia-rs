@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   geometry, `Path1DEffect` fills its stamps, `Line2DEffect` strokes at its
   own width, compose/sum share the record); several effects return an
   empty path where Skia draws nothing.
+- `Path1DEffect::new` cleans up `phase` like `SkPath1DPathEffect` (a
+  positive phase starts stamps at `advance - phase mod advance`, a negative
+  one at `-phase mod advance`), rejects non-finite `advance`/`phase`, and
+  stamps restart at every contour. Callers that relied on the raw phase as
+  a start distance will see stamps move.
+- Path effects bound their output like Skia: dashes give up past
+  `kMaxDashCount` (summed over contours), `Path1DEffect` past 100,000 stamps
+  per contour, and the 1D/2D effects past a point budget.
 
 ### Added
 

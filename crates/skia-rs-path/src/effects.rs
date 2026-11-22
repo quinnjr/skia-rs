@@ -261,20 +261,22 @@ impl DashEffect {
     /// (`is_on`, `interval_idx`, `remaining_in_interval`) across it. Used for
     /// both explicit line segments and the synthesized closing edge so the dash
     /// distance advances continuously (upstream `SkDashPath::InternalFilter`).
-    /// `SkDashPath::InternalFilter` gives up (the effect fails) when a
-    /// contour would need more than `kMaxDashCount` dashes, which also
-    /// covers non-finite contour lengths.
+    /// `SkDashPath::InternalFilter` gives up (the effect fails) once the dash
+    /// count, accumulated over the path's contours, exceeds `kMaxDashCount`
+    /// (which also covers non-finite lengths).
     fn dash_count_is_bounded(&self, path: &Path) -> bool {
         const MAX_DASH_COUNT: Scalar = 1_000_000.0;
         let measure = crate::PathMeasure::new(path);
         let on_intervals =
             scalar_from_i32(i32::try_from(self.intervals.len() / 2).unwrap_or(i32::MAX));
-        (0..measure.contour_count())
-            .filter_map(|i| measure.contour_length(i))
-            .all(|length| {
-                let dashes = length * on_intervals / self.interval_sum;
-                dashes.is_finite() && dashes <= MAX_DASH_COUNT
-            })
+        let mut dash_count: Scalar = 0.0;
+        for length in (0..measure.contour_count()).filter_map(|i| measure.contour_length(i)) {
+            dash_count += length * on_intervals / self.interval_sum;
+            if !(dash_count.is_finite() && dash_count <= MAX_DASH_COUNT) {
+                return false;
+            }
+        }
+        true
     }
 
     fn dash_line(
@@ -1181,9 +1183,31 @@ impl Path1DEffect {
     /// - `advance`: Distance between each stamp.
     /// - `phase`: Initial offset along the path.
     /// - `style`: How to orient the stamped path.
+    ///
+    /// Like `SkPath1DPathEffect::Make`, a non-positive or non-finite
+    /// `advance`, a non-finite `phase` or an empty `path` gives `None`. The
+    /// phase is cleaned up as Skia's constructor does (PostScript's
+    /// interpretation): a positive phase becomes `advance - phase mod
+    /// advance`, a negative one `-phase mod advance`, so stamps start that
+    /// far into each contour.
     pub fn new(path: Path, advance: Scalar, phase: Scalar, style: Path1DStyle) -> Option<Self> {
-        if advance <= 0.0 || path.is_empty() {
+        if !(advance.is_finite() && advance > 0.0 && phase.is_finite()) || path.is_empty() {
             return None;
+        }
+        let mut phase = phase;
+        if phase < 0.0 {
+            phase = -phase;
+            if phase > advance {
+                phase %= advance;
+            }
+        } else {
+            if phase > advance {
+                phase %= advance;
+            }
+            phase = advance - phase;
+        }
+        if phase >= advance {
+            phase = 0.0;
         }
         Some(Self {
             path,
@@ -1215,9 +1239,13 @@ impl Path1DEffect {
 }
 
 /// The most points [`Path1DEffect`] emits (stamps times the stamp's point
-/// count) before failing: a guard against non-finite or enormous path
-/// lengths (Skia caps measured stamps only in fuzzer builds).
+/// count, over all contours) before failing: a guard against non-finite or
+/// enormous path lengths and heavy stamps.
 const MAX_PATH1D_POINTS: Scalar = 4_194_304.0;
+
+/// `Sk1DPathEffect`'s per-contour stamp limit (`MAX_REASONABLE_ITERATIONS`):
+/// exceeding it fails the effect.
+const MAX_REASONABLE_ITERATIONS: u32 = 100_000;
 
 impl PathEffect for Path1DEffect {
     fn filter_path(&self, path: &Path, rec: &mut StrokeRec) -> Option<Path> {
@@ -1232,54 +1260,54 @@ impl PathEffect for Path1DEffect {
         if src_path.is_empty() {
             return None;
         }
-
-        let mut builder = PathBuilder::new();
         let measure = PathMeasure::new(src_path);
-        let length = measure.length();
-
-        if length <= 0.0 {
-            // Sk1DPathEffect still succeeds here: no stamps, nothing drawn.
-            return Some(Path::new());
-        }
-        // A non-finite length never ends the walk, and an enormous one
-        // allocates without bound; fail like Skia's fuzzer-build cap on
-        // measured stamps (the source is then drawn unchanged).
-        let stamps = (length - self.phase.max(0.0)) / self.advance;
+        // Output guard: stamps times the stamp's point count, over all
+        // contours (each contour starts at the phase).
         let stamp_points =
             scalar_from_i32(i32::try_from(self.path.points().len()).unwrap_or(i32::MAX));
-        let points = stamps * stamp_points.max(1.0);
-        if !(points.is_finite() && points <= MAX_PATH1D_POINTS) {
-            return None;
+        let mut points: Scalar = 0.0;
+        for i in 0..measure.contour_count() {
+            let length = measure.contour_length(i).unwrap_or(0.0);
+            let stamps = (length - self.phase).max(0.0) / self.advance;
+            let contour_points = stamps * stamp_points.max(1.0);
+            points += contour_points;
+            if !(points.is_finite() && points <= MAX_PATH1D_POINTS) {
+                return None;
+            }
         }
 
-        let mut distance = self.phase;
-        loop {
-            if distance >= length {
-                break;
+        // Sk1DPathEffect::onFilterPath: each contour restarts at the phase,
+        // and more than MAX_REASONABLE_ITERATIONS stamps on one contour
+        // fails the effect. A path with no length succeeds with nothing.
+        let mut builder = PathBuilder::new();
+        for i in 0..measure.contour_count() {
+            let length = measure.contour_length(i).unwrap_or(0.0);
+            let mut distance = self.phase;
+            let mut governor = MAX_REASONABLE_ITERATIONS;
+            loop {
+                if distance >= length {
+                    break;
+                }
+                if governor == 0 {
+                    return None;
+                }
+                governor -= 1;
+                if let Some((pos, tangent)) = measure.get_pos_tan_in_contour(i, distance) {
+                    let transform = match self.style {
+                        Path1DStyle::Translate => skia_rs_core::Matrix::translate(pos.x, pos.y),
+                        Path1DStyle::Rotate | Path1DStyle::Morph => {
+                            let angle = tangent.y.atan2(tangent.x);
+                            // First rotate, then translate
+                            let rotation = skia_rs_core::Matrix::rotate(angle);
+                            let translation = skia_rs_core::Matrix::translate(pos.x, pos.y);
+                            translation.concat(&rotation)
+                        }
+                    };
+                    builder.add_path(&self.path.transformed(&transform));
+                }
+                distance += self.advance;
             }
-            // Get position and tangent at this distance
-            let pos = measure.get_point_at(distance);
-            let tangent = measure.get_tangent_at(distance);
-
-            if let (Some(pos), Some(tangent)) = (pos, tangent) {
-                let transform = match self.style {
-                    Path1DStyle::Translate => skia_rs_core::Matrix::translate(pos.x, pos.y),
-                    Path1DStyle::Rotate | Path1DStyle::Morph => {
-                        let angle = tangent.y.atan2(tangent.x);
-                        // First rotate, then translate
-                        let rotation = skia_rs_core::Matrix::rotate(angle);
-                        let translation = skia_rs_core::Matrix::translate(pos.x, pos.y);
-                        translation.concat(&rotation)
-                    }
-                };
-
-                // Transform and add the stamped path
-                let transformed = self.path.transformed(&transform);
-                builder.add_path(&transformed);
-            }
-            distance += self.advance;
         }
-
         Some(builder.build())
     }
 
@@ -1414,6 +1442,7 @@ impl PathEffect for Path2DEffect {
 
 /// Resource guards for the 2D effects against pathological lattices: at
 /// most this many lattice rows and columns are scanned, and
+/// [`Line2DEffect`] emits at most half that many lines, sampled evenly, and
 /// [`Path2DEffect`] emits at most [`MAX_LATTICE_POINTS`] points, budgeted
 /// evenly across the covered rows (each row keeps its leftmost cells; with
 /// more rows than stamps, rows are sampled evenly). The
@@ -1683,9 +1712,16 @@ impl Line2DEffect {
         // As in Sk2DPathEffect, only a singular matrix fails; an empty
         // source succeeds with no lines.
         let inverse = self.matrix.invert()?;
-        let lines = lattice_spans(src_path, &inverse, cull)
+        let spans: Vec<_> = lattice_spans(src_path, &inverse, cull)
             .into_iter()
             .filter(|&(_, _, count)| count > 1)
+            .collect();
+        // Output guard: at most MAX_LATTICE_POINTS / 2 lines, sampled
+        // evenly over the rows when there are more.
+        let stride = spans.len().div_ceil(MAX_LATTICE_POINTS / 2).max(1);
+        let lines = spans
+            .into_iter()
+            .step_by(stride)
             .map(|(v, u, count)| {
                 let y = scalar_from_i32(v) + 0.5;
                 (
@@ -2037,6 +2073,73 @@ mod tests {
         let mut b = PathBuilder::new();
         b.move_to(0.0, 0.0).line_to(1e5, 0.0);
         assert!(one_d.apply(&b.build()).is_none(), "1e9 points: gives up");
+    }
+
+    #[test]
+    fn path1d_cleans_up_phase_and_restarts_per_contour_like_skia() {
+        let stamp = square(1.0);
+        let starts = |phase: Scalar, src: &Path| {
+            let effect = Path1DEffect::new(stamp.clone(), 10.0, phase, Path1DStyle::Translate)
+                .expect("valid");
+            let out = effect.apply(src).expect("applies");
+            out.iter()
+                .filter_map(|e| match e {
+                    PathElement::Move(p) => Some((p.x, p.y)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0).line_to(25.0, 0.0);
+        let line = b.build();
+        // SkPath1DPathEffect: phase 3 -> offset 7; phase -3 -> offset 3.
+        assert_eq!(starts(3.0, &line), [(7.0, 0.0), (17.0, 0.0)]);
+        assert_eq!(starts(-3.0, &line), [(3.0, 0.0), (13.0, 0.0), (23.0, 0.0)]);
+
+        // Each contour restarts at the phase (offset 0 for phase 0... which
+        // Skia maps to advance - 0 = advance -> 0).
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0).line_to(15.0, 0.0);
+        b.move_to(0.0, 50.0).line_to(15.0, 50.0);
+        assert_eq!(
+            starts(0.0, &b.build()),
+            [(0.0, 0.0), (10.0, 0.0), (0.0, 50.0), (10.0, 50.0)]
+        );
+
+        // Non-finite phase or advance is rejected (SkPath1DPathEffect::Make).
+        assert!(
+            Path1DEffect::new(stamp.clone(), 1.0, Scalar::NAN, Path1DStyle::Translate).is_none()
+        );
+        assert!(Path1DEffect::new(stamp, Scalar::INFINITY, 0.0, Path1DStyle::Translate).is_none());
+    }
+
+    #[test]
+    fn dash_count_accumulates_across_contours() {
+        // 20 contours of 600k dashes each: each is under kMaxDashCount but
+        // the total (12M) is over, so SkDashPath gives up.
+        let mut b = PathBuilder::new();
+        for i in 0..20 {
+            let y = scalar_from_i32(i);
+            b.move_to(0.0, y).line_to(6e6, y);
+        }
+        let dash = DashEffect::new(vec![5.0, 5.0], 0.0).unwrap();
+        assert!(dash.apply(&b.build()).is_none());
+    }
+
+    #[test]
+    fn line2d_output_is_bounded() {
+        // Many thin contours under a fine lattice: the line count stays
+        // within the budget.
+        let mut b = PathBuilder::new();
+        for i in 0..400 {
+            let x = scalar_from_i32(i) * 2.0;
+            b.add_rect(&skia_rs_core::Rect::new(x, 0.0, x + 1.0, 100.0));
+        }
+        let hatch = Line2DEffect::new(1.0, skia_rs_core::Matrix::scale(0.02, 0.02)).unwrap();
+        let mut rec = StrokeRec::Fill;
+        let lines = hatch.filter_path(&b.build(), &mut rec).expect("applies");
+        assert!(!lines.is_empty());
+        assert!(lines.points().len() <= MAX_LATTICE_POINTS);
     }
 
     #[test]
