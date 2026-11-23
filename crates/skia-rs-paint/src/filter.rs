@@ -409,8 +409,9 @@ pub trait ImageFilter: Send + Sync + std::fmt::Debug {
     /// This filter with its geometric parameters (blur sigmas, offsets,
     /// radii, rects, and those of its inputs) mapped through `matrix`, as
     /// `SkCanvas` maps a layer's image filter from local space into layer
-    /// space (`skif::Mapping::paramToLayer`). `None` when nothing changes
-    /// (the default, for filters without geometric parameters).
+    /// space (`skif::Mapping::paramToLayer`). `None` when nothing changes:
+    /// the default, for filters without geometric parameters or inputs
+    /// (every built-in filter that has either overrides this).
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         let _ = matrix;
         None
@@ -1294,6 +1295,41 @@ pub enum LightType {
     },
 }
 
+impl LightType {
+    /// The light mapped into layer space, like `SkLight::transform`: light
+    /// positions map as points with z the average of the mapped (z, z)
+    /// vector; a distant light's direction maps as a vector, z unchanged.
+    fn mapped(&self, matrix: &Matrix) -> Self {
+        let map_point3 = |(x, y, z): (Scalar, Scalar, Scalar)| {
+            let p = matrix.map_point(skia_rs_core::Point::new(x, y));
+            let (zx, zy) = map_vector(matrix, z, z);
+            (p.x, p.y, f32::midpoint(zx, zy))
+        };
+        match *self {
+            Self::Distant { direction } => {
+                let (dx, dy) = map_vector(matrix, direction.0, direction.1);
+                Self::Distant {
+                    direction: (dx, dy, direction.2),
+                }
+            }
+            Self::Point { location } => Self::Point {
+                location: map_point3(location),
+            },
+            Self::Spot {
+                location,
+                target,
+                specular_exponent,
+                cutoff_angle,
+            } => Self::Spot {
+                location: map_point3(location),
+                target: map_point3(target),
+                specular_exponent,
+                cutoff_angle,
+            },
+        }
+    }
+}
+
 /// A lighting image filter.
 ///
 /// Corresponds to Skia's lighting image filters.
@@ -1352,6 +1388,18 @@ impl LightingImageFilter {
 }
 
 impl ImageFilter for LightingImageFilter {
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        Some(Arc::new(Self {
+            light: self.light.mapped(matrix),
+            surface_scale: self.surface_scale,
+            diffuse_constant: self.diffuse_constant,
+            specular_constant: self.specular_constant,
+            specular_exponent: self.specular_exponent,
+            light_color: self.light_color,
+            input: map_input(self.input.as_ref(), matrix),
+        }))
+    }
+
     fn input_bounds(&self, output: &Rect) -> Rect {
         // Surface normals read the neighbouring pixels.
         input_of(self.input.as_ref(), &output.inset(-1.0, -1.0))
@@ -1717,6 +1765,16 @@ impl MatrixConvolutionImageFilter {
 }
 
 impl ImageFilter for MatrixConvolutionImageFilter {
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        // Skia does not scale the kernel (it is in layer pixels); only the
+        // input maps.
+        let input = self.input.as_ref()?;
+        Some(Arc::new(Self {
+            input: Some(map_image_filter(input, matrix)),
+            ..self.clone()
+        }))
+    }
+
     fn input_bounds(&self, output: &Rect) -> Rect {
         input_of(
             self.input.as_ref(),
@@ -2606,6 +2664,34 @@ pub(crate) fn deserialize_image_filter(bytes: &[u8], offset: &mut usize) -> Opti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lighting_and_convolution_map_their_inputs_and_lights() {
+        // A point light at (10, 20, 5) under scale(4) moves to (40, 80, 20),
+        // and a convolution's offset input maps too (its reach grows 4x).
+        let m = Matrix::scale(4.0, 4.0);
+        let light = LightType::Point {
+            location: (10.0, 20.0, 5.0),
+        }
+        .mapped(&m);
+        assert!(matches!(light, LightType::Point { location } if location == (40.0, 80.0, 20.0)));
+
+        let offset: ImageFilterRef = Arc::new(OffsetImageFilter::new(100.0, 0.0, None));
+        let conv: ImageFilterRef = Arc::new(MatrixConvolutionImageFilter::new(
+            (1, 1),
+            vec![1.0],
+            1.0,
+            0.0,
+            (0, 0),
+            crate::shader::TileMode::Decal,
+            true,
+            Some(offset),
+        ));
+        let mapped = map_image_filter(&conv, &m);
+        let out = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let input = mapped.input_bounds(&out);
+        assert_eq!(input.left, -400.0, "the offset input maps: {input:?}");
+    }
+
     use super::*;
 
     #[test]
