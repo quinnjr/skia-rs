@@ -1404,6 +1404,8 @@ impl Matrix {
         let b = sx * kx + sy * ky;
         let c = kx * kx + sy * sy;
         let b_sq = b * b;
+        // SkMatrix::getMinMaxScaleFactors: `bSqd <= SK_ScalarNearlyZero *
+        // SK_ScalarNearlyZero` (the square of the tolerance, on b squared).
         let largest_sq = if b_sq <= SCALAR_NEARLY_ZERO * SCALAR_NEARLY_ZERO {
             a.max(c)
         } else {

@@ -1171,6 +1171,15 @@ impl<'a> Canvas<'a> {
     }
 
     /// Draw an arc.
+    ///
+    /// Like `SkCanvas::drawArc`: an empty (or inverted) oval or a zero sweep
+    /// draws nothing, and a |sweep| of 360 degrees or more is a full oval
+    /// for a plain fill, else that many turns from `start_angle`. One
+    /// difference: at most 1024 whole turns are built. Skia keeps adding
+    /// turns (its loop becomes inexact past 2^27 degrees and never ends
+    /// past 2^33), so a dash or other path effect on a sweep beyond
+    /// 368,640 degrees sees fewer turns here; the drawn geometry of a
+    /// plain stroke is the same.
     pub fn draw_arc(
         &mut self,
         oval: &Rect,
