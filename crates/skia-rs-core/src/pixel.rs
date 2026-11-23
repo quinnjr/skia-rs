@@ -87,6 +87,20 @@ impl TryFrom<ImageInfoData> for ImageInfo {
     type Error = PixelError;
 
     fn try_from(data: ImageInfoData) -> Result<Self, Self::Error> {
+        // SkImageInfo's validity limit (kMaxDimension = SK_MaxS32 >> 2), and
+        // a byte size that fits, so min_row_bytes / compute_byte_size
+        // cannot overflow on untrusted input.
+        const MAX_DIMENSION: i32 = i32::MAX >> 2;
+        let (width, height) = (data.dimensions.width, data.dimensions.height);
+        let bpp = data.color_type.bytes_per_pixel();
+        let bytes = usize::try_from(width.max(0))
+            .ok()
+            .and_then(|w| w.checked_mul(bpp))
+            .and_then(|row| row.checked_mul(usize::try_from(height.max(0)).ok()?))
+            .filter(|&total| isize::try_from(total).is_ok());
+        if width > MAX_DIMENSION || height > MAX_DIMENSION || bytes.is_none() {
+            return Err(PixelError::InvalidDimensions { width, height });
+        }
         let mut info = Self::new(
             data.dimensions.width,
             data.dimensions.height,

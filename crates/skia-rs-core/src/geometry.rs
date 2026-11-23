@@ -1136,6 +1136,22 @@ impl RRect {
     #[inline]
     #[must_use]
     pub const fn from_rect(rect: Rect) -> Self {
+        // SkRRect::setRect (initializeRect): a non-finite rect gives the
+        // empty rrect, and the rect is sorted.
+        let finite = rect.left.is_finite()
+            && rect.top.is_finite()
+            && rect.right.is_finite()
+            && rect.bottom.is_finite();
+        let rect = if finite {
+            Rect::new(
+                rect.left.min(rect.right),
+                rect.top.min(rect.bottom),
+                rect.left.max(rect.right),
+                rect.top.max(rect.bottom),
+            )
+        } else {
+            Rect::EMPTY
+        };
         Self {
             rect,
             radii: [Point::zero(); 4],
@@ -2085,6 +2101,12 @@ mod serde_tests {
             info
         );
 
+        // An unsorted rect is sorted by from_rect (SkRRect::setRect), so it
+        // round-trips.
+        let unsorted = RRect::from_rect(Rect::new(10.0, 10.0, 0.0, 0.0));
+        let json = serde_json::to_string(&unsorted).unwrap();
+        assert_eq!(serde_json::from_str::<RRect>(&json).unwrap(), unsorted);
+
         // RRects validate like SkRRect::readFromMemory.
         let rr = RRect {
             rect: Rect::new(0.0, 0.0, 10.0, 10.0),
@@ -2104,5 +2126,10 @@ mod serde_tests {
         let bad = json.replacen("\"width\":4", "\"width\":-1", 1);
         assert_ne!(bad, json);
         assert!(serde_json::from_str::<crate::ImageInfo>(&bad).is_err());
+        // ... nor sizes whose byte count would overflow.
+        let huge = json
+            .replacen("\"width\":4", "\"width\":2147483647", 1)
+            .replacen("\"height\":3", "\"height\":2147483647", 1);
+        assert!(serde_json::from_str::<crate::ImageInfo>(&huge).is_err());
     }
 }
