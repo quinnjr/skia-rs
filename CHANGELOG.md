@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer built). Per `VERSIONING.md` an MSRV bump is a minor version
   change, so the next release is **0.5.0**. The workspace now uses the
   MSRV-aware `resolver = "3"`.
+- `Typeface::system_default()` looks for a system font once per process,
+  like Skia's default typeface, and also remembers a miss: if no font was
+  found on the first call, later calls return `None` without re-probing,
+  even if fonts are installed afterwards.
+- `StrokeRec::set_stroke_style` maps a NaN or infinite width to `Fill`
+  (Skia keeps an infinite width as a stroke), so a `Stroke` width is
+  always finite and positive.
 - **Breaking**: the C API's `sk_canvas_save_layer` returns `int32_t`
   (was `uint32_t`), the same type and value as `sk_canvas_save`.
 - The C API's `sk_canvas_save_layer` now makes a real offscreen layer

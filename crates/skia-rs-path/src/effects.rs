@@ -84,8 +84,9 @@ impl StrokeRec {
     /// (`SkStrokeRec::setStrokeStyle(width, false)`).
     pub const fn set_stroke_style(&mut self, width: Scalar) {
         // SkStrokeRec::setStrokeStyle: 0 is a hairline; a negative width
-        // reads back as fill (as does a NaN one here), keeping Stroke's
-        // finite, positive width.
+        // reads back as fill. Here a NaN or infinite width does too (Skia
+        // keeps an infinite one as a stroke), so Stroke's width is always
+        // finite and positive.
         *self = if width == 0.0 {
             Self::Hairline
         } else if width.is_finite() && width > 0.0 {

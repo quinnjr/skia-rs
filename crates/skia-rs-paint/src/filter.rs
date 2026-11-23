@@ -2946,8 +2946,8 @@ mod tests {
         };
         let scaled = light.mapped(&Matrix::scale(2.0, 2.0));
         assert!(matches!(scaled, LightType::Distant { direction } if direction == (1.0, 0.0, 1.0)));
-        // The surface scale follows the matrix's scale (normals come from
-        // device pixels).
+        // The surface scale is not mapped (as in Skia), so the shading
+        // does not change with zoom.
         let lighting: ImageFilterRef = Arc::new(LightingImageFilter::diffuse(
             light.clone(),
             1.5,
