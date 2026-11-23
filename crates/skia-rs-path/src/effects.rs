@@ -366,12 +366,16 @@ impl PathEffect for DashEffect {
         cull: Option<&skia_rs_core::Rect>,
         res_scale: Scalar,
     ) -> Option<Path> {
-        let _ = cull;
         // SkDashPath::InternalFilter does nothing for geometry that wants to
         // be filled (Fill or StrokeAndFill): the source is drawn unchanged.
         if matches!(rec, StrokeRec::Fill | StrokeRec::StrokeAndFill(_)) {
             return None;
         }
+        // SkDashPath's cull_path: a line or rect source is first trimmed to
+        // the cull (keeping the dash phase), so only the visible part counts
+        // against kMaxDashCount.
+        let culled = cull.and_then(|c| cull_dash_source(path, c, *rec, self.interval_sum));
+        let path = culled.as_ref().unwrap_or(path);
         let scale = if res_scale.is_finite() && res_scale > 0.0 {
             res_scale
         } else {
@@ -387,6 +391,131 @@ impl PathEffect for DashEffect {
     fn effect_kind(&self) -> PathEffectKind {
         PathEffectKind::Dash
     }
+}
+
+/// `SkDashPath`'s `cull_path`: a line, or the edges of a rect, trimmed to
+/// `cull` outset for the stroke. Trimmed ends move by whole interval lengths
+/// so the dash pattern is unchanged (`clip_line`). `None` when the source is
+/// neither, or nothing of it is near the cull.
+fn cull_dash_source(
+    path: &Path,
+    cull: &skia_rs_core::Rect,
+    rec: StrokeRec,
+    interval_len: Scalar,
+) -> Option<Path> {
+    // outset_for_stroke: half the width (1 for hairlines), times the miter
+    // limit for miter joins; the join is not in the record, so allow for
+    // Skia's default miter limit (4).
+    let radius = match rec {
+        StrokeRec::Stroke(w) | StrokeRec::StrokeAndFill(w) if w > 0.0 => w / 2.0,
+        _ => 1.0,
+    } * 4.0;
+    let bounds = cull.inset(-radius, -radius);
+    let mut builder = PathBuilder::new();
+    if path.is_line() {
+        let pts = path.points();
+        let (mut a, mut b) = (pts[0], pts[1]);
+        if !clip_dash_line(&mut a, &mut b, &bounds, interval_len, 0.0) {
+            return None;
+        }
+        builder.move_to(a.x, a.y).line_to(b.x, b.y);
+        return Some(builder.build());
+    }
+    path.is_rect()?;
+    // The rect's edges, including the closing one, culled separately with
+    // the unculled length so far keeping the phase.
+    let mut edges = Vec::with_capacity(4);
+    let (mut start, mut current) = (Point::zero(), Point::zero());
+    for element in path {
+        match element {
+            PathElement::Move(p) => (start, current) = (p, p),
+            PathElement::Line(p) => {
+                edges.push((current, p));
+                current = p;
+            }
+            PathElement::Close => {
+                if current != start {
+                    edges.push((current, start));
+                }
+                current = start;
+            }
+            _ => return None,
+        }
+    }
+    let mut accum = 0.0_f64;
+    let mut last: Option<Point> = None;
+    for (a, b) in edges {
+        let (mut ca, mut cb) = (a, b);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the prior phase is below one interval length"
+        )]
+        let prior = (accum % f64::from(interval_len)) as Scalar;
+        if clip_dash_line(&mut ca, &mut cb, &bounds, interval_len, prior) {
+            if last != Some(ca) {
+                builder.move_to(ca.x, ca.y);
+            }
+            builder.line_to(cb.x, cb.y);
+            last = Some(cb);
+        }
+        accum += f64::from((b.x - a.x + b.y - a.y).abs());
+    }
+    let out = builder.build();
+    (!out.is_empty()).then_some(out)
+}
+
+/// `SkDashPath`'s `clip_line` for a horizontal or vertical line: trim it to
+/// `bounds` along its axis, moving each trimmed end by a whole number of
+/// `interval_len` (and `prior_phase` for rect edges) so the dash pattern is
+/// unchanged. False for a diagonal line or one outside the bounds.
+#[allow(clippy::float_cmp, reason = "SkDashPath tests the exact deltas")]
+fn clip_dash_line(
+    p0: &mut Point,
+    p1: &mut Point,
+    bounds: &skia_rs_core::Rect,
+    interval_len: Scalar,
+    prior_phase: Scalar,
+) -> bool {
+    let (dx, dy) = (p1.x - p0.x, p1.y - p0.y);
+    if dx != 0.0 && dy != 0.0 {
+        return false;
+    }
+    let vertical = dy != 0.0;
+    let axis = |p: &Point| if vertical { p.y } else { p.x };
+    let (mut min, mut max) = (axis(p0), axis(p1));
+    let swapped = max < min;
+    if swapped {
+        std::mem::swap(&mut min, &mut max);
+    }
+    let (left_top, right_bottom) = if vertical {
+        (bounds.top, bounds.bottom)
+    } else {
+        (bounds.left, bounds.right)
+    };
+    if max < left_top || min > right_bottom {
+        return false;
+    }
+    if min < left_top {
+        min = left_top - (left_top - min) % interval_len;
+        if !swapped {
+            min -= prior_phase;
+        }
+    }
+    if max > right_bottom {
+        max = right_bottom + (max - right_bottom) % interval_len;
+        if swapped {
+            max += prior_phase;
+        }
+    }
+    if swapped {
+        std::mem::swap(&mut min, &mut max);
+    }
+    if vertical {
+        (p0.y, p1.y) = (min, max);
+    } else {
+        (p0.x, p1.x) = (min, max);
+    }
+    true
 }
 
 /// Curve-flattening tolerance for dashing, in local units at a resolution
@@ -796,6 +925,34 @@ impl DiscreteEffect {
 /// one contour is split into.
 const MAX_DISCRETE_SEGMENTS: i32 = 100_000;
 
+/// The point at `t` on the conic `p0, p1, p2` with weight `w` (the exact
+/// rational form, so quarter-circle conics stay circular).
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "unfused rational form, like the rasterizer's conic evaluation"
+)]
+fn conic_eval(p0: Point, p1: Point, p2: Point, weight: Scalar, t: Scalar) -> Point {
+    let mt = 1.0 - t;
+    let (k0, k1, k2) = (mt * mt, 2.0 * weight * mt * t, t * t);
+    let denom = k0 + k1 + k2;
+    Point::new(
+        (k0 * p0.x + k1 * p1.x + k2 * p2.x) / denom,
+        (k0 * p0.y + k1 * p1.y + k2 * p2.y) / denom,
+    )
+}
+
+/// Approximate arc length of a conic (16-segment polyline).
+fn conic_length(p0: Point, p1: Point, p2: Point, w: Scalar) -> Scalar {
+    let mut length = 0.0;
+    let mut prev = p0;
+    for i in 1..=16_u8 {
+        let next = conic_eval(p0, p1, p2, w, Scalar::from(i) / 16.0);
+        length += prev.distance(&next);
+        prev = next;
+    }
+    length
+}
+
 impl PathEffect for DiscreteEffect {
     fn apply(&self, path: &Path) -> Option<Path> {
         if path.is_empty() {
@@ -869,16 +1026,16 @@ impl PathEffect for DiscreteEffect {
                     }
                     current_pos = end;
                 }
-                PathElement::Conic(ctrl, end, _w) => {
+                PathElement::Conic(ctrl, end, w) => {
                     let steps = take_segments(
-                        ceil_to_i32(quadratic_length(current_pos, ctrl, end) / self.seg_length)
+                        ceil_to_i32(conic_length(current_pos, ctrl, end, w) / self.seg_length)
                             .max(4),
                         &mut contour_budget,
                     );
 
                     for i in 1..=steps {
                         let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                        let p = quadratic_point(current_pos, ctrl, end, t);
+                        let p = conic_eval(current_pos, ctrl, end, w, t);
 
                         let dx = Self::random(seed) * self.deviation;
                         seed = seed.wrapping_add(1);
@@ -2737,6 +2894,49 @@ mod tests {
             "unzoomed chords stay coarse: {}",
             longest(1.0)
         );
+    }
+
+    #[test]
+    fn dashed_long_lines_are_trimmed_to_the_cull_before_counting() {
+        // 2e7 long at intervals [2, 2]: 5e6 dashes over the whole line, but
+        // only the part near a 100x100 cull counts (SkDashPath's cull_path).
+        let dash = DashEffect::new(vec![2.0, 2.0], 0.0).unwrap();
+        let mut b = PathBuilder::new();
+        b.move_to(-1e7, 50.0).line_to(1e7, 50.0);
+        let cull = skia_rs_core::Rect::new(0.0, 0.0, 100.0, 100.0);
+        let mut rec = StrokeRec::Stroke(1.0);
+        let out = dash
+            .filter_path_culled(&b.build(), &mut rec, Some(&cull), 1.0)
+            .expect("dashes the visible part instead of failing");
+        assert!(!out.is_empty());
+        // Phase kept: a dash still starts on a multiple of the interval.
+        let first = out.points()[0].x;
+        let periods = first / 4.0;
+        assert!(
+            (periods - periods.round()).abs() < 1e-3,
+            "first dash at {first}"
+        );
+        // The unculled line still exceeds the cap and fails, as in Skia.
+        let mut rec = StrokeRec::Stroke(1.0);
+        let mut b = PathBuilder::new();
+        b.move_to(-1e7, 50.0).line_to(1e7, 50.0);
+        assert!(dash.filter_path(&b.build(), &mut rec).is_none());
+    }
+
+    #[test]
+    fn discrete_follows_conics_exactly() {
+        // Zero deviation reproduces the source: a circle of conics stays at
+        // radius 40 (evaluated as quads it bulges to about 44 at 45 degrees).
+        let discrete = DiscreteEffect::new(5.0, 0.0, 3).unwrap();
+        let mut b = PathBuilder::new();
+        b.add_circle(0.0, 0.0, 40.0);
+        let out = discrete.apply(&b.build()).expect("applies");
+        let max_r = out
+            .points()
+            .iter()
+            .map(|p| p.x.hypot(p.y))
+            .fold(0.0, Scalar::max);
+        assert!((max_r - 40.0).abs() < 0.05, "max radius {max_r}");
     }
 
     #[test]
