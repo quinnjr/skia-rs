@@ -372,14 +372,22 @@ impl<'a> Canvas<'a> {
             .layer_stack
             .last()
             .is_some_and(|l| l.save_count_when_pushed == self.save_count);
-        if should_pop_layer {
-            let layer = self.layer_stack.pop().unwrap();
-            self.composite_layer(layer);
-        }
+        let layer = if should_pop_layer {
+            self.layer_stack.pop()
+        } else {
+            None
+        };
 
         self.matrix_stack.pop();
         self.clip_stack.restore();
         self.save_count -= 1;
+
+        // Composite after popping the save state, so the layer goes through
+        // the clip that was active at saveLayer (as in Skia), not a clip set
+        // inside the layer, which its content was already drawn through.
+        if let Some(layer) = layer {
+            self.composite_layer(layer);
+        }
 
         if let Backing::Recording(commands) = &mut self.backing {
             commands.push(DrawCommand::Restore);
@@ -963,6 +971,11 @@ impl<'a> Canvas<'a> {
     /// top-left corner, clockwise, like `SkPath::addRect`) so the effect
     /// applies, as in Skia.
     pub fn draw_rect(&mut self, rect: &Rect, paint: &Paint) {
+        // SkCanvas quick-rejects non-finite rects (sorting would otherwise
+        // drop a NaN edge and draw a degenerate rect).
+        if !rect.is_finite() {
+            return;
+        }
         match &mut self.backing {
             Backing::Raster(_) if paint.path_effect().is_some() => {
                 // SkCanvas::drawRect sorts the rect first, which fixes the
@@ -989,7 +1002,11 @@ impl<'a> Canvas<'a> {
     /// With a path effect, the oval is drawn as a path (starting at 3
     /// o'clock, clockwise, like `SkPath::addOval`) so the effect applies.
     pub fn draw_oval(&mut self, rect: &Rect, paint: &Paint) {
-        // SkCanvas::drawOval sorts the rect first, for every draw.
+        // SkCanvas quick-rejects non-finite rects, then sorts the rest
+        // (f32::min/max would drop a NaN edge and draw a degenerate oval).
+        if !rect.is_finite() {
+            return;
+        }
         let rect = sorted_rect(rect);
         match &mut self.backing {
             Backing::Raster(_) if paint.path_effect().is_some() => {
@@ -1060,12 +1077,20 @@ impl<'a> Canvas<'a> {
         use_center: bool,
         paint: &Paint,
     ) {
+        // SkCanvas::drawArc quick-rejects non-finite ovals and sorts the rest.
+        if !oval.is_finite() {
+            return;
+        }
+        let oval = &sorted_rect(oval);
         match &mut self.backing {
             Backing::Raster(_) => {
                 // Build the arc path here so recording stays authoritative
                 // and the raster path matches the former RasterCanvas
                 // implementation.
-                let path = build_arc_path(oval, start_angle, sweep_angle, use_center);
+                let fill_no_effect =
+                    paint.style() == skia_rs_paint::Style::Fill && paint.path_effect().is_none();
+                let path =
+                    build_arc_path(oval, start_angle, sweep_angle, use_center, fill_no_effect);
                 self.rasterize_path(&path, paint);
             }
             Backing::Recording(commands) => {
@@ -1083,6 +1108,9 @@ impl<'a> Canvas<'a> {
 
     /// Draw a rounded rectangle.
     pub fn draw_round_rect(&mut self, rect: &Rect, rx: Scalar, ry: Scalar, paint: &Paint) {
+        if !rect.is_finite() {
+            return;
+        }
         match &mut self.backing {
             Backing::Raster(_) => {
                 let path = build_round_rect_path(rect, rx, ry);
@@ -2836,53 +2864,112 @@ fn build_round_rect_path(rect: &Rect, rx: Scalar, ry: Scalar) -> Path {
     delegated.build()
 }
 
-fn build_arc_path(oval: &Rect, start_angle: Scalar, sweep_angle: Scalar, use_center: bool) -> Path {
-    use skia_rs_path::{PathBuilder, PathElement};
-
-    let mut builder = PathBuilder::new();
+/// `SkPathPriv::CreateDrawArcPath`. Only a plain fill (no path effect) may
+/// replace a |sweep| >= 360 arc with the oval; otherwise the arc keeps its
+/// start angle and direction, built from 180-degree pieces (so a dash or
+/// trim starts where Skia's does), with the center and closing line for a
+/// wedge.
+fn build_arc_path(
+    oval: &Rect,
+    start_angle: Scalar,
+    sweep_angle: Scalar,
+    use_center: bool,
+    fill_no_effect: bool,
+) -> Path {
+    let mut builder = skia_rs_path::PathBuilder::new();
     if oval.is_empty() || sweep_angle == 0.0 {
         return builder.build();
     }
-
-    // SkPathPriv::CreateDrawArcPath: |sweep| >= 360 draws the complete oval
-    // regardless of the start angle.
-    if sweep_angle.abs() >= 360.0 {
+    if fill_no_effect && sweep_angle.abs() >= 360.0 {
         builder.add_oval(oval);
         return builder.build();
     }
-
-    // Curve-segment arc geometry from the path crate (Task 2), not
-    // polylines.
-    let mut arc_builder = PathBuilder::new();
-    arc_builder.add_arc(oval, start_angle, sweep_angle);
-    let arc_path = arc_builder.build();
-
-    if !use_center {
-        return arc_path;
+    let mut piece = ArcPiece {
+        builder: &mut builder,
+        oval,
+        force_move: !use_center,
+        last: None,
+    };
+    if use_center {
+        let center = oval.center();
+        piece.builder.move_to(center.x, center.y);
+        piece.last = Some(center);
     }
+    let (mut start, mut sweep) = (start_angle, sweep_angle);
+    loop {
+        if sweep > -360.0 {
+            break;
+        }
+        piece.add(start, -180.0);
+        start -= 180.0;
+        piece.add(start, -180.0);
+        start -= 180.0;
+        sweep += 360.0;
+    }
+    loop {
+        if sweep < 360.0 {
+            break;
+        }
+        piece.add(start, 180.0);
+        start += 180.0;
+        piece.add(start, 180.0);
+        start += 180.0;
+        sweep -= 360.0;
+    }
+    if sweep != 0.0 {
+        piece.add(start, sweep);
+    }
+    if use_center {
+        builder.close();
+    }
+    builder.build()
+}
 
-    // Wedge: center -> arc start -> arc -> close.
-    let center = oval.center();
-    builder.move_to(center.x, center.y);
-    for element in &arc_path {
-        match element {
-            PathElement::Move(p) | PathElement::Line(p) => {
-                builder.line_to(p.x, p.y);
+/// Appends arc pieces as one contour (`SkPath::arcTo` with `forceMoveTo`
+/// only for the first piece of a non-wedge arc).
+struct ArcPiece<'a> {
+    builder: &'a mut skia_rs_path::PathBuilder,
+    oval: &'a Rect,
+    force_move: bool,
+    last: Option<Point>,
+}
+
+impl ArcPiece<'_> {
+    fn add(&mut self, start_angle: Scalar, sweep_angle: Scalar) {
+        use skia_rs_path::{PathBuilder, PathElement};
+        let mut arc = PathBuilder::new();
+        arc.add_arc(self.oval, start_angle, sweep_angle);
+        for element in &arc.build() {
+            match element {
+                PathElement::Move(p) => {
+                    if self.force_move {
+                        self.builder.move_to(p.x, p.y);
+                        self.force_move = false;
+                    } else if self.last != Some(p) {
+                        self.builder.line_to(p.x, p.y);
+                    }
+                    self.last = Some(p);
+                }
+                PathElement::Line(p) => {
+                    self.builder.line_to(p.x, p.y);
+                    self.last = Some(p);
+                }
+                PathElement::Quad(c, p) => {
+                    self.builder.quad_to(c.x, c.y, p.x, p.y);
+                    self.last = Some(p);
+                }
+                PathElement::Conic(c, p, w) => {
+                    self.builder.conic_to(c.x, c.y, p.x, p.y, w);
+                    self.last = Some(p);
+                }
+                PathElement::Cubic(c1, c2, p) => {
+                    self.builder.cubic_to(c1.x, c1.y, c2.x, c2.y, p.x, p.y);
+                    self.last = Some(p);
+                }
+                PathElement::Close => {}
             }
-            PathElement::Quad(c, p) => {
-                builder.quad_to(c.x, c.y, p.x, p.y);
-            }
-            PathElement::Conic(c, p, w) => {
-                builder.conic_to(c.x, c.y, p.x, p.y, w);
-            }
-            PathElement::Cubic(c1, c2, p) => {
-                builder.cubic_to(c1.x, c1.y, c2.x, c2.y, p.x, p.y);
-            }
-            PathElement::Close => {}
         }
     }
-    builder.close();
-    builder.build()
 }
 
 // =============================================================================

@@ -1397,3 +1397,99 @@ fn layers_composite_partial_clip_coverage_like_other_draws() {
         }
     }
 }
+
+#[test]
+fn non_finite_ovals_and_rects_draw_nothing() {
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(2.0);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    let mut canvas = Canvas::new_raster(&mut buffer);
+    canvas.draw_oval(&Rect::new(f32::NAN, 0.0, 10.0, 10.0), &paint);
+    canvas.draw_round_rect(&Rect::new(f32::NAN, 0.0, 10.0, 10.0), 0.0, 0.0, &paint);
+    canvas.draw_arc(
+        &Rect::new(f32::NAN, 0.0, 10.0, 10.0),
+        0.0,
+        90.0,
+        false,
+        &paint,
+    );
+    drop(canvas);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            assert!(!lit(&buffer, x, y), "({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn full_sweep_stroked_wedges_keep_their_center_line() {
+    // CreateDrawArcPath only replaces a 360-degree arc with the oval for a
+    // plain fill: a stroked wedge keeps its radius line from the center.
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(2.0);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_arc(
+        &Rect::new(40.0, 40.0, 160.0, 160.0),
+        0.0,
+        360.0,
+        true,
+        &paint,
+    );
+    assert!(
+        lit(&buffer, 130, 100),
+        "the radius line from the center is drawn"
+    );
+}
+
+#[test]
+fn inverted_arc_ovals_are_sorted() {
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(2.0);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_arc(
+        &Rect::new(160.0, 160.0, 40.0, 40.0),
+        0.0,
+        90.0,
+        false,
+        &paint,
+    );
+    let drawn = (0..SIZE).any(|y| (0..SIZE).any(|x| lit(&buffer, x, y)));
+    assert!(drawn, "the quarter arc is drawn");
+}
+
+#[test]
+fn layers_composite_through_the_clip_active_at_save_layer() {
+    // A clip set inside the layer already shaped its content; compositing
+    // through it again would square the AA edge coverage. The layered draw
+    // must match drawing directly through the same clip.
+    use skia_rs_canvas::{ClipOp, SaveLayerRec};
+
+    let render = |layered: bool| {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            if layered {
+                canvas.save_layer(&SaveLayerRec::default());
+            }
+            let mut clip = PathBuilder::new();
+            clip.add_circle(100.0, 100.0, 40.3);
+            canvas.clip_path(&clip.build(), ClipOp::Intersect, true);
+            canvas.draw_rect(&Rect::new(0.0, 0.0, 200.0, 200.0), &white(Style::Fill));
+            if layered {
+                canvas.restore();
+            }
+        }
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).map_or(0, |c| c.alpha()))
+            .collect::<Vec<_>>()
+    };
+    let (direct, layered) = (render(false), render(true));
+    let worst = direct
+        .iter()
+        .zip(&layered)
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(worst <= 2, "layered edges differ by up to {worst}");
+}
