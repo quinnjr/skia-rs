@@ -83,10 +83,15 @@ impl StrokeRec {
     /// Switch to stroking at `width`; zero means hairline
     /// (`SkStrokeRec::setStrokeStyle(width, false)`).
     pub const fn set_stroke_style(&mut self, width: Scalar) {
+        // SkStrokeRec::setStrokeStyle: 0 is a hairline; a negative width
+        // reads back as fill (as does a NaN one here), keeping Stroke's
+        // finite, positive width.
         *self = if width == 0.0 {
             Self::Hairline
-        } else {
+        } else if width.is_finite() && width > 0.0 {
             Self::Stroke(width)
+        } else {
+            Self::Fill
         };
     }
 }
@@ -3429,6 +3434,19 @@ mod tests {
             .filter(|e| matches!(e, PathElement::Quad(..)))
             .count();
         assert_eq!(quads, 3, "all three edges are morphed: {out:?}");
+    }
+
+    #[test]
+    fn set_stroke_style_maps_invalid_widths_to_fill() {
+        let mut rec = StrokeRec::Fill;
+        rec.set_stroke_style(-1.0);
+        assert_eq!(rec, StrokeRec::Fill);
+        rec.set_stroke_style(f32::NAN);
+        assert_eq!(rec, StrokeRec::Fill);
+        rec.set_stroke_style(0.0);
+        assert_eq!(rec, StrokeRec::Hairline);
+        rec.set_stroke_style(2.0);
+        assert_eq!(rec, StrokeRec::Stroke(2.0));
     }
 
     #[test]
