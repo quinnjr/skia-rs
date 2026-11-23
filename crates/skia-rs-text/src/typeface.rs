@@ -242,6 +242,23 @@ fn next_typeface_id() -> u32 {
     NEXT_TYPEFACE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether a font read error may clear up later (so the lookup should not
+/// be cached), as opposed to a path that is permanently missing or
+/// unreadable.
+fn is_transient(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    !matches!(
+        error.kind(),
+        ErrorKind::NotFound
+            | ErrorKind::PermissionDenied
+            | ErrorKind::NotADirectory
+            | ErrorKind::IsADirectory
+            | ErrorKind::InvalidInput
+            | ErrorKind::InvalidFilename
+            | ErrorKind::InvalidData
+    )
+}
+
 /// Well-known locations of each platform's default sans-serif font, in order
 /// of preference. Mirrors the families Skia's platform font managers resolve
 /// for a `nullptr` family name.
@@ -338,10 +355,10 @@ impl Typeface {
     /// [`from_data`](Self::from_data)). Like Skia's default typeface (set
     /// up once with `SkOnce`), the lookup runs once per process whether it
     /// finds a font or not, so a font-less environment does not re-probe the
-    /// candidate paths on every call. A miss is remembered only when every
-    /// candidate is missing or not a font; after any other read error (too
-    /// many open files, a permission race, a slow mount) the next call tries
-    /// again.
+    /// candidate paths on every call. A result is not remembered after a
+    /// transient read error (too many open files, an interrupted or timed-out
+    /// read): the next call tries again, so the preferred font can still
+    /// load. Missing or permanently unreadable candidates do not count.
     #[must_use]
     pub fn system_default() -> Option<Self> {
         // A hit, or a definite miss, is cached; every call shares it.
@@ -357,12 +374,14 @@ impl Typeface {
                 .find_map(|path| match std::fs::read(path) {
                     Ok(data) => Self::from_data(data),
                     Err(e) => {
-                        transient_error |= e.kind() != std::io::ErrorKind::NotFound;
+                        transient_error |= is_transient(&e);
                         None
                     }
                 });
-        if found.is_none() && transient_error {
-            return None;
+        // After a transient error the result (hit or miss) is not final: a
+        // preferred candidate may load next time.
+        if transient_error {
+            return found;
         }
         // If two threads look up concurrently, the first result is kept.
         TYPEFACE.get_or_init(|| found).clone()
