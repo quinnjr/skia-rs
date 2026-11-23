@@ -449,11 +449,6 @@ void sk_surface_ref(sk_surface_t *surface);
 // Decrement the reference count of a surface.
 //
 // Frees the surface when the count reaches 0.
-//
-// # Panics
-// Panics (caught by `catch_panic_void`, see the crate-level docs) if the
-// internal locked-surfaces mutex is poisoned by another thread panicking
-// while holding it.
 void sk_surface_unref(sk_surface_t *surface);
 
 // Get the reference count of a surface.
@@ -811,19 +806,9 @@ void sk_surface_draw_line(sk_surface_t *surface,
 // (which bypass the locked canvas and draw directly on the surface) are
 // rejected (no-op) to avoid two independent mutable views of the same
 // pixel buffer.
-//
-// # Panics
-// Panics (caught by `catch_panic`, see the crate-level docs) if the
-// internal locked-surfaces mutex is poisoned by another thread panicking
-// while holding it.
 struct sk_canvas_t *sk_surface_lock_canvas(sk_surface_t *surface);
 
 // Release a canvas acquired via [`sk_surface_lock_canvas`].
-//
-// # Panics
-// Panics (caught by `catch_panic_void`, see the crate-level docs) if the
-// internal locked-surfaces mutex is poisoned by another thread panicking
-// while holding it.
 void sk_canvas_release(struct sk_canvas_t *canvas);
 
 // Get the width of the canvas.

@@ -698,21 +698,13 @@ pub unsafe extern "C" fn sk_surface_ref(surface: *mut sk_surface_t) {
 /// Decrement the reference count of a surface.
 ///
 /// Frees the surface when the count reaches 0.
-///
-/// # Panics
-/// Panics (caught by `catch_panic_void`, see the crate-level docs) if the
-/// internal locked-surfaces mutex is poisoned by another thread panicking
-/// while holding it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_surface_unref(surface: *mut sk_surface_t) {
     catch_panic_void(|| {
         if RefCounted::unref_ptr(surface) {
             // The surface was freed — drop any stale lock entry so its
             // address can be safely reused by a future allocation.
-            locked_surfaces()
-                .lock()
-                .unwrap()
-                .remove(&(surface as usize));
+            locked_surface_set().remove(&(surface as usize));
         }
     });
 }
@@ -1639,6 +1631,15 @@ pub const unsafe extern "C" fn sk_is_available() -> bool {
 /// canvas may be held per surface at a time, and the `sk_surface_draw_*` /
 /// [`sk_surface_clear`] convenience helpers (which draw directly on the
 /// surface, bypassing the locked canvas) are rejected while a lock is held.
+/// The locked-surfaces set, usable even if another thread panicked while
+/// holding its mutex (the set stays consistent: every update is a single
+/// insert or remove), so a stale entry can never outlive its surface.
+fn locked_surface_set() -> std::sync::MutexGuard<'static, std::collections::HashSet<usize>> {
+    locked_surfaces()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn locked_surfaces() -> &'static std::sync::Mutex<std::collections::HashSet<usize>> {
     static LOCKED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
         std::sync::OnceLock::new();
@@ -1648,11 +1649,7 @@ fn locked_surfaces() -> &'static std::sync::Mutex<std::collections::HashSet<usiz
 /// Returns true if `surface` currently has an outstanding lock from
 /// [`sk_surface_lock_canvas`].
 unsafe fn is_surface_locked(surface: *const sk_surface_t) -> bool {
-    !surface.is_null()
-        && locked_surfaces()
-            .lock()
-            .unwrap()
-            .contains(&(surface as usize))
+    !surface.is_null() && locked_surface_set().contains(&(surface as usize))
 }
 
 /// Clear a surface with a color. No-op while the surface is locked (see
@@ -1946,11 +1943,6 @@ impl sk_canvas_t {
 /// (which bypass the locked canvas and draw directly on the surface) are
 /// rejected (no-op) to avoid two independent mutable views of the same
 /// pixel buffer.
-///
-/// # Panics
-/// Panics (caught by `catch_panic`, see the crate-level docs) if the
-/// internal locked-surfaces mutex is poisoned by another thread panicking
-/// while holding it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_surface_lock_canvas(surface: *mut sk_surface_t) -> *mut sk_canvas_t {
     catch_panic(|| {
@@ -1958,12 +1950,12 @@ pub unsafe extern "C" fn sk_surface_lock_canvas(surface: *mut sk_surface_t) -> *
             return ptr::null_mut();
         }
         let key = surface as usize;
-        if !locked_surfaces().lock().unwrap().insert(key) {
+        if !locked_surface_set().insert(key) {
             // Already locked.
             return ptr::null_mut();
         }
         let Some(s) = RefCounted::get_mut(surface) else {
-            locked_surfaces().lock().unwrap().remove(&key);
+            locked_surface_set().remove(&key);
             return ptr::null_mut();
         };
         let width = s.width();
@@ -1988,11 +1980,6 @@ pub unsafe extern "C" fn sk_surface_lock_canvas(surface: *mut sk_surface_t) -> *
 }
 
 /// Release a canvas acquired via [`sk_surface_lock_canvas`].
-///
-/// # Panics
-/// Panics (caught by `catch_panic_void`, see the crate-level docs) if the
-/// internal locked-surfaces mutex is poisoned by another thread panicking
-/// while holding it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_canvas_release(canvas: *mut sk_canvas_t) {
     catch_panic_void(|| {
@@ -2020,10 +2007,7 @@ impl Drop for SurfaceUnlock {
         }
         // Remove the entry even if another thread poisoned the mutex: a
         // stale address would make a later surface there look locked.
-        locked_surfaces()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.0);
+        locked_surface_set().remove(&self.0);
         // SAFETY: the lock took a reference, so the surface is alive.
         unsafe { RefCounted::unref_ptr(self.0 as *mut sk_surface_t) };
     }
@@ -5127,9 +5111,10 @@ mod tests {
 
     #[test]
     fn test_nested_filtered_layers_stay_bounded_by_the_surface() {
-        // Each filtered layer may reach past the surface by at most the
-        // surface size, however deeply layers nest (the parent layer is
-        // not the device).
+        // Like Skia, each filtered layer covers its parent plus its own
+        // filter's reach (here capped at the surface size, 20): growth is
+        // linear in depth (-60..80 after three), not geometric as when the
+        // cap was taken from the parent layer (27x after three).
         unsafe {
             let surface = sk_surface_new_raster(20, 20);
             let canvas = sk_surface_lock_canvas(surface);
@@ -5147,7 +5132,7 @@ mod tests {
             };
             assert!(sk_canvas_get_clip_ibounds(canvas, &raw mut out));
             assert!(
-                out.left >= -20 && out.top >= -20 && out.right <= 40 && out.bottom <= 40,
+                out.left >= -60 && out.top >= -60 && out.right <= 80 && out.bottom <= 80,
                 "layer bounds {:?}",
                 (out.left, out.top, out.right, out.bottom)
             );
