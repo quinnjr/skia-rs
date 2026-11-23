@@ -1994,3 +1994,30 @@ fn init_with_previous_seeds_only_the_hinted_content() {
         "the ring keeps the backdrop plus a faint halo, got {a}"
     );
 }
+
+#[test]
+fn draw_picture_maps_its_layer_bounds_through_the_matrix() {
+    // SkAutoCanvasMatrixPaint maps the picture's cull rect through the
+    // matrix for the implicit layer; otherwise a translated picture would
+    // fall outside the layer's content bounds and vanish.
+    use skia_rs_canvas::PictureRecorder;
+    use skia_rs_core::Matrix;
+
+    let mut recorder = PictureRecorder::new();
+    let rc = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, 20.0, 20.0));
+    rc.draw_rect(&Rect::from_xywh(0.0, 0.0, 20.0, 20.0), &white(Style::Fill));
+    let picture = recorder.finish_recording().expect("recorded");
+
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        let mut half = Paint::new();
+        half.set_color32(Color::from_argb(128, 0, 0, 0));
+        canvas.draw_picture(&picture, Some(&Matrix::translate(50.0, 50.0)), Some(&half));
+    }
+    let a = buffer.get_pixel(60, 60).map_or(0, |c| c.alpha());
+    assert!(
+        (120..=136).contains(&a),
+        "half-alpha picture at its new place, got {a}"
+    );
+}

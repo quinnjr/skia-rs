@@ -340,10 +340,9 @@ impl<'a> Canvas<'a> {
             let mut buffer = PixelBuffer::new(w, h);
             if rec.flags.contains(SaveLayerFlags::INIT_WITH_PREVIOUS) {
                 // kInitWithPrevious: the layer starts as a copy of what is
-                // under it.
-                // under it, over the content area only (Skia's layer
-                // device is the content bounds; the rest of the buffer is
-                // room for the filter's output).
+                // under it, over the content area only (Skia's layer device
+                // is the content bounds; the rest of the buffer is room for
+                // the filter's output).
                 self.copy_target_into(&mut buffer, (device_rect.left, device_rect.top), &content);
             }
             // Skia's layer device starts wide open (clipped only to its
@@ -1414,10 +1413,13 @@ impl<'a> Canvas<'a> {
         matrix: Option<&Matrix>,
         paint: Option<&Paint>,
     ) {
-        // SkCanvas::onDrawPicture: a non-null paint wraps the playback in an
-        // implicit saveLayer(bounds=cullRect, paint); otherwise a plain save.
+        // SkCanvas::onDrawPicture (SkAutoCanvasMatrixPaint): a non-null
+        // paint wraps the playback in an implicit saveLayer(bounds, paint),
+        // with the cull rect mapped through `matrix` (the layer is made
+        // before the matrix is concatenated); otherwise a plain save.
         let restore_count = if let Some(p) = paint {
-            let bounds = picture.cull_rect();
+            let cull = picture.cull_rect();
+            let bounds = matrix.map_or(cull, |m| m.map_rect(&cull));
             let rec = SaveLayerRec {
                 bounds: if bounds.is_empty() {
                     None
