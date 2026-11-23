@@ -1622,7 +1622,7 @@ impl<'a> Canvas<'a> {
             let mut rec = stroke_rec_from_paint(paint);
             // A filled glyph made bold is outlined with Skia's fake-bold
             // stroke defaults, not the paint's join/miter/cap.
-            let bold_fill = font.is_embolden() && rec == StrokeRec::Fill;
+            let bold_fill = font.is_embolden() && paint.style() == Style::Fill;
             if font.is_embolden() {
                 let extra = fake_bold_extra(font.size());
                 rec = match rec {
@@ -2316,12 +2316,11 @@ impl Canvas<'_> {
         let complex_paint = paint.path_effect().is_some()
             || paint.mask_filter().is_some()
             || paint.style() != skia_rs_paint::Style::Fill;
-        // A plain non-AA fill is the same rect by rect under any matrix
-        // (every pixel center lies in exactly one rect), so the boundary
-        // path, which is costly to build, is only used where it changes the
-        // output: effects, mask filters, strokes, and AA fills (rect-by-rect
-        // AA under a non-integer mapping would blend shared edges twice).
-        if complex_paint || (paint.is_anti_alias() && (non_translate || fractional_translate)) {
+        // Under a non-translate matrix even a plain aliased fill uses the
+        // boundary: rects meeting at T-junctions compute their shared edge
+        // from different endpoints, so after rotation the crossings can
+        // differ by an ulp and leave holes or double-blended pixels.
+        if non_translate || complex_paint || (paint.is_anti_alias() && fractional_translate) {
             let mut rects = skia_rs_path::PathBuilder::new();
             for rect in region.iter() {
                 rects.add_rect(&rect.to_rect());
