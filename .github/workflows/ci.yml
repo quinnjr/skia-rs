@@ -123,6 +123,11 @@ jobs:
       - name: Run doc tests
         run: cargo test --workspace --doc
 
+      # The serde feature (derives and deserialization validation) is off
+      # by default, so test it explicitly.
+      - name: Run serde feature tests
+        run: cargo test -p skia-rs-core -p skia-rs-path -p skia-rs-paint --features serde
+
   # ==========================================================================
   # MSRV Check (Minimum Supported Rust Version)
   # ==========================================================================
