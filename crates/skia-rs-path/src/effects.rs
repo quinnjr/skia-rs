@@ -426,8 +426,8 @@ impl DashEffect {
         let point_at = |d: Scalar| {
             let t = d / segment_length;
             Point::new(
-                (to.x - from.x).mul_add(t, from.x),
-                (to.y - from.y).mul_add(t, from.y),
+                crate::measure::lerp(from.x, to.x, t),
+                crate::measure::lerp(from.y, to.y, t),
             )
         };
         let mut pos: Scalar = 0.0;
@@ -1138,8 +1138,8 @@ impl PathEffect for DiscreteEffect {
 
                     for i in 1..=num_segments {
                         let t = scalar_from_i32(i) / scalar_from_i32(num_segments);
-                        let x = (end.x - current_pos.x).mul_add(t, current_pos.x);
-                        let y = (end.y - current_pos.y).mul_add(t, current_pos.y);
+                        let x = crate::measure::lerp(current_pos.x, end.x, t);
+                        let y = crate::measure::lerp(current_pos.y, end.y, t);
 
                         let dx = Self::random(seed) * self.deviation;
                         seed = seed.wrapping_add(1);

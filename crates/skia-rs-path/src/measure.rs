@@ -4,6 +4,17 @@ use crate::flatten::{flatten_conic_adaptive, flatten_cubic_adaptive, flatten_qua
 use crate::{Path, PathElement};
 use skia_rs_core::{Matrix, Point, Scalar};
 
+/// `a + (b - a) * t`, unfused like Skia's interpolation (`mul_add` rounds
+/// once and differs from Skia in the last bit).
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "unfused like Skia; mul_add rounds differently"
+)]
+pub(crate) fn lerp(a: Scalar, b: Scalar, t: Scalar) -> Scalar {
+    (b - a) * t + a
+}
+
 /// Tolerance used when flattening curves for length measurement.
 const FLATTEN_TOLERANCE: Scalar = 0.25;
 
@@ -82,8 +93,8 @@ impl PathMeasure {
             0.0
         };
         Some(Point::new(
-            (seg.end.x - seg.start.x).mul_add(t, seg.start.x),
-            (seg.end.y - seg.start.y).mul_add(t, seg.start.y),
+            lerp(seg.start.x, seg.end.x, t),
+            lerp(seg.start.y, seg.end.y, t),
         ))
     }
 
@@ -125,7 +136,10 @@ impl PathMeasure {
             0.0
         };
         let (dx, dy) = (seg.end.x - seg.start.x, seg.end.y - seg.start.y);
-        let pos = Point::new(dx.mul_add(t, seg.start.x), dy.mul_add(t, seg.start.y));
+        let pos = Point::new(
+            lerp(seg.start.x, seg.start.x + dx, t),
+            lerp(seg.start.y, seg.start.y + dy, t),
+        );
         let len = dx.hypot(dy);
         let tangent = if len > 0.0 {
             Point::new(dx / len, dy / len)
@@ -231,8 +245,8 @@ impl PathMeasure {
                     1.0
                 };
                 let p = Point::new(
-                    (seg.end.x - seg.start.x).mul_add(t1, seg.start.x),
-                    (seg.end.y - seg.start.y).mul_add(t1, seg.start.y),
+                    lerp(seg.start.x, seg.end.x, t1),
+                    lerp(seg.start.y, seg.end.y, t1),
                 );
                 builder.line_to(p.x, p.y);
             }
@@ -405,8 +419,8 @@ fn interpolate_at(contour: &Contour, offset: Scalar) -> Point {
         0.0
     };
     Point::new(
-        (seg.end.x - seg.start.x).mul_add(t, seg.start.x),
-        (seg.end.y - seg.start.y).mul_add(t, seg.start.y),
+        lerp(seg.start.x, seg.end.x, t),
+        lerp(seg.start.y, seg.end.y, t),
     )
 }
 
