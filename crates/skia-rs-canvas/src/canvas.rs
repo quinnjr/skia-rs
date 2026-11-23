@@ -1502,12 +1502,11 @@ impl<'a> Canvas<'a> {
             return;
         }
         let restore_count = if let Some(p) = paint {
+            // SkAutoCanvasMatrixPaint passes the mapped cull as the hint even
+            // when the matrix collapses it (an empty layer: nothing drawn).
+            // Only an empty cull itself means "unknown" (no hint).
             let rec = SaveLayerRec {
-                bounds: if bounds.is_empty() {
-                    None
-                } else {
-                    Some(&bounds)
-                },
+                bounds: if cull.is_empty() { None } else { Some(&bounds) },
                 paint: Some(p),
                 flags: SaveLayerFlags::NONE,
             };

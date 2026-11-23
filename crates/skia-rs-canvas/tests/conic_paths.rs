@@ -2136,11 +2136,18 @@ fn pictures_collapsed_by_their_matrix_draw_nothing() {
             lit(&buffer, 100, 100)
         };
     let collapse = Matrix::scale(0.0, 1.0);
+    // A one-op picture is played: without a paint its clip-filling draw
+    // shows; with a paint, SkAutoCanvasMatrixPaint's layer gets the
+    // collapsed (empty) cull as its bounds, so nothing shows.
+    assert!(
+        draw(&picture(1), Some(&collapse), None, None),
+        "one op: played"
+    );
+    assert!(
+        !draw(&picture(1), Some(&collapse), None, Some(&Paint::new())),
+        "one op with a paint: empty layer"
+    );
     for paint in [None, Some(Paint::new())] {
-        assert!(
-            draw(&picture(1), Some(&collapse), None, paint.as_ref()),
-            "one op: played"
-        );
         assert!(
             !draw(&picture(2), Some(&collapse), None, paint.as_ref()),
             "two ops: rejected"
