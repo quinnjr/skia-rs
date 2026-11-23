@@ -444,12 +444,15 @@ fn render_node(
     match &node.kind {
         SvgNodeKind::Rect(rect) => {
             let r = Rect::from_xywh(rect.x, rect.y, rect.width, rect.height);
-            if rect.rx > 0.0 || rect.ry > 0.0 {
+            // SVG clamps each radius to half the matching side.
+            let rx = rect.rx.min(rect.width / 2.0);
+            let ry = rect.ry.min(rect.height / 2.0);
+            if rx > 0.0 || ry > 0.0 {
                 if let Some(paint) = &fill_paint {
-                    canvas.draw_round_rect(&r, rect.rx, rect.ry, paint);
+                    canvas.draw_round_rect(&r, rx, ry, paint);
                 }
                 if let Some(paint) = &stroke_paint {
-                    canvas.draw_round_rect(&r, rect.rx, rect.ry, paint);
+                    canvas.draw_round_rect(&r, rx, ry, paint);
                 }
             } else {
                 if let Some(paint) = &fill_paint {
@@ -520,7 +523,9 @@ fn render_node(
             }
         }
         SvgNodeKind::Polygon(points) => {
-            if points.len() >= 3 {
+            // Two points still make a closed polygon (SkSVGPoly strokes it
+            // out and back); its fill covers no area.
+            if points.len() >= 2 {
                 let mut builder = PathBuilder::new();
                 builder.move_to(points[0].x, points[0].y);
                 for p in &points[1..] {
@@ -1022,6 +1027,29 @@ mod tests {
             pixels[off + 1],
             pixels[off + 2],
         ))
+    }
+
+    #[test]
+    fn rect_with_only_rx_rounds_both_radii() {
+        // ry missing is "auto": it takes rx, so the corner is rounded and
+        // the corner pixel keeps the white background.
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="80" height="80" rx="20" fill="red"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = |x: i32, y: i32| pixel_at(&surface, x, y).map_or(0, |c| c.green());
+        assert!(green(11, 11) > 200, "rounded corner left unfilled");
+        assert!(green(50, 50) < 50, "interior filled");
+    }
+
+    #[test]
+    fn two_point_polygons_are_stroked() {
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <polygon points="10,10 90,90" fill="none" stroke="red" stroke-width="6"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = pixel_at(&surface, 50, 50).map_or(255, |c| c.green());
+        assert!(green < 50, "the diagonal is stroked");
     }
 
     #[test]

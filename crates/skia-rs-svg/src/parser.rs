@@ -190,14 +190,31 @@ fn build_node(
     let mut node = match tag {
         "svg" => SvgNode::new(SvgNodeKind::Svg),
         "g" => SvgNode::new(SvgNodeKind::Group),
-        "rect" => SvgNode::new(SvgNodeKind::Rect(SvgRect {
-            x: hlen("x", "0"),
-            y: vlen("y", "0"),
-            width: hlen("width", "0"),
-            height: vlen("height", "0"),
-            rx: hlen("rx", "0"),
-            ry: vlen("ry", "0"),
-        })),
+        "rect" => {
+            // SVG: a missing (or negative) rx/ry is "auto", taking the
+            // other radius (SkSVGRect::resolve).
+            let rx = attrs
+                .contains_key("rx")
+                .then(|| hlen("rx", "0"))
+                .filter(|r| *r >= 0.0);
+            let ry = attrs
+                .contains_key("ry")
+                .then(|| vlen("ry", "0"))
+                .filter(|r| *r >= 0.0);
+            let (rx, ry) = match (rx, ry) {
+                (Some(rx), Some(ry)) => (rx, ry),
+                (Some(r), None) | (None, Some(r)) => (r, r),
+                (None, None) => (0.0, 0.0),
+            };
+            SvgNode::new(SvgNodeKind::Rect(SvgRect {
+                x: hlen("x", "0"),
+                y: vlen("y", "0"),
+                width: hlen("width", "0"),
+                height: vlen("height", "0"),
+                rx,
+                ry,
+            }))
+        }
         "circle" => SvgNode::new(SvgNodeKind::Circle(SvgCircle {
             cx: hlen("cx", "0"),
             cy: vlen("cy", "0"),
