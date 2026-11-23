@@ -797,8 +797,9 @@ void sk_surface_draw_line(sk_surface_t *surface,
 
 // Acquire a canvas borrowed from the given surface.
 //
-// The returned canvas is valid until [`sk_canvas_release`] is called and
-// must not outlive `surface`. Only one canvas may be held per surface at
+// The returned canvas is valid until [`sk_canvas_release`] is called. It
+// holds a reference to `surface` until then, so unreffing the surface
+// while it is locked does not free it under the canvas. Only one canvas may be held per surface at
 // a time — attempting to lock twice returns null. While a surface is
 // locked, the `sk_surface_draw_*`/`sk_surface_clear` convenience helpers
 // (which bypass the locked canvas and draw directly on the surface) are

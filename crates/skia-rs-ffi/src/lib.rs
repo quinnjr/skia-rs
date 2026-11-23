@@ -1932,8 +1932,9 @@ impl sk_canvas_t {
 
 /// Acquire a canvas borrowed from the given surface.
 ///
-/// The returned canvas is valid until [`sk_canvas_release`] is called and
-/// must not outlive `surface`. Only one canvas may be held per surface at
+/// The returned canvas is valid until [`sk_canvas_release`] is called. It
+/// holds a reference to `surface` until then, so unreffing the surface
+/// while it is locked does not free it under the canvas. Only one canvas may be held per surface at
 /// a time — attempting to lock twice returns null. While a surface is
 /// locked, the `sk_surface_draw_*`/`sk_surface_clear` convenience helpers
 /// (which bypass the locked canvas and draw directly on the surface) are
@@ -1962,6 +1963,9 @@ pub unsafe extern "C" fn sk_surface_lock_canvas(surface: *mut sk_surface_t) -> *
         let width = s.width();
         let height = s.height();
         let buffer: *mut PixelBuffer = s.pixel_buffer_mut();
+        // Keep the surface alive while locked: the canvas draws into its
+        // buffer, and release may composite open layers into it.
+        RefCounted::ref_ptr(surface);
         Box::into_raw(Box::new(sk_canvas_t {
             buffer,
             width,
@@ -1988,15 +1992,32 @@ pub unsafe extern "C" fn sk_canvas_release(canvas: *mut sk_canvas_t) {
     catch_panic_void(|| {
         if !canvas.is_null() {
             let mut c = Box::from_raw(canvas);
+            // Unlocks the surface and drops the canvas's reference to it
+            // even if compositing below panics.
+            let _unlock = SurfaceUnlock(c.locked_surface);
             // Like ~SkCanvas: unwind open saves, compositing open layers.
             while !c.state.stack.is_empty() {
                 c.restore_one();
             }
-            if c.locked_surface != 0 {
-                locked_surfaces().lock().unwrap().remove(&c.locked_surface);
-            }
         }
     });
+}
+
+/// Releases a locked surface on drop: removes its [`LOCKED_SURFACES`] entry
+/// and the reference [`sk_surface_lock_canvas`] took. 0 means no surface.
+struct SurfaceUnlock(usize);
+
+impl Drop for SurfaceUnlock {
+    fn drop(&mut self) {
+        if self.0 == 0 {
+            return;
+        }
+        if let Ok(mut locked) = locked_surfaces().lock() {
+            locked.remove(&self.0);
+        }
+        // SAFETY: the lock took a reference, so the surface is alive.
+        unsafe { RefCounted::unref_ptr(self.0 as *mut sk_surface_t) };
+    }
 }
 
 /// Get the width of the canvas.
@@ -2272,13 +2293,16 @@ pub unsafe extern "C" fn sk_canvas_get_clip_ibounds(
         let Some(dst) = out.as_mut() else {
             return false;
         };
+        // Inside a layer the transient canvas is in the layer's pixels:
+        // shift back to device space, as getDeviceClipBounds reports.
+        let (_, (ox, oy)) = c.target();
         let inner = c.canvas_with_state();
         let bounds = inner.clip_bounds();
         *dst = sk_irect_t {
-            left: skia_rs_core::cast::floor_to_i32(bounds.left),
-            top: skia_rs_core::cast::floor_to_i32(bounds.top),
-            right: skia_rs_core::cast::ceil_to_i32(bounds.right),
-            bottom: skia_rs_core::cast::ceil_to_i32(bounds.bottom),
+            left: skia_rs_core::cast::floor_to_i32(bounds.left) + ox,
+            top: skia_rs_core::cast::floor_to_i32(bounds.top) + oy,
+            right: skia_rs_core::cast::ceil_to_i32(bounds.right) + ox,
+            bottom: skia_rs_core::cast::ceil_to_i32(bounds.bottom) + oy,
         };
         true
     })
@@ -5032,6 +5056,45 @@ mod tests {
                 (126..=130).contains(&a),
                 "the open layer was composited: {a}"
             );
+            sk_surface_unref(surface);
+        }
+    }
+
+    #[test]
+    fn test_canvas_clip_ibounds_are_in_device_space_inside_a_layer() {
+        unsafe {
+            let surface = sk_surface_new_raster(20, 20);
+            let canvas = sk_surface_lock_canvas(surface);
+            let r = rect(2.0, 3.0, 10.0, 12.0);
+            assert!(sk_canvas_clip_rect(canvas, &raw const r, 1, false));
+            sk_canvas_save_layer(canvas, ptr::null(), ptr::null());
+            let mut out = sk_irect_t {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            assert!(sk_canvas_get_clip_ibounds(canvas, &raw mut out));
+            assert_eq!((out.left, out.top, out.right, out.bottom), (2, 3, 10, 12));
+            sk_canvas_release(canvas);
+            sk_surface_unref(surface);
+        }
+    }
+
+    #[test]
+    fn test_locked_canvas_keeps_its_surface_alive() {
+        // The lock holds a reference, so unreffing the surface while it is
+        // locked cannot free the buffer release composites into.
+        unsafe {
+            let surface = sk_surface_new_raster(20, 20);
+            let canvas = sk_surface_lock_canvas(surface);
+            assert_eq!(sk_surface_get_refcnt(surface), 2);
+            sk_canvas_release(canvas);
+            assert_eq!(sk_surface_get_refcnt(surface), 1);
+            // Relocking works: the lock entry was removed.
+            let again = sk_surface_lock_canvas(surface);
+            assert!(!again.is_null());
+            sk_canvas_release(again);
             sk_surface_unref(surface);
         }
     }
