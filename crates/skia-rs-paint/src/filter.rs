@@ -413,13 +413,22 @@ pub trait ImageFilter: Send + Sync + std::fmt::Debug {
     /// the default, for filters without geometric parameters or inputs
     /// (every built-in filter that has either overrides this).
     ///
-    /// Filters run on device-space layer pixels here. That matches Skia for
-    /// scale/translate and quarter-turn matrices. Skia additionally
-    /// decomposes other matrices (`skif::Mapping::decomposeCTM`), filtering
-    /// in a scale-only (or, for matrix convolution and lighting,
-    /// translate-only) layer space and resampling the result. That is not
-    /// done here, so anisotropic filters under arbitrary rotation or skew,
-    /// and matrix-convolution kernels under scale, differ from Skia.
+    /// Filters run on device-space layer pixels here, while Skia decomposes
+    /// the matrix (`skif::Mapping::decomposeCTM`) and filters in a
+    /// scale-only (or, for matrix convolution and lighting, translate-only)
+    /// layer space, resampling the result. The mapping here matches Skia:
+    /// - blur, drop shadow, morphology, offset, tile, color filter and the
+    ///   combining filters: under scale/translate and quarter turns;
+    /// - matrix convolution: under translate and axis-permuting matrices
+    ///   (quarter turns, mirrors) at unit scale (the kernel is re-oriented,
+    ///   not resampled);
+    /// - lighting: under translate and quarter turns at unit scale (under
+    ///   scale, normals come from device pixels rather than resampled ones);
+    /// - displacement map: under translate and positive uniform scale (one
+    ///   signed scale for both axes cannot express rotations or mirrors).
+    ///
+    /// Anisotropic filters under other rotations or skews are fitted to the
+    /// nearest axes.
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         let _ = matrix;
         None
@@ -471,6 +480,14 @@ fn input_of(input: Option<&ImageFilterRef>, rect: &Rect) -> Rect {
 /// Maps an optional input filter.
 fn map_input(input: Option<&ImageFilterRef>, matrix: &Matrix) -> Option<ImageFilterRef> {
     input.map(|f| map_image_filter(f, matrix))
+}
+
+/// The uniform scale of `matrix`'s linear part (`sqrt(|det|)`).
+fn linear_scale(matrix: &Matrix) -> Scalar {
+    let v = &matrix.values;
+    (v[Matrix::SCALE_X] * v[Matrix::SCALE_Y] - v[Matrix::SKEW_X] * v[Matrix::SKEW_Y])
+        .abs()
+        .sqrt()
 }
 
 /// Maps a vector (an offset) through the linear part of `matrix`.
@@ -1318,7 +1335,8 @@ pub enum LightType {
 impl LightType {
     /// The light mapped into layer space, like `SkLight::transform`: light
     /// positions map as points with z the average of the mapped (z, z)
-    /// vector; a distant light's direction maps as a vector, z unchanged.
+    /// vector. A distant light's direction turns with the matrix but keeps
+    /// its x/y length and z, so its elevation does not change.
     fn mapped(&self, matrix: &Matrix) -> Self {
         let map_point3 = |(x, y, z): (Scalar, Scalar, Scalar)| {
             let p = matrix.map_point(skia_rs_core::Point::new(x, y));
@@ -1328,8 +1346,14 @@ impl LightType {
         match *self {
             Self::Distant { direction } => {
                 let (dx, dy) = map_vector(matrix, direction.0, direction.1);
+                let (len, mapped_len) = (direction.0.hypot(direction.1), dx.hypot(dy));
+                let k = if mapped_len > 0.0 {
+                    len / mapped_len
+                } else {
+                    0.0
+                };
                 Self::Distant {
-                    direction: (dx, dy, direction.2),
+                    direction: (dx * k, dy * k, direction.2),
                 }
             }
             Self::Point { location } => Self::Point {
@@ -1411,7 +1435,10 @@ impl ImageFilter for LightingImageFilter {
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         Some(Arc::new(Self {
             light: self.light.mapped(matrix),
-            surface_scale: self.surface_scale,
+            // Normals come from device-resolution pixels: a local slope is
+            // spread over `scale` device pixels, so scale the heights to
+            // keep it.
+            surface_scale: self.surface_scale * linear_scale(matrix),
             diffuse_constant: self.diffuse_constant,
             specular_constant: self.specular_constant,
             specular_exponent: self.specular_exponent,
@@ -1784,13 +1811,72 @@ impl MatrixConvolutionImageFilter {
     }
 }
 
+impl MatrixConvolutionImageFilter {
+    /// The kernel (size, values, offset) as seen in device space under an
+    /// axis-permuting `matrix`: each tap's offset from the kernel origin is
+    /// mapped by the signs/permutation of the linear part. Other matrices
+    /// leave the kernel unchanged.
+    #[allow(clippy::float_cmp, reason = "exact zero tests for an axis permutation")]
+    fn reoriented(&self, matrix: &Matrix) -> ((i32, i32), Vec<Scalar>, (i32, i32)) {
+        let unchanged = (self.kernel_size, self.kernel.clone(), self.kernel_offset);
+        let values = &matrix.values;
+        let (scale_x, skew_x, skew_y, scale_y) = (
+            values[Matrix::SCALE_X],
+            values[Matrix::SKEW_X],
+            values[Matrix::SKEW_Y],
+            values[Matrix::SCALE_Y],
+        );
+        let sign = |t: Scalar| if t < 0.0 { -1 } else { 1 };
+        let (kw, kh) = self.kernel_size;
+        let len = usize::try_from(kw.max(0) * kh.max(0)).unwrap_or(0);
+        if kw <= 0 || kh <= 0 || self.kernel.len() < len || matrix.has_perspective() {
+            return unchanged;
+        }
+        // Device tap offset (u', v') from a local one (u, v).
+        let map: Box<dyn Fn(i32, i32) -> (i32, i32)> =
+            if skew_x == 0.0 && skew_y == 0.0 && scale_x != 0.0 && scale_y != 0.0 {
+                let (sx, sy) = (sign(scale_x), sign(scale_y));
+                Box::new(move |u, w| (sx * u, sy * w))
+            } else if scale_x == 0.0 && scale_y == 0.0 && skew_x != 0.0 && skew_y != 0.0 {
+                let (sx, sy) = (sign(skew_x), sign(skew_y));
+                Box::new(move |u, w| (sx * w, sy * u))
+            } else {
+                return unchanged;
+            };
+        let (ox, oy) = self.kernel_offset;
+        let taps: Vec<((i32, i32), Scalar)> = (0..kh)
+            .flat_map(|ky| (0..kw).map(move |kx| (kx, ky)))
+            .map(|(kx, ky)| {
+                let value = self.kernel[usize::try_from(ky * kw + kx).unwrap_or(0)];
+                (map(kx - ox, ky - oy), value)
+            })
+            .collect();
+        let min_u = taps.iter().map(|t| t.0.0).min().unwrap_or(0);
+        let min_v = taps.iter().map(|t| t.0.1).min().unwrap_or(0);
+        let max_u = taps.iter().map(|t| t.0.0).max().unwrap_or(0);
+        let max_v = taps.iter().map(|t| t.0.1).max().unwrap_or(0);
+        let (nw, nh) = (max_u - min_u + 1, max_v - min_v + 1);
+        let mut kernel = vec![0.0; usize::try_from(nw * nh).unwrap_or(0)];
+        for ((u, w), value) in taps {
+            let index = usize::try_from((w - min_v) * nw + (u - min_u)).unwrap_or(0);
+            kernel[index] = value;
+        }
+        ((nw, nh), kernel, (-min_u, -min_v))
+    }
+}
+
 impl ImageFilter for MatrixConvolutionImageFilter {
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
-        // Skia does not scale the kernel (it is in layer pixels); only the
-        // input maps.
-        let input = self.input.as_ref()?;
+        // Skia runs the kernel in a translate-only layer space and resamples.
+        // Here the kernel is re-oriented for axis-permuting matrices
+        // (quarter turns, mirrors), which is exact at unit scale; it is not
+        // scaled.
+        let (kernel_size, kernel, kernel_offset) = self.reoriented(matrix);
         Some(Arc::new(Self {
-            input: Some(map_image_filter(input, matrix)),
+            kernel_size,
+            kernel,
+            kernel_offset,
+            input: map_input(self.input.as_ref(), matrix),
             ..self.clone()
         }))
     }
@@ -2706,6 +2792,54 @@ mod tests {
             debug.contains("sigma_x: 20.0") && debug.contains("sigma_y: 0.0"),
             "{debug}"
         );
+    }
+
+    #[test]
+    fn convolution_kernels_reorient_under_quarter_turns() {
+        // A horizontal 3x1 edge kernel under rotate(90) is vertical on
+        // screen: local tap offset (u, v) maps to device (-v, u).
+        let conv: ImageFilterRef = Arc::new(MatrixConvolutionImageFilter::new(
+            (3, 1),
+            vec![1.0, 0.0, -1.0],
+            1.0,
+            0.0,
+            (1, 0),
+            crate::shader::TileMode::Decal,
+            true,
+            None,
+        ));
+        let mapped = map_image_filter(&conv, &Matrix::rotate(90.0_f32.to_radians()));
+        let debug = format!("{mapped:?}");
+        assert!(debug.contains("kernel_size: (1, 3)"), "{debug}");
+        assert!(debug.contains("kernel: [1.0, 0.0, -1.0]"), "{debug}");
+        assert!(debug.contains("kernel_offset: (0, 1)"), "{debug}");
+    }
+
+    #[test]
+    fn distant_lights_keep_their_elevation() {
+        // Under scale a distant light keeps its direction; under a quarter
+        // turn it turns with the content.
+        let light = LightType::Distant {
+            direction: (1.0, 0.0, 1.0),
+        };
+        let scaled = light.mapped(&Matrix::scale(2.0, 2.0));
+        assert!(matches!(scaled, LightType::Distant { direction } if direction == (1.0, 0.0, 1.0)));
+        // The surface scale follows the matrix's scale (normals come from
+        // device pixels).
+        let lighting: ImageFilterRef = Arc::new(LightingImageFilter::diffuse(
+            light.clone(),
+            1.5,
+            1.0,
+            Color4f::new(1.0, 1.0, 1.0, 1.0),
+            None,
+        ));
+        let debug = format!(
+            "{:?}",
+            map_image_filter(&lighting, &Matrix::scale(2.0, 2.0))
+        );
+        assert!(debug.contains("surface_scale: 3.0"), "{debug}");
+        let turned = light.mapped(&Matrix::rotate(90.0_f32.to_radians()));
+        assert!(matches!(turned, LightType::Distant { direction } if direction == (0.0, 1.0, 1.0)));
     }
 
     #[test]
