@@ -428,7 +428,10 @@ jobs:
               os=$(echo "$backend_os" | cut -d'-' -f2-)
 
               report="$dir/conformance_results/report.txt"
-              if [ ! -f "$report" ]; then
+              if [ "$backend" != "raster" ] || [ "$os" != "ubuntu-latest" ]; then
+                # Images are generated for raster and compared on Ubuntu only.
+                status="➖ Not compared (raster on Ubuntu only)"
+              elif [ ! -f "$report" ]; then
                 status="⚠️ No results"
               elif grep -q '^FAIL ' "$report"; then
                 status="❌ Diverged"
