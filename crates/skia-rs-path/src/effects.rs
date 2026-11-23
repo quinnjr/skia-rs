@@ -100,6 +100,16 @@ pub trait PathEffect: Send + Sync + std::fmt::Debug {
         self.filter_path(path, rec)
     }
 
+    /// Whether this effect's culling only drops output Skia's own culling
+    /// would drop, so its result under a cull is still exactly what an
+    /// outer effect (e.g. in a [`ComposeEffect`]) should measure. Dashing
+    /// culls like `SkDashPath` (phase-preserving, as Skia passes the cull
+    /// to an inner dash); the 2D effects' culling is an extra optimization
+    /// Skia does not do. The default (`false`) is safe for any effect.
+    fn cull_is_exact(&self) -> bool {
+        false
+    }
+
     /// Get the kind of path effect for debugging.
     fn effect_kind(&self) -> PathEffectKind;
 }
@@ -483,6 +493,10 @@ impl PathEffect for DashEffect {
 
     fn apply(&self, path: &Path) -> Option<Path> {
         self.dash(path, DASH_FLATTEN_TOLERANCE)
+    }
+
+    fn cull_is_exact(&self) -> bool {
+        true
     }
 
     fn effect_kind(&self) -> PathEffectKind {
@@ -1373,11 +1387,16 @@ impl PathEffect for ComposeEffect {
         res_scale: Scalar,
     ) -> Option<Path> {
         // The outer effect measures the inner one's output (dash phase,
-        // trim lengths, stamp spacing), so the inner effect must produce its
-        // full, unculled geometry; only the outer one may cull.
-        // (The inner effect still gets the resolution scale: it only
-        // refines flattening, never removes geometry.)
-        let intermediate = self.inner.filter_path_culled(path, rec, None, res_scale);
+        // trim lengths, stamp spacing). Skia passes the cull to both, which
+        // is exact for an inner dash (SkDashPath trims phase-preservingly,
+        // and must, to stay under kMaxDashCount); an inner effect whose
+        // culling Skia would not do gets no cull, so the outer one sees its
+        // full geometry. (The resolution scale always passes through: it
+        // only refines flattening.)
+        let inner_cull = cull.filter(|_| self.inner.cull_is_exact());
+        let intermediate = self
+            .inner
+            .filter_path_culled(path, rec, inner_cull, res_scale);
         self.outer
             .filter_path_culled(intermediate.as_ref().unwrap_or(path), rec, cull, res_scale)
     }
@@ -1385,6 +1404,10 @@ impl PathEffect for ComposeEffect {
     fn apply(&self, path: &Path) -> Option<Path> {
         let intermediate = self.inner.apply(path);
         self.outer.apply(intermediate.as_ref().unwrap_or(path))
+    }
+
+    fn cull_is_exact(&self) -> bool {
+        self.inner.cull_is_exact() && self.outer.cull_is_exact()
     }
 
     fn effect_kind(&self) -> PathEffectKind {
@@ -1447,6 +1470,10 @@ impl PathEffect for SumEffect {
 
     fn apply(&self, path: &Path) -> Option<Path> {
         Self::combine(self.first.apply(path), self.second.apply(path))
+    }
+
+    fn cull_is_exact(&self) -> bool {
+        self.first.cull_is_exact() && self.second.cull_is_exact()
     }
 
     fn effect_kind(&self) -> PathEffectKind {
@@ -3153,6 +3180,36 @@ mod tests {
             })
             .collect();
         assert!(starts.iter().all(|p| p.x.hypot(p.y) > 1e-3), "{starts:?}");
+    }
+
+    #[test]
+    fn compose_passes_the_cull_to_an_inner_dash() {
+        // Skia gives an inner dash the cull, which trims a very long line to
+        // the visible part before kMaxDashCount is checked. Without it the
+        // dash fails and the outer effect gets the undashed line.
+        let dash: PathEffectRef = Arc::new(DashEffect::new(vec![1.0, 1.0], 0.0).unwrap());
+        let corner: PathEffectRef = Arc::new(CornerEffect::new(2.0).unwrap());
+        let composed = ComposeEffect::new(corner, dash);
+        let mut b = PathBuilder::new();
+        b.move_to(-5e7, 50.0).line_to(5e7, 50.0);
+        let cull = skia_rs_core::Rect::new(0.0, 0.0, 100.0, 100.0);
+        let mut rec = StrokeRec::Stroke(1.0);
+        let out = composed
+            .filter_path_culled(&b.build(), &mut rec, Some(&cull), 1.0)
+            .expect("applies");
+        let dashes = out
+            .iter()
+            .filter(|e| matches!(e, PathElement::Move(_)))
+            .count();
+        assert!(
+            dashes > 10,
+            "the visible part is dashed ({dashes} subpaths)"
+        );
+
+        // 2D effects' culling is not exact, so they still get no cull as an
+        // inner effect (checked by compose_does_not_cull_the_inner_effect).
+        let hatch = Line2DEffect::new(1.0, skia_rs_core::Matrix::scale(4.0, 4.0)).unwrap();
+        assert!(!hatch.cull_is_exact());
     }
 
     #[test]
