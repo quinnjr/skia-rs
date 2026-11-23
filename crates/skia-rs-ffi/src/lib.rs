@@ -2309,11 +2309,22 @@ pub unsafe extern "C" fn sk_canvas_get_clip_ibounds(
         let (_, (ox, oy)) = c.target();
         let inner = c.canvas_with_state();
         let bounds = inner.clip_bounds();
-        *dst = sk_irect_t {
-            left: skia_rs_core::cast::floor_to_i32(bounds.left) + ox,
-            top: skia_rs_core::cast::floor_to_i32(bounds.top) + oy,
-            right: skia_rs_core::cast::ceil_to_i32(bounds.right) + ox,
-            bottom: skia_rs_core::cast::ceil_to_i32(bounds.bottom) + oy,
+        // An empty clip is (0, 0, 0, 0), as getDeviceClipBounds reports it,
+        // not a zero-size rect at the layer origin.
+        *dst = if bounds.is_empty() {
+            sk_irect_t {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            }
+        } else {
+            sk_irect_t {
+                left: skia_rs_core::cast::floor_to_i32(bounds.left) + ox,
+                top: skia_rs_core::cast::floor_to_i32(bounds.top) + oy,
+                right: skia_rs_core::cast::ceil_to_i32(bounds.right) + ox,
+                bottom: skia_rs_core::cast::ceil_to_i32(bounds.bottom) + oy,
+            }
         };
         true
     })
@@ -5140,6 +5151,29 @@ mod tests {
             sk_canvas_release(canvas);
             sk_paint_unref(paint);
             sk_imagefilter_unref(blur);
+            sk_surface_unref(surface);
+        }
+    }
+
+    #[test]
+    fn test_canvas_empty_clip_inside_a_layer_is_all_zero() {
+        unsafe {
+            let surface = sk_surface_new_raster(20, 20);
+            let canvas = sk_surface_lock_canvas(surface);
+            let outer = rect(5.0, 5.0, 15.0, 15.0);
+            assert!(sk_canvas_clip_rect(canvas, &raw const outer, 1, false));
+            sk_canvas_save_layer(canvas, ptr::null(), ptr::null());
+            let miss = rect(100.0, 100.0, 110.0, 110.0);
+            assert!(sk_canvas_clip_rect(canvas, &raw const miss, 1, false));
+            let mut out = sk_irect_t {
+                left: 1,
+                top: 1,
+                right: 1,
+                bottom: 1,
+            };
+            sk_canvas_get_clip_ibounds(canvas, &raw mut out);
+            assert_eq!((out.left, out.top, out.right, out.bottom), (0, 0, 0, 0));
+            sk_canvas_release(canvas);
             sk_surface_unref(surface);
         }
     }
