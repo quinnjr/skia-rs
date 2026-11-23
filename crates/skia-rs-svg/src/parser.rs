@@ -523,14 +523,20 @@ pub fn parse_length(s: &str) -> Scalar {
 fn is_length(s: &str) -> bool {
     const UNITS: &[&str] = &[
         "vmin", "vmax", "rem", "px", "pt", "pc", "em", "ex", "ch", "vw", "vh", "cm", "mm", "in",
-        "%",
     ];
-    // Exactly as parse_length reads it: no space between number and unit.
+    // Exactly as LengthContext::resolve reads it: a percentage may have
+    // space before the `%`; any other unit must follow the number directly
+    // (parse_length).
     let s = s.trim();
-    let number = UNITS
-        .iter()
-        .find_map(|unit| s.strip_suffix(unit))
-        .unwrap_or(s);
+    let number = s.strip_suffix('%').map_or_else(
+        || {
+            UNITS
+                .iter()
+                .find_map(|unit| s.strip_suffix(unit))
+                .unwrap_or(s)
+        },
+        str::trim,
+    );
     number.parse::<Scalar>().is_ok_and(Scalar::is_finite)
 }
 

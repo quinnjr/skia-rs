@@ -1082,6 +1082,18 @@ mod tests {
     }
 
     #[test]
+    fn rect_radius_with_a_spaced_percent_is_a_length() {
+        // "5 %" reads as 5% (as width="50 %" does), so rx is given: 5% of
+        // 100 = 5 against ry 20, a corner much less round than auto (20).
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="80" height="80" rx="5 %" ry="20" fill="red"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = pixel_at(&surface, 13, 13).map_or(0, |c| c.green());
+        assert!(green < 50, "rx = 5: (13, 13) is inside the shallow corner");
+    }
+
+    #[test]
     fn rects_with_negative_size_are_not_drawn() {
         let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
             <rect x="50" y="10" width="-40" height="40" rx="5" fill="red"/>
