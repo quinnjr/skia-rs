@@ -397,6 +397,13 @@ pub trait ImageFilter: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Whether the filter turns transparent black into something visible
+    /// (`SkImageFilter_Base::affectsTransparentBlack`): its output then
+    /// covers the whole clip, not just the layer's content.
+    fn affects_transparent_black(&self) -> bool {
+        false
+    }
+
     /// The area of the source this filter reads to produce `output` (both
     /// in layer space), like `SkImageFilter_Base::onGetInputLayerBounds`:
     /// a layer with this filter must hold it. The default mirrors
@@ -469,6 +476,17 @@ fn spread_input(spread: &Rect, output: &Rect) -> Rect {
     } else {
         *output
     }
+}
+
+/// Whether a color filter turns transparent black into something visible.
+#[must_use]
+pub fn color_filter_affects_transparent_black(filter: &dyn ColorFilter) -> bool {
+    filter.filter_color(Color4f::new(0.0, 0.0, 0.0, 0.0)).a > 0.0
+}
+
+/// Whether an optional input affects transparent black.
+fn input_affects(input: Option<&ImageFilterRef>) -> bool {
+    input.is_some_and(|f| f.affects_transparent_black())
 }
 
 /// What an optional input filter reads for `rect` (`None` is the source
@@ -1069,6 +1087,11 @@ impl ColorFilterImageFilter {
 }
 
 impl ImageFilter for ColorFilterImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        input_affects(self.input.as_ref())
+            || color_filter_affects_transparent_black(self.color_filter.as_ref())
+    }
+
     fn input_bounds(&self, output: &Rect) -> Rect {
         input_of(self.input.as_ref(), output)
     }
@@ -1216,8 +1239,9 @@ impl ImageFilter for DisplacementMapImageFilter {
     }
 
     fn filter_bounds(&self, src: &Rect) -> Rect {
-        // Displacement can move pixels by up to scale/2 in each direction
-        let offset = self.scale / 2.0;
+        // Displacement can move pixels by up to |scale|/2 in each direction
+        // (a negative scale moves them the other way, not less).
+        let offset = self.scale.abs() / 2.0;
         Rect::new(
             src.left - offset,
             src.top - offset,
@@ -1564,6 +1588,10 @@ impl ComposeImageFilter {
 }
 
 impl ImageFilter for ComposeImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        self.outer.affects_transparent_black() || self.inner.affects_transparent_black()
+    }
+
     fn input_bounds(&self, output: &Rect) -> Rect {
         // The inner filter produces what the outer one reads.
         self.inner.input_bounds(&self.outer.input_bounds(output))
@@ -1618,6 +1646,10 @@ impl MergeImageFilter {
 }
 
 impl ImageFilter for MergeImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        self.inputs.iter().any(|i| input_affects(i.as_ref()))
+    }
+
     fn input_bounds(&self, output: &Rect) -> Rect {
         self.inputs
             .iter()
@@ -1831,8 +1863,15 @@ impl MatrixConvolutionImageFilter {
         );
         let sign = |t: Scalar| if t < 0.0 { -1 } else { 1 };
         let (kw, kh) = self.kernel_size;
-        let len = usize::try_from(kw.max(0) * kh.max(0)).unwrap_or(0);
-        if kw <= 0 || kh <= 0 || self.kernel.len() < len || matrix.has_perspective() {
+        // Checked: a bogus kernel size must not overflow or allocate.
+        let len = usize::try_from(kw)
+            .ok()
+            .zip(usize::try_from(kh).ok())
+            .and_then(|(w, h)| w.checked_mul(h));
+        let Some(len) = len else {
+            return unchanged;
+        };
+        if kw <= 0 || kh <= 0 || self.kernel.len() != len || matrix.has_perspective() {
             return unchanged;
         }
         // Device tap offset (u', v') from a local one (u, v).
@@ -2150,6 +2189,10 @@ impl BlendImageFilter {
 }
 
 impl ImageFilter for BlendImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        input_affects(self.background.as_ref()) || input_affects(self.foreground.as_ref())
+    }
+
     fn input_bounds(&self, output: &Rect) -> Rect {
         input_of(self.background.as_ref(), output)
             .union(&input_of(self.foreground.as_ref(), output))
@@ -2250,6 +2293,13 @@ impl ArithmeticImageFilter {
 }
 
 impl ImageFilter for ArithmeticImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        // k4 is added to every pixel, transparent ones included.
+        self.k4 > 0.0
+            || input_affects(self.background.as_ref())
+            || input_affects(self.foreground.as_ref())
+    }
+
     fn input_bounds(&self, output: &Rect) -> Rect {
         input_of(self.background.as_ref(), output)
             .union(&input_of(self.foreground.as_ref(), output))
@@ -2857,6 +2907,58 @@ mod tests {
         }
         let turned = light.mapped(&Matrix::rotate(90.0_f32.to_radians()));
         assert!(matches!(turned, LightType::Distant { direction } if direction == (0.0, 1.0, 1.0)));
+    }
+
+    #[test]
+    fn filters_report_whether_they_affect_transparent_black() {
+        let mut add_alpha = [0.0; 20];
+        for i in 0..4 {
+            add_alpha[i * 5 + i] = 1.0;
+        }
+        add_alpha[19] = 1.0;
+        let cf: ColorFilterRef = Arc::new(ColorMatrixFilter::new(add_alpha));
+        assert!(ColorFilterImageFilter::new(cf, None).affects_transparent_black());
+        let identity: ColorFilterRef = Arc::new(ColorMatrixFilter::identity());
+        assert!(!ColorFilterImageFilter::new(identity, None).affects_transparent_black());
+        let blur = BlurImageFilter::new(2.0, 2.0, crate::shader::TileMode::Decal);
+        assert!(!blur.affects_transparent_black());
+    }
+
+    #[test]
+    fn negative_displacement_scales_reach_as_far_as_positive_ones() {
+        let map: ImageFilterRef = Arc::new(OffsetImageFilter::new(0.0, 0.0, None));
+        let r = Rect::new(0.0, 0.0, 10.0, 10.0);
+        for scale in [20.0, -20.0] {
+            let f = DisplacementMapImageFilter::new(
+                ColorChannel::R,
+                ColorChannel::G,
+                scale,
+                Arc::clone(&map),
+                None,
+            );
+            assert_eq!(
+                f.filter_bounds(&r),
+                Rect::new(-10.0, -10.0, 20.0, 20.0),
+                "{scale}"
+            );
+        }
+    }
+
+    #[test]
+    fn bogus_convolution_kernel_sizes_do_not_overflow() {
+        let conv: ImageFilterRef = Arc::new(MatrixConvolutionImageFilter::new(
+            (65536, 65536),
+            vec![1.0],
+            1.0,
+            0.0,
+            (0, 0),
+            crate::shader::TileMode::Decal,
+            true,
+            None,
+        ));
+        // Mapping (done for every layer) leaves the bogus kernel alone.
+        let mapped = map_image_filter(&conv, &Matrix::rotate(90.0_f32.to_radians()));
+        assert!(format!("{mapped:?}").contains("kernel_size: (65536, 65536)"));
     }
 
     #[test]
