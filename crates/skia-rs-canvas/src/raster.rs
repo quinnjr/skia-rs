@@ -169,13 +169,48 @@ impl PixelBuffer {
             return;
         }
 
-        // `src` is premultiplied: coverage attenuates all four channels.
         let cov = skia_rs_core::cast::f32_to_u8_sat(coverage.min(1.0) * 255.0);
-        let src_with_coverage = apply_coverage(src, cov);
+        self.blend_pixel_coverage(x, y, src, cov, blend_mode);
+    }
 
+    /// Blend `src` (premultiplied) into the pixel with partial `coverage`
+    /// (0-255), the way Skia's blitters do: `lerp(dst, blend(src, dst),
+    /// coverage)`. For `SrcOver` that equals blending the coverage-scaled
+    /// source, which is the fast path kept here; other modes (`Src`,
+    /// `Clear`, ...) must lerp, or partially covered pixels would be
+    /// replaced instead of blended toward.
+    pub fn blend_pixel_coverage(
+        &mut self,
+        x: i32,
+        y: i32,
+        src: Color,
+        coverage: u8,
+        blend_mode: BlendMode,
+    ) {
+        if x < 0 || x >= self.width || y < 0 || y >= self.height || coverage == 0 {
+            return;
+        }
+        if coverage == 255 {
+            self.blend_pixel(x, y, src, blend_mode);
+            return;
+        }
         let dst = self.get_pixel(x, y).unwrap_or(Color::from_argb(0, 0, 0, 0));
-        let blended = blend_colors(src_with_coverage, dst, blend_mode);
-        self.set_pixel(x, y, blended);
+        let result = if blend_mode == BlendMode::SrcOver {
+            blend_colors(apply_coverage(src, coverage), dst, blend_mode)
+        } else {
+            let full = blend_colors(src, dst, blend_mode);
+            let lerp = |from: u8, to: u8| {
+                let (from, to, cov) = (u32::from(from), u32::from(to), u32::from(coverage));
+                u8::try_from((from * (255 - cov) + to * cov + 127) / 255).unwrap_or(u8::MAX)
+            };
+            Color::from_argb(
+                lerp(dst.alpha(), full.alpha()),
+                lerp(dst.red(), full.red()),
+                lerp(dst.green(), full.green()),
+                lerp(dst.blue(), full.blue()),
+            )
+        };
+        self.set_pixel(x, y, result);
     }
 }
 
@@ -526,8 +561,9 @@ impl<'a> Rasterizer<'a> {
         } else {
             mul_div_255_round(u32::from(coverage), u32::from(clip_cov))
         };
-        let c = apply_coverage(source_color_at(source, x, y), combined);
-        self.buffer.blend_pixel(x, y, c, blend_mode);
+        let color = source_color_at(source, x, y);
+        self.buffer
+            .blend_pixel_coverage(x, y, color, combined, blend_mode);
     }
 
     /// Blend a full-coverage horizontal span `[x0, x1)` at row `y` through

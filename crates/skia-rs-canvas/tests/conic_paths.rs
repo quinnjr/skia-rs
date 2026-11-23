@@ -990,3 +990,46 @@ fn circles_under_perspective_match_their_path() {
     };
     assert_eq!(render(false), render(true));
 }
+
+#[test]
+fn negative_radius_hairline_circles_draw_nothing() {
+    use skia_rs_core::Point;
+
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_circle(Point::new(50.0, 50.0), -10.0, &paint);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            assert!(!lit(&buffer, x, y), "({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn partial_coverage_blends_toward_the_result_for_non_srcover_modes() {
+    // Skia: lerp(dst, blend(src, dst), coverage). With Src on opaque white,
+    // a partially covered pixel stays opaque (white blended toward red),
+    // not a dark, partly transparent coverage-scaled red.
+    use skia_rs_core::Point;
+    use skia_rs_paint::BlendMode;
+
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            buffer.set_pixel(x, y, Color::WHITE);
+        }
+    }
+    let mut paint = Paint::new();
+    paint.set_color32(Color::from_argb(255, 255, 0, 0));
+    paint.set_style(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    paint.set_anti_alias(true);
+    paint.set_blend_mode(BlendMode::Src);
+    Canvas::new_raster(&mut buffer).draw_point(Point::new(10.3, 10.7), &paint);
+    for (x, y) in [(9, 10), (10, 10), (9, 11), (10, 11)] {
+        let c = buffer.get_pixel(x, y).unwrap_or(Color::BLACK);
+        assert_eq!(c.alpha(), 255, "({x}, {y}) stays opaque: {c:?}");
+        assert_eq!(c.red(), 255, "({x}, {y}) red channel: {c:?}");
+    }
+}

@@ -980,6 +980,9 @@ impl<'a> Canvas<'a> {
         if !(center.x.is_finite() && center.y.is_finite() && radius.is_finite()) {
             return;
         }
+        // SkCanvas::drawCircle clamps a negative radius to 0 for every draw
+        // (a zero-size oval draws nothing), not only with a path effect.
+        let radius = radius.max(0.0);
         match &mut self.backing {
             Backing::Raster(_) if paint.path_effect().is_some() => {
                 // SkCanvas::drawCircle clamps a negative radius to 0 and
