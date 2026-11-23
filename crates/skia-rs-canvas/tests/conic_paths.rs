@@ -1958,3 +1958,39 @@ fn layer_bounds_hints_limit_content_not_the_filtered_result() {
     assert!(alpha(35, 50) > 0, "the halo reaches past the hint");
     assert_eq!(alpha(5, 5), 0, "content outside the hint is dropped");
 }
+
+#[test]
+fn init_with_previous_seeds_only_the_hinted_content() {
+    // With a bounds hint and a blur, the layer buffer is larger than the
+    // content (room for the halo), but only the content area starts as a
+    // copy of the backdrop; seeding the ring would blur the backdrop and
+    // draw it back over itself.
+    use skia_rs_canvas::{SaveLayerFlags, SaveLayerRec};
+    use skia_rs_paint::{BlurImageFilter, TileMode};
+    use std::sync::Arc;
+
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        let mut backdrop = Paint::new();
+        backdrop.set_color32(Color::from_argb(128, 255, 255, 255));
+        canvas.draw_rect(&Rect::new(0.0, 0.0, 200.0, 200.0), &backdrop);
+        let mut layer_paint = Paint::new();
+        layer_paint.set_image_filter(Some(Arc::new(BlurImageFilter::new(
+            5.0,
+            5.0,
+            TileMode::Decal,
+        ))));
+        canvas.save_layer(&SaveLayerRec {
+            bounds: Some(&Rect::from_xywh(40.0, 40.0, 20.0, 20.0)),
+            paint: Some(&layer_paint),
+            flags: SaveLayerFlags::INIT_WITH_PREVIOUS,
+        });
+        canvas.restore();
+    }
+    let a = buffer.get_pixel(28, 50).map_or(0, |c| c.alpha());
+    assert!(
+        a < 160,
+        "the ring keeps the backdrop plus a faint halo, got {a}"
+    );
+}

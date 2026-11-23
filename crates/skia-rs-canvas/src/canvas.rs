@@ -341,7 +341,10 @@ impl<'a> Canvas<'a> {
             if rec.flags.contains(SaveLayerFlags::INIT_WITH_PREVIOUS) {
                 // kInitWithPrevious: the layer starts as a copy of what is
                 // under it.
-                self.copy_target_into(&mut buffer, (device_rect.left, device_rect.top));
+                // under it, over the content area only (Skia's layer
+                // device is the content bounds; the rest of the buffer is
+                // room for the filter's output).
+                self.copy_target_into(&mut buffer, (device_rect.left, device_rect.top), &content);
             }
             // Skia's layer device starts wide open (clipped only to its
             // bounds): the prior clip, AA mask included, applies once, when
@@ -551,8 +554,9 @@ impl<'a> Canvas<'a> {
     }
 
     /// Copies the pixels under a new layer (the top layer, or the base
-    /// raster) into it, for `SaveLayerFlags::INIT_WITH_PREVIOUS`.
-    fn copy_target_into(&self, dst: &mut PixelBuffer, origin: (i32, i32)) {
+    /// raster) into it, within device rect `region`, for
+    /// `SaveLayerFlags::INIT_WITH_PREVIOUS`.
+    fn copy_target_into(&self, dst: &mut PixelBuffer, origin: (i32, i32), region: &IRect) {
         let (src, (sox, soy)): (&PixelBuffer, (i32, i32)) =
             if let Some(parent) = self.layer_stack.last() {
                 (&parent.buffer, parent.device_origin)
@@ -562,11 +566,16 @@ impl<'a> Canvas<'a> {
                     _ => return,
                 }
             };
-        // The overlap, in source coordinates.
-        let x0 = (origin.0 - sox).max(0);
-        let y0 = (origin.1 - soy).max(0);
-        let x1 = (origin.0 - sox + dst.width).min(src.width);
-        let y1 = (origin.1 - soy + dst.height).min(src.height);
+        // The overlap of the layer, `region` and the source, in source
+        // coordinates.
+        let x0 = (origin.0 - sox).max(region.left - sox).max(0);
+        let y0 = (origin.1 - soy).max(region.top - soy).max(0);
+        let x1 = (origin.0 - sox + dst.width)
+            .min(region.right - sox)
+            .min(src.width);
+        let y1 = (origin.1 - soy + dst.height)
+            .min(region.bottom - soy)
+            .min(src.height);
         if x0 >= x1 || y0 >= y1 {
             return;
         }
