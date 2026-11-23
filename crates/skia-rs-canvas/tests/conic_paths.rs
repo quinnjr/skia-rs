@@ -1493,3 +1493,23 @@ fn layers_composite_through_the_clip_active_at_save_layer() {
         .unwrap_or(0);
     assert!(worst <= 2, "layered edges differ by up to {worst}");
 }
+
+#[test]
+fn arcs_with_non_finite_or_huge_sweeps_finish() {
+    // A NaN sweep draws nothing; a huge one (where subtracting 360 no longer
+    // changes it) is bounded instead of looping forever.
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(2.0);
+    let oval = Rect::new(40.0, 40.0, 160.0, 160.0);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    let mut canvas = Canvas::new_raster(&mut buffer);
+    canvas.draw_arc(&oval, 0.0, f32::NAN, false, &paint);
+    canvas.draw_arc(&oval, f32::INFINITY, 90.0, false, &paint);
+    canvas.draw_arc(&oval, 0.0, 1e10, false, &paint);
+    canvas.draw_arc(&oval, 0.0, -1e10, true, &paint);
+    drop(canvas);
+    assert!(
+        lit(&buffer, 160, 100),
+        "the huge sweep still draws the oval"
+    );
+}

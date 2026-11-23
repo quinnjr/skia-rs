@@ -353,9 +353,9 @@ impl<'a> Canvas<'a> {
     /// Restore to the previous state.
     ///
     /// If the top entry of the layer stack was pushed at the current save
-    /// count, the layer is popped and composited onto its parent target
-    /// (the next layer below, or the base backing) before the matrix/clip
-    /// stacks are popped.
+    /// count, the layer is popped and, after the matrix/clip stacks are
+    /// popped, composited onto its parent target (the next layer below, or
+    /// the base backing) through the clip that was active at `save_layer`.
     ///
     /// # Panics
     ///
@@ -1077,8 +1077,9 @@ impl<'a> Canvas<'a> {
         use_center: bool,
         paint: &Paint,
     ) {
-        // SkCanvas::drawArc quick-rejects non-finite ovals and sorts the rest.
-        if !oval.is_finite() {
+        // SkCanvas::drawArc quick-rejects non-finite ovals and sorts the rest;
+        // a non-finite angle has no arc to draw.
+        if !oval.is_finite() || !start_angle.is_finite() || !sweep_angle.is_finite() {
             return;
         }
         let oval = &sorted_rect(oval);
@@ -2895,35 +2896,36 @@ fn build_arc_path(
         piece.builder.move_to(center.x, center.y);
         piece.last = Some(center);
     }
-    let (mut start, mut sweep) = (start_angle, sweep_angle);
+    // Skia peels off whole turns by repeated subtraction; here they are
+    // counted up front (and capped, so a huge sweep, where subtracting 360
+    // no longer changes the value, cannot spin or build millions of pieces),
+    // and the remainder is the same as the subtraction's.
+    let half = 180.0_f32.copysign(sweep_angle);
+    let turns = (sweep_angle.abs() / 360.0).floor().min(MAX_ARC_TURNS);
+    let mut start = start_angle;
+    let mut done = 0.0_f32;
     loop {
-        if sweep > -360.0 {
+        if done >= turns {
             break;
         }
-        piece.add(start, -180.0);
-        start -= 180.0;
-        piece.add(start, -180.0);
-        start -= 180.0;
-        sweep += 360.0;
+        piece.add(start, half);
+        start += half;
+        piece.add(start, half);
+        start += half;
+        done += 1.0;
     }
-    loop {
-        if sweep < 360.0 {
-            break;
-        }
-        piece.add(start, 180.0);
-        start += 180.0;
-        piece.add(start, 180.0);
-        start += 180.0;
-        sweep -= 360.0;
-    }
-    if sweep != 0.0 {
-        piece.add(start, sweep);
+    let rest = sweep_angle % 360.0;
+    if rest != 0.0 {
+        piece.add(start, rest);
     }
     if use_center {
         builder.close();
     }
     builder.build()
 }
+
+/// The most whole turns `build_arc_path` draws for one arc.
+const MAX_ARC_TURNS: Scalar = 1024.0;
 
 /// Appends arc pieces as one contour (`SkPath::arcTo` with `forceMoveTo`
 /// only for the first piece of a non-wedge arc).
