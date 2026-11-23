@@ -490,7 +490,7 @@ impl<'a> Canvas<'a> {
             .and_then(Paint::image_filter)
             .map(|f| skia_rs_paint::map_image_filter(f, &ctm));
         if let Some(filter) = &filter {
-            clip_bounds = filtered_layer_area(filter.as_ref(), clip_bounds, device, &device_full);
+            clip_bounds = filtered_layer_area(filter.as_ref(), clip_bounds, device);
         }
         let limit = if filter.is_some() {
             clip_bounds
@@ -3223,8 +3223,7 @@ fn device_clip_path(path: &Path, matrix: &Matrix) -> Path {
 }
 
 /// The device area a layer with image `filter` must cover to produce the
-/// clip area `clip` (`device`: the device; `device_full`: the current
-/// target's extent).
+/// clip area `clip` (`device`: the device).
 ///
 /// Like Skia (`getInputBounds`), the layer holds what the filter reads to
 /// produce the clip area (a blur's margin, a shadow's or offset's source, a
@@ -3232,12 +3231,7 @@ fn device_clip_path(path: &Path, matrix: &Matrix) -> Path {
 /// in place on the layer's pixels. Skia downsamples layers that would be
 /// too large; here a layer past 9x the device area is cut to the device
 /// outset by its size instead.
-fn filtered_layer_area(
-    filter: &dyn skia_rs_paint::ImageFilter,
-    clip: Rect,
-    device: &Rect,
-    device_full: &Rect,
-) -> Rect {
+fn filtered_layer_area(filter: &dyn skia_rs_paint::ImageFilter, clip: Rect, device: &Rect) -> Rect {
     // Nothing is visible through an empty clip: no layer area.
     if clip.is_empty() {
         return clip;
@@ -3248,9 +3242,11 @@ fn filtered_layer_area(
     if area.is_finite() && area <= budget {
         return needed;
     }
-    // Each axis outset by its own size: at most 3W x 3H, i.e. the budget.
+    // Each axis of the device itself (not a parent layer, which may already
+    // be enlarged) outset by its own size: at most 3W x 3H, i.e. the
+    // budget, however deeply layers nest.
     needed
-        .intersect(&device_full.inset(-device.width(), -device.height()))
+        .intersect(&device.inset(-device.width(), -device.height()))
         .unwrap_or(clip)
 }
 
@@ -3567,12 +3563,23 @@ mod tests {
     }
 
     #[test]
+    fn nested_filtered_layer_fallbacks_stay_within_the_budget() {
+        // An already-enlarged parent layer (the clip here) must not widen
+        // the fallback: it is bounded by the device itself.
+        let device = super::Rect::new(0.0, 0.0, 100.0, 100.0);
+        let parent = super::Rect::new(-300.0, -300.0, 400.0, 400.0);
+        let filter = skia_rs_paint::OffsetImageFilter::new(-1.0e6, -1.0e6, None);
+        let area = super::filtered_layer_area(&filter, parent, &device);
+        assert!(area.width() <= 300.0 && area.height() <= 300.0, "{area:?}");
+    }
+
+    #[test]
     fn filtered_layers_under_an_empty_clip_have_no_area() {
         let empty = super::Rect::new(0.0, 0.0, 0.0, 0.0);
         let device = super::Rect::new(0.0, 0.0, 100.0, 100.0);
         let blur =
             skia_rs_paint::BlurImageFilter::new(100.0, 100.0, skia_rs_paint::TileMode::Decal);
-        let area = super::filtered_layer_area(&blur, empty, &device, &device);
+        let area = super::filtered_layer_area(&blur, empty, &device);
         assert!(area.is_empty(), "{area:?}");
     }
 
@@ -3582,7 +3589,7 @@ mod tests {
         // size, so the layer stays within 9x the device area.
         let device = super::Rect::new(0.0, 0.0, 10_000.0, 10.0);
         let filter = skia_rs_paint::OffsetImageFilter::new(-1.0e6, -1.0e6, None);
-        let area = super::filtered_layer_area(&filter, device, &device, &device);
+        let area = super::filtered_layer_area(&filter, device, &device);
         assert!(
             area.width() * area.height() <= 9.0 * 10_000.0 * 10.0,
             "{area:?}"
