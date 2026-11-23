@@ -1966,6 +1966,10 @@ impl sk_canvas_t {
 /// (which bypass the locked canvas and draw directly on the surface) are
 /// rejected (no-op) to avoid two independent mutable views of the same
 /// pixel buffer.
+///
+/// # Safety
+/// `surface` must be null or a live surface handle. The returned canvas must
+/// be released exactly once with [`sk_canvas_release`] and not used after.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_surface_lock_canvas(surface: *mut sk_surface_t) -> *mut sk_canvas_t {
     catch_panic(|| {
@@ -2003,6 +2007,13 @@ pub unsafe extern "C" fn sk_surface_lock_canvas(surface: *mut sk_surface_t) -> *
 }
 
 /// Release a canvas acquired via [`sk_surface_lock_canvas`].
+///
+/// Like `~SkCanvas`, open saves are unwound first, compositing any open
+/// layer into the surface.
+///
+/// # Safety
+/// `canvas` must be null or a canvas from [`sk_surface_lock_canvas`] that
+/// has not been released; it must not be used afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_canvas_release(canvas: *mut sk_canvas_t) {
     catch_panic_void(|| {
@@ -2086,6 +2097,11 @@ pub unsafe extern "C" fn sk_canvas_save(canvas: *mut sk_canvas_t) -> i32 {
 /// [`sk_canvas_save`]): the save count *before* this call in Skia's
 /// 1-based counting (1 for the first save, 2 for a nested one, ...).
 /// Returns 0 if `canvas` is null.
+///
+/// # Safety
+/// `canvas` must be null or a live locked canvas; `bounds` must be null or
+/// point to a valid `sk_rect_t`; `paint` must be null or a live paint
+/// handle. The paint is copied, so it may be released afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_canvas_save_layer(
     canvas: *mut sk_canvas_t,
