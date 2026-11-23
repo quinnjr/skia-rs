@@ -2610,6 +2610,10 @@ impl Canvas<'_> {
                         .mul_add(scale_y, scalar_from_i32(src_rect.top))
                         .trunc(),
                 );
+                // Strict src: rounding at dst's right/bottom edge must not
+                // reach past src (into a neighboring atlas sprite).
+                let src_x = src_x.clamp(src_rect.left, src_rect.right - 1);
+                let src_y = src_y.clamp(src_rect.top, src_rect.bottom - 1);
                 if src_x < 0 || src_x >= image.width() || src_y < 0 || src_y >= image.height() {
                     continue;
                 }
@@ -2936,19 +2940,25 @@ impl Canvas<'_> {
                 + values[Matrix::PERSP_1] * pt.y
                 + values[Matrix::PERSP_2]
         };
-        let mut kept: Vec<(Point, Option<Color>)> = Vec::with_capacity(4);
+        // Clipping a triangle by one plane leaves at most four vertices: a
+        // fixed array, so perspective meshes allocate nothing per triangle.
+        let mut kept = [(Point::default(), None::<Color>); 4];
+        let mut count = 0;
         for edge in 0..3 {
             let from = (points[edge], colors[edge]);
             let to = (points[(edge + 1) % 3], colors[(edge + 1) % 3]);
             let (w_from, w_to) = (weight(from.0), weight(to.0));
             if w_from >= W_MIN {
-                kept.push(from);
+                kept[count] = from;
+                count += 1;
             }
             if (w_from >= W_MIN) != (w_to >= W_MIN) {
-                kept.push(w_plane_cut(from, to, W_MIN, &weight));
+                kept[count] = w_plane_cut(from, to, W_MIN, &weight);
+                count += 1;
             }
         }
-        for fan in 1..kept.len().saturating_sub(1) {
+        let kept = &kept[..count];
+        for fan in 1..count.saturating_sub(1) {
             let (first, second, third) = (kept[0], kept[fan], kept[fan + 1]);
             self.draw_triangle(
                 matrix.map_point(first.0),
@@ -5334,6 +5344,45 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "codec")]
+    #[test]
+    fn image_src_rects_never_sample_past_their_edge() {
+        // An atlas: columns 0..7 red, column 7 blue. src = the 7 red columns
+        // drawn 3 + 2^-22 wide at x = 0.5: pixel 3's center is 3.0 into dst,
+        // and 3.0 * (7 / width) rounds to exactly 7.0, the blue column.
+        let mut pixels = Vec::new();
+        for x in 0..8 {
+            pixels.extend_from_slice(if x < 7 {
+                &[255, 0, 0, 255]
+            } else {
+                &[0, 0, 255, 255]
+            });
+        }
+        let info = skia_rs_codec::ImageInfo::new(
+            8,
+            1,
+            skia_rs_core::ColorType::Rgba8888,
+            skia_rs_core::AlphaType::Premul,
+        );
+        let image = skia_rs_codec::Image::from_raster_data_owned(info, pixels, 32).unwrap();
+        let src = skia_rs_core::IRect::new(0, 0, 7, 1);
+        let width = f32::from_bits(0x4040_0001);
+        let mut buffer = PixelBuffer::new(8, 4);
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.draw_image_rect(
+            &image,
+            Some(&src),
+            &Rect::from_xywh(0.5, 0.0, width, 4.0),
+            None,
+        );
+        drop(canvas);
+        let edge = buffer.get_pixel(3, 1).unwrap();
+        assert_eq!(
+            (edge.red(), edge.blue()),
+            (255, 0),
+            "pixel 3 samples src, not past it"
+        );
+    }
     #[cfg(feature = "codec")]
     #[test]
     fn image_pixels_on_the_horizon_are_not_drawn() {
