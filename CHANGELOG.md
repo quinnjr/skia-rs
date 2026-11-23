@@ -30,9 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layer is cut to the device outset by its size).
   As in Skia, the filter's parameters are mapped from local space into the
   layer (sigmas, offsets and radii scale and rotate with the matrix) via the
-  new `ImageFilter::map_params` / `map_image_filter`. Blur and drop-shadow
-  sigmas are clamped to 532, like `SkBlurImageFilter`'s `kMaxSigma`. New
-  `Canvas::layer_bounds`, `layer_bounds_within`, `layer_paint` and
+  new `ImageFilter::map_params` / `map_image_filter`. Filters run on
+  device-space layer pixels, which matches Skia for scale/translate and
+  quarter turns; Skia's further decomposition of other matrices
+  (`decomposeCTM`) is not implemented, so anisotropic filters under
+  arbitrary rotation or skew, and matrix-convolution kernels under scale,
+  differ. Blur and drop-shadow sigmas are clamped to 532, like
+  `SkBlurImageFilter`'s `kMaxSigma`. New `Canvas::layer_bounds`, `layer_bounds_within`, `layer_paint` and
   `composite_layer_pixels`.
 - **Breaking**: `DrawCommand::SaveLayer` has a `flags` field, so recorded
   layers keep `INIT_WITH_PREVIOUS` on playback.

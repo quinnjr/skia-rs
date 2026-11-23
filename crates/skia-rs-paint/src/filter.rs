@@ -412,6 +412,14 @@ pub trait ImageFilter: Send + Sync + std::fmt::Debug {
     /// space (`skif::Mapping::paramToLayer`). `None` when nothing changes:
     /// the default, for filters without geometric parameters or inputs
     /// (every built-in filter that has either overrides this).
+    ///
+    /// Filters run on device-space layer pixels here. That matches Skia for
+    /// scale/translate and quarter-turn matrices. Skia additionally
+    /// decomposes other matrices (`skif::Mapping::decomposeCTM`), filtering
+    /// in a scale-only (or, for matrix convolution and lighting,
+    /// translate-only) layer space and resampling the result. That is not
+    /// done here, so anisotropic filters under arbitrary rotation or skew,
+    /// and matrix-convolution kernels under scale, differ from Skia.
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         let _ = matrix;
         None
@@ -474,11 +482,22 @@ fn map_vector(matrix: &Matrix, dx: Scalar, dy: Scalar) -> (Scalar, Scalar) {
     )
 }
 
-/// Maps a size (sigmas, radii) as the lengths of its mapped axis vectors.
+/// Maps a size (sigmas, radii) as the lengths of its mapped axis vectors,
+/// each assigned to the device axis its local axis mostly maps to: exact
+/// for scale/translate and quarter turns (where x and y swap). Other
+/// rotations and skews get the nearest axis-aligned fit; see
+/// [`ImageFilter::map_params`].
 fn map_size(matrix: &Matrix, w: Scalar, h: Scalar) -> (Scalar, Scalar) {
     let (x0, y0) = map_vector(matrix, w, 0.0);
     let (x1, y1) = map_vector(matrix, 0.0, h);
-    (x0.hypot(y0), x1.hypot(y1))
+    let (along_w, along_h) = (x0.hypot(y0), x1.hypot(y1));
+    // Where local x points, independent of w (which may be 0).
+    let (ux, uy) = map_vector(matrix, 1.0, 0.0);
+    if ux.abs() < uy.abs() {
+        (along_h, along_w)
+    } else {
+        (along_w, along_h)
+    }
 }
 
 /// A blur image filter.
@@ -2665,6 +2684,30 @@ pub(crate) fn deserialize_image_filter(bytes: &[u8], offset: &mut usize) -> Opti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quarter_turns_swap_directional_filter_axes() {
+        // A horizontal blur under a 90-degree rotation is vertical on
+        // screen, as Skia draws it.
+        let blur: ImageFilterRef = Arc::new(BlurImageFilter::new(
+            10.0,
+            0.0,
+            crate::shader::TileMode::Decal,
+        ));
+        let mapped = map_image_filter(&blur, &Matrix::rotate(90.0_f32.to_radians()));
+        let debug = format!("{mapped:?}");
+        assert!(
+            debug.contains("sigma_x: 0.0") && debug.contains("sigma_y: 10.0"),
+            "{debug}"
+        );
+        // Scale alone keeps the axes.
+        let mapped = map_image_filter(&blur, &Matrix::scale(2.0, 3.0));
+        let debug = format!("{mapped:?}");
+        assert!(
+            debug.contains("sigma_x: 20.0") && debug.contains("sigma_y: 0.0"),
+            "{debug}"
+        );
+    }
+
     #[test]
     fn displacement_mapping_keeps_the_scale_sign() {
         let map: ImageFilterRef = Arc::new(OffsetImageFilter::new(0.0, 0.0, None));
