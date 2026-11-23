@@ -219,8 +219,10 @@ impl DashEffect {
             }
         }
 
+        // SkDashPath::ValidDashPath: a positive total and a finite phase and
+        // total (a NaN/infinite phase would never find its start interval).
         let interval_sum: Scalar = intervals.iter().sum();
-        if interval_sum <= 0.0 {
+        if !(interval_sum > 0.0 && interval_sum.is_finite() && phase.is_finite()) {
             return None;
         }
 
@@ -718,8 +720,12 @@ pub struct DiscreteEffect {
 impl DiscreteEffect {
     /// Create a new discrete effect.
     #[must_use]
+    ///
+    /// Like `SkDiscretePathEffect::Make`, non-finite parameters or a
+    /// segment length at or below `SK_ScalarNearlyZero` give `None`.
     pub fn new(seg_length: Scalar, deviation: Scalar, seed: u32) -> Option<Self> {
-        if seg_length <= 0.0 {
+        const SCALAR_NEARLY_ZERO: Scalar = 1.0 / 4096.0;
+        if !(seg_length.is_finite() && deviation.is_finite()) || seg_length <= SCALAR_NEARLY_ZERO {
             return None;
         }
         Some(Self {
@@ -751,6 +757,10 @@ impl DiscreteEffect {
     }
 }
 
+/// `SkDiscretePathEffect`'s `kMaxReasonableIterations`: the most segments
+/// one contour is split into.
+const MAX_DISCRETE_SEGMENTS: i32 = 100_000;
+
 impl PathEffect for DiscreteEffect {
     fn apply(&self, path: &Path) -> Option<Path> {
         if path.is_empty() {
@@ -760,6 +770,15 @@ impl PathEffect for DiscreteEffect {
         let mut builder = PathBuilder::new();
         let mut current_pos = Point::zero();
         let mut seed = self.seed;
+        // SkDiscretePathEffect caps each contour at kMaxReasonableIterations
+        // segments, so a long contour or a tiny segment length cannot
+        // allocate without bound.
+        let mut contour_budget = MAX_DISCRETE_SEGMENTS;
+        let take_segments = |wanted: i32, budget: &mut i32| {
+            let n = wanted.clamp(1, (*budget).max(1));
+            *budget = budget.saturating_sub(n);
+            n
+        };
 
         for element in path {
             match element {
@@ -770,10 +789,12 @@ impl PathEffect for DiscreteEffect {
                     seed = seed.wrapping_add(1);
                     builder.move_to(p.x + dx, p.y + dy);
                     current_pos = p;
+                    contour_budget = MAX_DISCRETE_SEGMENTS;
                 }
                 PathElement::Line(end) => {
                     let length = current_pos.distance(&end);
-                    let num_segments = ceil_to_i32(length / self.seg_length).max(1);
+                    let num_segments =
+                        take_segments(ceil_to_i32(length / self.seg_length), &mut contour_budget);
 
                     for i in 1..=num_segments {
                         let t = scalar_from_i32(i) / scalar_from_i32(num_segments);
@@ -794,9 +815,11 @@ impl PathEffect for DiscreteEffect {
                 }
                 // For curves, subdivide into lines first
                 PathElement::Quad(ctrl, end) => {
-                    let steps =
+                    let steps = take_segments(
                         ceil_to_i32(quadratic_length(current_pos, ctrl, end) / self.seg_length)
-                            .max(4);
+                            .max(4),
+                        &mut contour_budget,
+                    );
 
                     for i in 1..=steps {
                         let t = scalar_from_i32(i) / scalar_from_i32(steps);
@@ -812,9 +835,11 @@ impl PathEffect for DiscreteEffect {
                     current_pos = end;
                 }
                 PathElement::Conic(ctrl, end, _w) => {
-                    let steps =
+                    let steps = take_segments(
                         ceil_to_i32(quadratic_length(current_pos, ctrl, end) / self.seg_length)
-                            .max(4);
+                            .max(4),
+                        &mut contour_budget,
+                    );
 
                     for i in 1..=steps {
                         let t = scalar_from_i32(i) / scalar_from_i32(steps);
@@ -830,9 +855,11 @@ impl PathEffect for DiscreteEffect {
                     current_pos = end;
                 }
                 PathElement::Cubic(ctrl1, ctrl2, end) => {
-                    let steps =
+                    let steps = take_segments(
                         ceil_to_i32(cubic_length(current_pos, ctrl1, ctrl2, end) / self.seg_length)
-                            .max(4);
+                            .max(4),
+                        &mut contour_budget,
+                    );
 
                     for i in 1..=steps {
                         let t = scalar_from_i32(i) / scalar_from_i32(steps);
@@ -1355,13 +1382,21 @@ impl PathEffect for Path1DEffect {
         // MAX_REASONABLE_ITERATIONS stamps (or has a non-finite length).
         // Decide that first, so the point budget below never turns Skia's
         // failure into a truncated success.
-        let iteration_limit =
-            scalar_from_i32(i32::try_from(MAX_REASONABLE_ITERATIONS).unwrap_or(i32::MAX));
+        // Count by stepping `distance` exactly as the walk below (and Skia)
+        // does, so rounding cannot make the two disagree at the limit.
         for i in 0..measure.contour_count() {
             let length = measure.contour_length(i).unwrap_or(0.0);
-            let needed = ((length - self.initial_offset) / self.advance).ceil();
-            if !(needed.is_finite() && needed <= iteration_limit) {
-                return None;
+            let mut distance = self.initial_offset;
+            let mut stamps = 0_u32;
+            loop {
+                if distance >= length {
+                    break;
+                }
+                if stamps == MAX_REASONABLE_ITERATIONS {
+                    return None;
+                }
+                stamps += 1;
+                distance += self.advance;
             }
         }
         let stamp_points = self.path.points().len().max(1);
@@ -1710,8 +1745,11 @@ fn lattice_spans(
     // Limit to the cull area in lattice space, outset by a cell (a cell's
     // output can reach past its center by up to a cell). Cells outside it
     // produce nothing visible.
+    // A perspective inverse can map the cull's corners across the horizon
+    // (w <= 0), where their bounding box no longer covers the visible
+    // cells: skip the cull then.
     let (left, top, right, bottom) = match cull {
-        Some(cull) if cull.is_finite() => {
+        Some(cull) if cull.is_finite() && !inverse.has_perspective() => {
             let c = inverse.map_rect(cull);
             (
                 left.max(floor_to_i32(c.left).saturating_sub(1)),
@@ -2445,6 +2483,48 @@ mod tests {
         // 4-unit cells: the cull's one-cell margin ends near x = 102, but a
         // stamp at x = 106..110 still shows its 20-wide stroke inside.
         assert!(culled.points().iter().any(|p| p.x > 105.0 && p.x < 111.0));
+    }
+
+    #[test]
+    fn effects_reject_non_finite_parameters_like_skia() {
+        assert!(DashEffect::new(vec![5.0, 5.0], Scalar::NAN).is_none());
+        assert!(DashEffect::new(vec![5.0, 5.0], Scalar::INFINITY).is_none());
+        assert!(DashEffect::new(vec![Scalar::INFINITY, 5.0], 0.0).is_none());
+        assert!(DiscreteEffect::new(Scalar::NAN, 1.0, 0).is_none());
+        assert!(DiscreteEffect::new(1.0, Scalar::INFINITY, 0).is_none());
+        assert!(
+            DiscreteEffect::new(1e-5, 1.0, 0).is_none(),
+            "below nearly-zero"
+        );
+    }
+
+    #[test]
+    fn discrete_segments_are_capped_per_contour() {
+        let discrete = DiscreteEffect::new(1e-3, 0.5, 7).unwrap();
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0).line_to(1e6, 0.0);
+        let out = discrete.apply(&b.build()).expect("applies");
+        // 1e9 segments requested; at most MAX_DISCRETE_SEGMENTS emitted.
+        let max = usize::try_from(MAX_DISCRETE_SEGMENTS).unwrap() + 1;
+        assert!(out.points().len() <= max, "{} points", out.points().len());
+    }
+
+    #[test]
+    fn perspective_lattices_are_not_culled() {
+        // With a perspective lattice matrix the cull's mapped box is
+        // meaningless, so culled output equals the unculled output.
+        let lattice = skia_rs_core::Matrix {
+            values: [4.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.01, 0.0, 1.0],
+        };
+        let hatch = Line2DEffect::new(1.0, lattice).unwrap();
+        let source = square(300.0);
+        let cull = skia_rs_core::Rect::new(0.0, 0.0, 100.0, 100.0);
+        let (mut a, mut b) = (StrokeRec::Fill, StrokeRec::Fill);
+        let culled = hatch
+            .filter_path_culled(&source, &mut a, Some(&cull))
+            .expect("applies");
+        let full = hatch.filter_path(&source, &mut b).expect("applies");
+        assert_eq!(culled.points(), full.points());
     }
 
     #[test]
