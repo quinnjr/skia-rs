@@ -2324,6 +2324,9 @@ pub(crate) fn perspective_clip(path: &Path, matrix: &Matrix) -> Option<Path> {
         pending: None,
     };
     let (mut start, mut current) = (Point::zero(), Point::zero());
+    // A path without a leading move starts at the origin (as collect_edges
+    // treats it).
+    clipper.begin(Point::zero());
     for element in path {
         match element {
             PathElement::Move(p) => {

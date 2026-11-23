@@ -2380,11 +2380,13 @@ impl Canvas<'_> {
             for rect in region.iter() {
                 rects.add_rect(&rect.to_rect());
             }
-            // The union of the region's (disjoint) rects is its boundary.
-            if let Some(boundary) = skia_rs_path::simplify(&rects.build()) {
-                self.draw_path(&boundary, paint);
-                return;
-            }
+            // The union of the region's (disjoint) rects is its boundary. If
+            // the union fails, the rects as one winding-fill path still
+            // fill the same area as a single draw (no per-rect seams).
+            let rects = rects.build();
+            let boundary = skia_rs_path::simplify(&rects).unwrap_or(rects);
+            self.draw_path(&boundary, paint);
+            return;
         }
         for rect in region.iter() {
             let rect_f = rect.to_rect();
