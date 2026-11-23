@@ -985,9 +985,9 @@ impl<'a> Canvas<'a> {
         let radius = radius.max(0.0);
         match &mut self.backing {
             Backing::Raster(_) if paint.path_effect().is_some() => {
-                // SkCanvas::drawCircle clamps a negative radius to 0 and
-                // draws the oval of the (sorted) bounds.
-                let r = radius.max(0.0);
+                // SkCanvas::drawCircle draws the oval of the circle's bounds
+                // (the radius was clamped to 0 above).
+                let r = radius;
                 let mut b = skia_rs_path::PathBuilder::new();
                 b.add_oval(&Rect::new(
                     center.x - r,
