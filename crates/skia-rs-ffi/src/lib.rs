@@ -1972,7 +1972,7 @@ pub unsafe extern "C" fn sk_canvas_save_layer(
     canvas: *mut sk_canvas_t,
     _bounds: *const sk_rect_t,
     _paint: *const sk_paint_t,
-) -> u32 {
+) -> i32 {
     // Currently behaves as a plain save() — see [`CanvasSaveFrame`] for why
     // layer composition is deferred. The parameters are typed and accepted
     // now so the C ABI doesn't need to break when layer support lands.
@@ -1986,7 +1986,7 @@ pub unsafe extern "C" fn sk_canvas_save_layer(
         };
         c.state.stack.push(frame);
         c.state.save_count += 1;
-        u32::try_from(c.state.save_count).unwrap_or(u32::MAX)
+        i32::try_from(c.state.save_count).unwrap_or(i32::MAX)
     })
 }
 
@@ -4253,7 +4253,7 @@ mod tests {
             let canvas = sk_surface_lock_canvas(surface);
             let n0 = sk_canvas_save(canvas);
             let n1 = sk_canvas_save_layer(canvas, ptr::null(), ptr::null());
-            assert_eq!(i32::try_from(n1).unwrap(), n0 + 1);
+            assert_eq!(n1, n0 + 1);
             sk_canvas_restore(canvas);
             sk_canvas_restore(canvas);
             sk_canvas_release(canvas);

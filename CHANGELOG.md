@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer built). Per `VERSIONING.md` an MSRV bump is a minor version
   change, so the next release is **0.5.0**. The workspace now uses the
   MSRV-aware `resolver = "3"`.
+- **Breaking**: the C API's `sk_canvas_save_layer` returns `int32_t`
+  (was `uint32_t`), the same type and value as `sk_canvas_save`.
 - **Breaking**: `skia-rs-core`'s `libm` feature is a deprecated no-op
   (it only forwarded to the unused, now removed, `glam` dependency).
 - Unused dependencies were removed across the workspace; `skia-rs-gpu`

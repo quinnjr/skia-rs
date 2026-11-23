@@ -849,9 +849,9 @@ int32_t sk_canvas_save(struct sk_canvas_t *canvas);
 // composition is delegated to the transient canvas at the next draw — the
 // effective behavior matches the recording-only semantics in
 // [`skia_rs_canvas::Canvas::save_layer`].
-uint32_t sk_canvas_save_layer(struct sk_canvas_t *canvas,
-                              const struct sk_rect_t *_bounds,
-                              const sk_paint_t *_paint);
+int32_t sk_canvas_save_layer(struct sk_canvas_t *canvas,
+                             const struct sk_rect_t *_bounds,
+                             const sk_paint_t *_paint);
 
 // Restore the most recently saved matrix and clip.
 void sk_canvas_restore(struct sk_canvas_t *canvas);
