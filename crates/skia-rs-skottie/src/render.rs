@@ -672,9 +672,14 @@ fn trim_path(path: &Path, start: Scalar, stop: Scalar, inverted: bool) -> Path {
 /// Apply a stroke's dash pattern (if any) to a path, splitting it into
 /// dash segments via Task 2's `DashEffect`.
 fn apply_dash(path: &Path, stroke: &StrokeShape, frame: Scalar) -> Path {
-    let Some(intervals) = stroke.dash_intervals_at(frame) else {
+    let Some(mut intervals) = stroke.dash_intervals_at(frame) else {
         return path.clone();
     };
+    // Lottie allows an odd dash count; Skottie repeats it to an even one
+    // before SkDashPathEffect::Make, which rejects odd counts.
+    if intervals.len() % 2 == 1 {
+        intervals.extend_from_within(..);
+    }
     let phase = stroke.dash_offset_at(frame);
     skia_rs_path::DashEffect::new(intervals, phase).map_or_else(
         || path.clone(),

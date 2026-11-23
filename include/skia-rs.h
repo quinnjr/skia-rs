@@ -1267,8 +1267,9 @@ void sk_region_unref(sk_region_t *region);
 
 // Create a dash path effect.
 //
-// `intervals` must be non-null with `count` positive entries; the pattern
-// is duplicated internally if `count` is odd, matching Skia's semantics.
+// `intervals` must be non-null with an even `count` of at least 2
+// non-negative entries; like `SkDashPathEffect::Make`, an odd `count`
+// returns null.
 // `phase` shifts where the pattern starts. Returns null if the intervals
 // are invalid (empty, negative, or sum to 0).
 sk_patheffect_t *sk_patheffect_new_dash(const float *intervals,
