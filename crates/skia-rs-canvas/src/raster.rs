@@ -2095,15 +2095,17 @@ fn push_curve_edges(
 /// measured after mapping through the full matrix, which is correct for any
 /// CTM, including perspective (where mapping control points alone would draw
 /// the wrong curve, and would change a conic's weight). Subdivision depth is
-/// capped (as Skia caps conic subdivision) so a hugely magnified curve
-/// costs at most 2^8 segments.
+/// capped at 2^12 segments per curve, comparable to Skia's edge builders
+/// (up to 32 quads per conic, each up to 64 lines), which keeps the bound
+/// for curves with device radii up to ~1e6 px; only curves that need the
+/// depth pay for it.
 fn flatten_curve_device_error(
     out: &mut Vec<Point>,
     eval: impl Fn(Scalar) -> Point,
     end: Point,
     matrix: &Matrix,
 ) {
-    const MAX_DEPTH: u32 = 8;
+    const MAX_DEPTH: u32 = 12;
 
     out.clear();
     // Iterative depth-first subdivision over [t0, t1] intervals, in curve
@@ -2654,6 +2656,43 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn huge_curves_stay_within_the_device_flattening_tolerance() {
+        // A quarter circle of device radius 1e5: every chord's sagitta must
+        // stay within CONIC_FLATTEN_TOLERANCE (256 segments gave ~0.47 px).
+        let radius = 1.0e5_f32;
+        let matrix = Matrix::scale(radius, radius);
+        let (start, ctrl, end) = (
+            Point::new(1.0, 0.0),
+            Point::new(1.0, 1.0),
+            Point::new(0.0, 1.0),
+        );
+        let weight = std::f32::consts::FRAC_1_SQRT_2;
+        let mut out = Vec::new();
+        flatten_curve_device_error(
+            &mut out,
+            |t| conic_point(start, ctrl, end, weight, t),
+            end,
+            &matrix,
+        );
+        let mut prev = matrix.map_point(start);
+        let mut worst = 0.0_f64;
+        for q in &out {
+            let next = matrix.map_point(*q);
+            let (mx, my) = (
+                f64::midpoint(f64::from(prev.x), f64::from(next.x)),
+                f64::midpoint(f64::from(prev.y), f64::from(next.y)),
+            );
+            worst = worst.max(f64::from(radius) - mx.hypot(my));
+            prev = next;
+        }
+        assert!(
+            worst <= 0.3,
+            "max sagitta {worst} px over {} segments",
+            out.len()
+        );
+    }
 
     #[test]
     fn perspective_clip_adds_no_empty_contours() {
