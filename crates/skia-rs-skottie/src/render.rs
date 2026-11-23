@@ -646,7 +646,9 @@ fn trim_path(path: &Path, start: Scalar, stop: Scalar, inverted: bool) -> Path {
     let measure = PathMeasure::new(path);
     let len = measure.length();
     if len <= 0.0 {
-        return path.clone();
+        // SkTrimPathEffect adds nothing for a zero-length source (not even a
+        // capped dot), as TrimEffect does.
+        return Path::default();
     }
 
     if inverted {
@@ -815,6 +817,15 @@ impl Canvas for SkiaCanvas<'_, '_> {
     reason = "tests assert exact keyframe/interpolation output values, not tolerances"
 )]
 mod tests {
+    #[test]
+    fn trimming_a_zero_length_shape_draws_nothing() {
+        let mut b = skia_rs_path::PathBuilder::new();
+        b.move_to(5.0, 5.0).line_to(5.0, 5.0);
+        let dot = b.build();
+        assert!(super::trim_path(&dot, 0.25, 0.75, false).is_empty());
+        assert!(super::trim_path(&dot, 0.25, 0.75, true).is_empty());
+    }
+
     use super::*;
 
     struct MockCanvas {
