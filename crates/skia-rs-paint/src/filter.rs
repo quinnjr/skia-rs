@@ -1606,9 +1606,14 @@ impl ImageFilter for LightingImageFilter {
         let lb = (self.light_color.b * 255.0).clamp(0.0, 255.0);
         for i in 0..width * height {
             let idx = i * 4;
-            pixels[idx] = f32_to_u8_trunc(f32::from(pixels[idx]) * factor * lr / 255.0);
-            pixels[idx + 1] = f32_to_u8_trunc(f32::from(pixels[idx + 1]) * factor * lg / 255.0);
-            pixels[idx + 2] = f32_to_u8_trunc(f32::from(pixels[idx + 2]) * factor * lb / 255.0);
+            // Premultiplied: no color channel may exceed alpha.
+            let alpha = pixels[idx + 3];
+            let lit = |v: u8, light: Scalar| {
+                f32_to_u8_trunc(f32::from(v) * factor * light / 255.0).min(alpha)
+            };
+            pixels[idx] = lit(pixels[idx], lr);
+            pixels[idx + 1] = lit(pixels[idx + 1], lg);
+            pixels[idx + 2] = lit(pixels[idx + 2], lb);
         }
     }
 }
@@ -3008,6 +3013,23 @@ mod tests {
             None,
         );
         assert!(biased.affects_transparent_black());
+    }
+
+    #[test]
+    fn lighting_keeps_pixels_premultiplied() {
+        let lighting = LightingImageFilter::diffuse(
+            LightType::Distant {
+                direction: (0.0, 0.0, 1.0),
+            },
+            10.0,
+            1.0,
+            Color4f::new(1.0, 1.0, 1.0, 1.0),
+            None,
+        );
+        // Half-transparent red (premultiplied 128, 0, 0, 128).
+        let mut pixels = vec![128u8, 0, 0, 128];
+        lighting.apply(&mut pixels, 1, 1);
+        assert!(pixels[0] <= pixels[3], "color <= alpha: {pixels:?}");
     }
 
     #[test]
