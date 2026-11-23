@@ -460,6 +460,9 @@ fn export_node(output: &mut String, node: &SvgNode, options: &SvgExportOptions, 
                     if options.pretty_print {
                         output.push_str(&options.indent.repeat(depth + 1));
                     }
+                    // A "]]>" inside the CSS would end the CDATA section:
+                    // split it across two sections.
+                    let css = css.replace("]]>", "]]]]><![CDATA[>");
                     write!(output, "<![CDATA[{css}]]>").unwrap();
                     output.push_str(newline);
                 }
@@ -1066,6 +1069,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_export_style_cdata_escapes_its_terminator() {
+        // "]]>" in the CSS must not end the CDATA section early: the export
+        // must re-parse with the rule intact.
+        use crate::parser::parse_svg;
+
+        let svg_in = r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+          <style>rect { fill: red; } /* ]]&gt; */</style>
+          <rect x="0" y="0" width="10" height="10"/>
+        </svg>"#;
+        let dom = parse_svg(svg_in).unwrap();
+        let exported = export_svg(&dom);
+        let reparsed = parse_svg(&exported);
+        assert!(
+            reparsed.is_ok(),
+            "export must stay well-formed:
+{exported}"
+        );
+        assert_eq!(reparsed.unwrap().stylesheet.rules.len(), 1);
+    }
     #[test]
     fn test_export_style_element_round_trips() {
         // When a <style> block is parsed, its contents end up in the
