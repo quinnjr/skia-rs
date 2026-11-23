@@ -13,6 +13,7 @@ const STROKE_FLATTEN_TOLERANCE: Scalar = 0.25;
 
 /// Stroke cap style for stroke-to-fill conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum StrokeCap {
     /// Flat cap - no extension beyond the endpoint.
@@ -26,6 +27,7 @@ pub enum StrokeCap {
 
 /// Stroke join style for stroke-to-fill conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum StrokeJoin {
     /// Miter join - sharp corners.

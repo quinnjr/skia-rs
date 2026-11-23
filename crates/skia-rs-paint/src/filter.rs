@@ -252,6 +252,7 @@ impl ColorFilter for ColorMatrixFilter {
 
 /// Blur style for mask filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum BlurStyle {
     /// Normal blur.
@@ -708,6 +709,7 @@ impl MaskFilter for TableMaskFilter {
 
 /// Morphology filter type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MorphologyType {
     /// Dilate (expand bright regions).
     Dilate,
@@ -973,6 +975,7 @@ pub struct DisplacementMapImageFilter {
 
 /// Color channel selector for displacement map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ColorChannel {
     /// Red channel.
     R,

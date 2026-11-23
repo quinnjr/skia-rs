@@ -46,6 +46,7 @@ const fn sorted_rect(rect: Rect) -> Rect {
 ///
 /// Equivalent to Skia's `SkIPoint`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct IPoint {
     /// X coordinate.
@@ -101,6 +102,7 @@ impl IPoint {
 ///
 /// Equivalent to Skia's `SkPoint` / `SkVector`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct Point {
     /// X coordinate.
@@ -325,6 +327,7 @@ impl std::ops::Neg for Point {
 ///
 /// Equivalent to Skia's `SkPoint3`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct Point3 {
     /// X coordinate.
@@ -388,6 +391,7 @@ impl Point3 {
 ///
 /// Equivalent to Skia's `SkISize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct ISize {
     /// Width.
@@ -433,6 +437,7 @@ impl ISize {
 ///
 /// Equivalent to Skia's `SkSize`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct Size {
     /// Width.
@@ -518,6 +523,7 @@ impl From<ISize> for Size {
 ///
 /// Equivalent to Skia's `SkIRect`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct IRect {
     /// Left edge.
@@ -700,6 +706,7 @@ impl IRect {
 ///
 /// Equivalent to Skia's `SkRect`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct Rect {
     /// Left edge.
@@ -1003,6 +1010,7 @@ impl From<IRect> for Rect {
 ///
 /// Equivalent to Skia's `SkRRect`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RRect {
     /// The bounding rectangle.
     pub rect: Rect,
@@ -1013,6 +1021,7 @@ pub struct RRect {
 
 /// Corner indices for `RRect`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum Corner {
     /// Top-left corner.
@@ -1164,6 +1173,7 @@ impl RRect {
 /// | persp_0  persp_1  persp_2 |
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Matrix {
     /// Matrix values in row-major order.
     pub values: [Scalar; 9],
@@ -2007,5 +2017,30 @@ mod tests {
         let rect = Rect::new(0.0, 0.0, 40.0, 20.0);
         let rr = RRect::from_rect_xy(rect, 5.0, 0.0);
         assert!(rr.is_rect(), "one zero radius must yield square corners");
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use super::*;
+
+    #[test]
+    fn geometry_round_trips_through_serde() {
+        let rect = Rect::new(1.0, 2.5, 30.0, 40.25);
+        let json = serde_json::to_string(&rect).unwrap();
+        assert_eq!(serde_json::from_str::<Rect>(&json).unwrap(), rect);
+
+        let m = Matrix::translate(3.0, 4.0).concat(&Matrix::scale(2.0, 0.5));
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(serde_json::from_str::<Matrix>(&json).unwrap(), m);
+
+        let info =
+            crate::ImageInfo::new_srgb(4, 3, crate::ColorType::Rgba8888, crate::AlphaType::Premul)
+                .unwrap();
+        let json = serde_json::to_string(&info).unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::ImageInfo>(&json).unwrap(),
+            info
+        );
     }
 }

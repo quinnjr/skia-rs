@@ -19,6 +19,7 @@ use std::sync::Arc;
 /// caller draws the result with whatever the record says afterwards, even
 /// when the effect itself failed (`skpathutils::FillPathWithPaint`).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum StrokeRec {
     /// Fill the geometry.
     Fill,
@@ -116,6 +117,7 @@ pub trait PathEffect: Send + Sync + std::fmt::Debug {
 
 /// Kind of path effect (for debugging/inspection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PathEffectKind {
     /// Dash effect.
     Dash,
@@ -1206,6 +1208,7 @@ pub struct TrimEffect {
 
 /// Trim mode for path effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TrimMode {
     /// Normal trim (from start to end).
     #[default]
@@ -1531,6 +1534,7 @@ fn cubic_length(p0: Point, p1: Point, p2: Point, p3: Point) -> Scalar {
 
 /// Style for how the stamped path is placed along the input path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Path1DStyle {
     /// Translate the path shape.
     #[default]

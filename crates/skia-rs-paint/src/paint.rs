@@ -16,6 +16,7 @@ fn color_component_to_byte(v: Scalar) -> u8 {
 
 /// Paint style (fill, stroke, or both).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum Style {
     /// Fill the shape.
@@ -29,6 +30,7 @@ pub enum Style {
 
 /// Stroke cap style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum StrokeCap {
     /// Flat cap.
@@ -42,6 +44,7 @@ pub enum StrokeCap {
 
 /// Stroke join style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum StrokeJoin {
     /// Miter join.

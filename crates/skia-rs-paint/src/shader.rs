@@ -315,6 +315,7 @@ fn read_pixel_rgba8(
 ///
 /// Determines how a shader handles coordinates outside its bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum TileMode {
     /// Clamp to edge color.
@@ -394,6 +395,7 @@ pub trait Shader: Send + Sync + std::fmt::Debug {
 
 /// Kind of shader (for debugging/inspection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ShaderKind {
     /// Solid color shader.
     Color,
@@ -1216,6 +1218,7 @@ pub struct ImageShader {
 
 /// Sampling options for image shaders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SamplingOptions {
     /// Filter mode.
     pub filter: FilterMode,
@@ -1225,6 +1228,7 @@ pub struct SamplingOptions {
 
 /// Filter mode for image sampling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum FilterMode {
     /// Nearest neighbor sampling.
@@ -1236,6 +1240,7 @@ pub enum FilterMode {
 
 /// Mipmap mode for image sampling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum MipmapMode {
     /// No mipmapping.
@@ -1729,6 +1734,7 @@ pub struct PerlinNoiseShader {
 
 /// Type of Perlin noise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum NoiseType {
     /// Fractal noise (smoother).
     FractalNoise,

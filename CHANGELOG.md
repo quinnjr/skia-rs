@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Canvas::composite_layer_pixels`.
 - **Breaking**: `DrawCommand::SaveLayer` has a `flags` field, so recorded
   layers keep `INIT_WITH_PREVIOUS` on playback.
+- The `serde` feature (core, path, paint, and `skia-rs-safe`/`skia-rs`)
+  now does something: it derives `Serialize`/`Deserialize` for the plain
+  value types (points, sizes, rects, `RRect`, `Matrix`, `Matrix44`,
+  colors, `ImageInfo`/`ColorSpace`, surface props, and the enums such as
+  `BlendMode`, `FillType`, `Verb`, `TileMode`, stroke caps/joins). Types with
+  internal invariants (`Path`, `Region`) or shared handles (`Paint`,
+  shaders, filters) are not serializable yet.
 - **Breaking**: `DashEffect::new` (and the C API's dash constructor)
   returns `None` for an odd number of intervals, like
   `SkDashPathEffect::Make`, instead of repeating the pattern. The SVG

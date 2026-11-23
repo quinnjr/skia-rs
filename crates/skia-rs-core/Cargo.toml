@@ -29,6 +29,7 @@ thiserror = { workspace = true }
 serde = { workspace = true, optional = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 proptest = { workspace = true }
 cargo-husky = { workspace = true }
 

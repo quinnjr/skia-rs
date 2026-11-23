@@ -55,6 +55,7 @@ pub enum PixelError {
 ///
 /// Equivalent to Skia's `SkImageInfo`.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ImageInfo {
     /// Image dimensions.
     pub dimensions: ISize,
@@ -622,6 +623,7 @@ impl Default for Bitmap {
 bitflags! {
     /// Surface properties flags.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     pub struct SurfacePropsFlags: u32 {
         /// Use device-independent fonts.
         const USE_DEVICE_INDEPENDENT_FONTS = 1 << 0;
@@ -630,6 +632,7 @@ bitflags! {
 
 /// Pixel geometry for LCD text rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum PixelGeometry {
     /// Unknown pixel geometry.
@@ -647,6 +650,7 @@ pub enum PixelGeometry {
 
 /// Properties of a surface (for text rendering hints).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SurfaceProps {
     /// Flags.
     pub flags: SurfacePropsFlags,

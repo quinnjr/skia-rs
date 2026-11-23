@@ -9,6 +9,7 @@ use skia_rs_core::Color4f;
 
 /// Porter-Duff and other blend modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum BlendMode {
     // Porter-Duff modes
