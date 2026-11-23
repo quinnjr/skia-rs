@@ -1096,6 +1096,9 @@ impl<'a> Rasterizer<'a> {
         // Trim to the device outset by one (Skia intersects with the clip
         // bounds outset by 1) so the integer extents cannot overflow.
         let (w, h) = (self.buffer.width, self.buffer.height);
+        if w <= 0 || h <= 0 {
+            return;
+        }
         let trim = |v: Scalar, hi: i32| floor_to_i32(v).clamp(-1, hi.saturating_add(1));
         let (left, top) = (trim(dev.left, w), trim(dev.top, h));
         let (right, bottom) = (trim(dev.right + 1.0, w), trim(dev.bottom + 1.0, h));

@@ -226,7 +226,7 @@ impl ClipMask {
                     || dy < intersection.top
                     || dy >= intersection.bottom
                 {
-                    self.coverage[usize::try_from(y * self.width + x).unwrap_or(0)] = 0;
+                    self.coverage[Self::index(x, y, self.width)] = 0;
                 }
             }
         }
@@ -239,7 +239,7 @@ impl ClipMask {
                 let dx = x + self.bounds.left;
                 let dy = y + self.bounds.top;
                 if !rect.contains(dx, dy) {
-                    self.coverage[usize::try_from(y * self.width + x).unwrap_or(0)] = 0;
+                    self.coverage[Self::index(x, y, self.width)] = 0;
                 }
             }
         }

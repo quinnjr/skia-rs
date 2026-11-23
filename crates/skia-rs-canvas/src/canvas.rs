@@ -674,21 +674,11 @@ impl<'a> Canvas<'a> {
         paint: Option<Paint>,
     ) {
         let paint = paint.unwrap_or_default();
-        // A buffer too short for its rows cannot be filtered or read: skip it
-        // rather than composite a partly processed (or out-of-range) layer.
-        {
-            let to_usize = |v: i32| usize::try_from(v).unwrap_or(0);
-            let (w, h) = (to_usize(src_pixels.width), to_usize(src_pixels.height));
-            // Checked throughout: on 32-bit targets a bogus width overflows.
-            let Some(row) = w.checked_mul(4) else {
-                return;
-            };
-            let needed = h.checked_sub(1).map_or(Some(0), |rows| {
-                rows.checked_mul(src_pixels.stride)?.checked_add(row)
-            });
-            if src_pixels.stride < row || needed.is_none_or(|n| src_pixels.pixels.len() < n) {
-                return;
-            }
+        // A buffer too short for its rows (or of negative size) cannot be
+        // filtered or read: skip it rather than composite a partly processed
+        // or out-of-range layer.
+        if !layer_buffer_is_valid(&src_pixels) {
+            return;
         }
         if let Some(filter) = paint.image_filter() {
             let to_usize = |v: i32| usize::try_from(v).unwrap_or(0);
@@ -3336,6 +3326,24 @@ fn device_clip_path(path: &Path, matrix: &Matrix) -> Path {
     out
 }
 
+/// Whether a layer buffer's size, stride and pixel length are consistent
+/// (non-negative size, rows of at least `width * 4` bytes, all rows
+/// present), with checked arithmetic so a bogus size cannot overflow.
+fn layer_buffer_is_valid(buffer: &PixelBuffer) -> bool {
+    let (Ok(w), Ok(h)) = (
+        usize::try_from(buffer.width),
+        usize::try_from(buffer.height),
+    ) else {
+        return false;
+    };
+    let Some(row) = w.checked_mul(4) else {
+        return false;
+    };
+    let needed = h.checked_sub(1).map_or(Some(0), |rows| {
+        rows.checked_mul(buffer.stride)?.checked_add(row)
+    });
+    buffer.stride >= row && needed.is_some_and(|n| buffer.pixels.len() >= n)
+}
 /// The layer pixel ranges (x, y) that can change anything when compositing
 /// a `layer` (origin and size) onto a `target` (origin and size) through a
 /// clip with integer bounds `clip`: elsewhere the clip coverage is 0 or the
@@ -3347,6 +3355,8 @@ fn composite_window(
     clip: IRect,
 ) -> (std::ops::Range<i32>, std::ops::Range<i32>) {
     let (lx, ly, lw, lh) = layer;
+    // Sizes are clamped non-negative: i32::clamp panics if min > max.
+    let (lw, lh) = (lw.max(0), lh.max(0));
     let (tx, ty, tw, th) = target;
     let left = tx.max(clip.left);
     let top = ty.max(clip.top);

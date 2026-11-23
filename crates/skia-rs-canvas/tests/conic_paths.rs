@@ -2266,3 +2266,17 @@ fn closed_two_point_contours_stroke_as_a_line() {
         assert!(!lit(&buffer, 50, 80), "{join:?}: only along the line");
     }
 }
+
+#[test]
+fn negative_size_buffers_draw_nothing_instead_of_panicking() {
+    // PixelBuffer's fields are public, so a negative size can reach the
+    // compositing and hairline-rect code; both must skip it.
+    let mut target = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut target).composite_layer_pixels(PixelBuffer::new(-1, 8), (0, 0), None);
+
+    let mut bogus = PixelBuffer::new(-5, 10);
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    paint.set_anti_alias(false);
+    Canvas::new_raster(&mut bogus).draw_rect(&Rect::new(1.0, 1.0, 4.0, 4.0), &paint);
+}
