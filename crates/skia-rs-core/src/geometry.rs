@@ -1051,14 +1051,102 @@ impl TryFrom<RRectData> for RRect {
             .iter()
             .all(|p| valid(p.x, r.left, r.right) && valid(p.y, r.top, r.bottom));
         if finite && sorted && radii_ok {
-            Ok(Self {
-                rect: data.rect,
-                radii: data.radii,
-            })
+            // SkRRect::readFromMemory then normalizes through setRectRadii.
+            Ok(Self::from_rect_radii(data.rect, data.radii))
         } else {
             Err("invalid RRect: unsorted or non-finite rect, or a radius out of range")
         }
     }
+}
+
+/// `SkRRect`'s `clamp_to_zero`: a corner with either radius `<= 0` becomes
+/// square. Returns whether every corner is square.
+fn clamp_radii_to_zero(radii: &mut [Point; 4]) -> bool {
+    let mut all_square = true;
+    for r in radii.iter_mut() {
+        if r.x <= 0.0 || r.y <= 0.0 {
+            *r = Point::zero();
+        } else {
+            all_square = false;
+        }
+    }
+    all_square
+}
+
+/// `SkRRect`'s `compute_min_scale`.
+fn compute_min_scale(rad1: Scalar, rad2: Scalar, limit: f64, cur_min: f64) -> f64 {
+    let sum = f64::from(rad1) + f64::from(rad2);
+    if sum > limit {
+        cur_min.min(limit / sum)
+    } else {
+        cur_min
+    }
+}
+
+/// `SkRRect`'s `flush_to_zero`: a radius too small to change the sum is
+/// zeroed.
+#[allow(clippy::float_cmp, reason = "exact absorption test, as in Skia")]
+fn flush_to_zero(a: Scalar, b: Scalar) -> (Scalar, Scalar) {
+    if a + b == a {
+        (a, 0.0)
+    } else if a + b == b {
+        (0.0, b)
+    } else {
+        (a, b)
+    }
+}
+
+/// `nextafterf(x, 0)`.
+fn next_toward_zero(x: Scalar) -> Scalar {
+    if x == 0.0 || x.is_nan() {
+        x
+    } else {
+        Scalar::from_bits(x.to_bits() - 1)
+    }
+}
+
+/// `SkScaleToSides::AdjustRadii`: scales the pair, then steps radii down
+/// so they fit between `min_coord` and `max_coord` despite float rounding.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "f64 -> f32 narrowing, as in SkScaleToSides"
+)]
+fn adjust_radii(
+    scale: f64,
+    a: Scalar,
+    b: Scalar,
+    min_coord: Scalar,
+    max_coord: Scalar,
+) -> (Scalar, Scalar) {
+    let limit = (f64::from(max_coord) - f64::from(min_coord)).min(f64::from(max_coord - min_coord));
+    let (mut a, mut b) = (a, b);
+    if scale < 1.0 {
+        a = (f64::from(a) * scale) as Scalar;
+        b = (f64::from(b) * scale) as Scalar;
+    }
+    if max_coord - b < min_coord {
+        b = next_toward_zero(max_coord - min_coord);
+    }
+    if min_coord + a > max_coord {
+        a = next_toward_zero(max_coord - min_coord);
+    }
+    if f64::from(a + b) > limit {
+        let a_is_min = a <= b;
+        let new_min = if a_is_min { a } else { b };
+        let mut new_max = (limit - f64::from(new_min)) as Scalar;
+        loop {
+            if !(f64::from(new_max + new_min) > limit && new_max > 0.0) {
+                break;
+            }
+            new_max = next_toward_zero(new_max);
+        }
+        if a_is_min {
+            b = new_max;
+        } else {
+            a = new_max;
+        }
+    }
+    (a, b)
 }
 
 /// Corner indices for `RRect`.
@@ -1122,6 +1210,82 @@ impl RRect {
         Self {
             rect,
             radii: [radius, radius, radius, radius],
+        }
+    }
+
+    /// Creates a rounded rectangle with per-corner radii (upper-left,
+    /// upper-right, lower-right, lower-left), like `SkRRect::setRectRadii`.
+    ///
+    /// A non-finite rect gives the empty rrect, and the rect is sorted. Non-
+    /// finite radii give a plain rect. A corner with either radius `<= 0` is
+    /// square. Radii that overlap along a side are scaled down together to
+    /// fit (`scaleRadii`, CSS "overlapping curves").
+    #[must_use]
+    pub fn from_rect_radii(rect: Rect, radii: [Point; 4]) -> Self {
+        let base = Self::from_rect(rect);
+        if !rect.is_finite() || base.rect.is_empty() {
+            return base;
+        }
+        if radii.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+            return base;
+        }
+        let mut radii = radii;
+        if clamp_radii_to_zero(&mut radii) {
+            return base;
+        }
+        let mut rr = Self {
+            rect: base.rect,
+            radii,
+        };
+        rr.scale_radii();
+        rr
+    }
+
+    /// `SkRRect::scaleRadii`: scales all radii by the smallest ratio of a
+    /// side to the sum of its two radii (if below 1), then fixes up float
+    /// precision so each pair fits its side.
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact comparisons, as in SkRRect::scaleRadii"
+    )]
+    fn scale_radii(&mut self) {
+        let r = &mut self.radii;
+        let was_simple = r[0] == r[1] && r[0] == r[2] && r[0] == r[3];
+        let was_circular = was_simple && r[0].x == r[0].y;
+        let (left, top, right, bottom) = (
+            self.rect.left,
+            self.rect.top,
+            self.rect.right,
+            self.rect.bottom,
+        );
+        let width = f64::from(right) - f64::from(left);
+        let height = f64::from(bottom) - f64::from(top);
+        let mut scale = 1.0;
+        scale = compute_min_scale(r[0].x, r[1].x, width, scale);
+        scale = compute_min_scale(r[1].y, r[2].y, height, scale);
+        scale = compute_min_scale(r[2].x, r[3].x, width, scale);
+        scale = compute_min_scale(r[3].y, r[0].y, height, scale);
+
+        (r[0].x, r[1].x) = flush_to_zero(r[0].x, r[1].x);
+        (r[1].y, r[2].y) = flush_to_zero(r[1].y, r[2].y);
+        (r[2].x, r[3].x) = flush_to_zero(r[2].x, r[3].x);
+        (r[3].y, r[0].y) = flush_to_zero(r[3].y, r[0].y);
+
+        (r[0].x, r[1].x) = adjust_radii(scale, r[0].x, r[1].x, left, right);
+        (r[1].y, r[2].y) = adjust_radii(scale, r[1].y, r[2].y, top, bottom);
+        (r[3].x, r[2].x) = adjust_radii(scale, r[3].x, r[2].x, left, right);
+        (r[0].y, r[3].y) = adjust_radii(scale, r[0].y, r[3].y, top, bottom);
+
+        // Adjusting may zero one radius of a corner: square it. Keep a
+        // simple (and circular) rrect symmetric if 1-ulp fixes broke it.
+        if !clamp_radii_to_zero(r) && was_simple {
+            let mut min_x = r.iter().map(|p| p.x).fold(Scalar::INFINITY, Scalar::min);
+            let mut min_y = r.iter().map(|p| p.y).fold(Scalar::INFINITY, Scalar::min);
+            if was_circular {
+                min_x = min_x.min(min_y);
+                min_y = min_x;
+            }
+            *r = [Point::new(min_x, min_y); 4];
         }
     }
 
@@ -1894,6 +2058,29 @@ mod tests {
     }
 
     #[test]
+    fn test_rrect_from_rect_radii_normalizes_like_set_rect_radii() {
+        let rect = Rect::new(0.0, 0.0, 10.0, 10.0);
+        // Overlapping radii scale by 10 / 16.
+        let rr = RRect::from_rect_radii(rect, [Point::new(8.0, 8.0); 4]);
+        assert_eq!(rr.radii, [Point::new(5.0, 5.0); 4]);
+        // A half-zero corner is square; the others keep their radii.
+        let rr = RRect::from_rect_radii(
+            rect,
+            [
+                Point::new(0.0, 5.0),
+                Point::new(2.0, 2.0),
+                Point::new(2.0, 2.0),
+                Point::new(2.0, 2.0),
+            ],
+        );
+        assert_eq!(rr.radii[0], Point::zero());
+        assert_eq!(rr.radii[1], Point::new(2.0, 2.0));
+        // Non-finite radii give a plain rect.
+        let rr = RRect::from_rect_radii(rect, [Point::new(f32::NAN, 1.0); 4]);
+        assert_eq!(rr.radii, [Point::zero(); 4]);
+    }
+
+    #[test]
     fn test_rrect_from_rect_xy_clamps_radii() {
         let rect = Rect::new(0.0, 0.0, 100.0, 50.0);
 
@@ -2120,6 +2307,14 @@ mod serde_tests {
         };
         let bad = serde_json::to_string(&bad_rr).unwrap();
         assert!(serde_json::from_str::<RRect>(&bad).is_err());
+        // ... and normalize like setRectRadii: overlapping radii scale down.
+        let overlapping = RRect {
+            radii: [Point::new(8.0, 8.0); 4],
+            ..rr
+        };
+        let json = serde_json::to_string(&overlapping).unwrap();
+        let back = serde_json::from_str::<RRect>(&json).unwrap();
+        assert_eq!(back.radii, [Point::new(5.0, 5.0); 4]);
 
         // Deserializing validates like ImageInfo::new: no negative sizes.
         let json = serde_json::to_string(&info).unwrap();
