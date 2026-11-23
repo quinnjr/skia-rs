@@ -623,6 +623,10 @@ impl<'a> Rasterizer<'a> {
     /// `bw_line_hair_proc` / `aa_line_hair_proc` (`SkScan::HairLine`).
     /// Only hairline *paths* extend their ends for caps (`hair_path`).
     pub fn draw_line(&mut self, p0: Point, p1: Point, paint: &Paint) {
+        // SkCanvas::drawPoints quick-rejects non-finite points.
+        if ![p0.x, p0.y, p1.x, p1.y].iter().all(|v| v.is_finite()) {
+            return;
+        }
         if paint.stroke_width() > 0.0 {
             let mut b = PathBuilder::new();
             b.move_to(p0.x, p0.y).line_to(p1.x, p1.y);
