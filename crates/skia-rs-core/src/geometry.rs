@@ -1278,6 +1278,10 @@ impl RRect {
         (r[2].x, r[3].x) = flush_to_zero(r[2].x, r[3].x);
         (r[3].y, r[0].y) = flush_to_zero(r[3].y, r[0].y);
 
+        // Argument order exactly as SkRRect::scaleRadii (the bottom edge
+        // passes lower-left before lower-right, the left edge upper-left
+        // before lower-left); AdjustRadii scales only when scale < 1 but
+        // always applies its float fix-ups.
         (r[0].x, r[1].x) = adjust_radii(scale, r[0].x, r[1].x, left, right);
         (r[1].y, r[2].y) = adjust_radii(scale, r[1].y, r[2].y, top, bottom);
         (r[3].x, r[2].x) = adjust_radii(scale, r[3].x, r[2].x, left, right);

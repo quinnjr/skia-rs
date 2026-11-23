@@ -292,6 +292,13 @@ impl<'a> Canvas<'a> {
     /// through it with the paint's image filter (mapped through the current
     /// matrix), color filter, alpha and blend mode.
     ///
+    /// Unlike `~SkCanvas`, dropping a `Canvas` does not restore open saves (a
+    /// `Drop` impl would hold the canvas's borrow of its pixels until the end
+    /// of its scope): call [`restore`](Self::restore) or
+    /// [`restore_to_count(1)`](Self::restore_to_count) before dropping it, or a
+    /// still-open layer's content is discarded. (The C API's
+    /// `sk_canvas_release` does unwind open layers.)
+    ///
     /// Recording backings emit a [`DrawCommand::SaveLayer`] and rely on
     /// playback (against a raster canvas) to do the composition. Null
     /// backings behave like plain [`save`](Self::save) — no layer is
