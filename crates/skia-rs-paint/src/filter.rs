@@ -433,8 +433,9 @@ pub trait ImageFilter: Send + Sync + std::fmt::Debug {
     ///   not resampled);
     /// - lighting: lights map under translate, scale and quarter turns
     ///   (`apply` here shades with a uniform factor, not per-pixel normals);
-    /// - displacement map: under translate and positive uniform scale (one
-    ///   signed scale for both axes cannot express rotations or mirrors).
+    /// - displacement map: under translate, uniform scale, half turns and
+    ///   diagonal swaps (one signed scale for both axes cannot express other
+    ///   quarter turns or single-axis mirrors).
     ///
     /// Anisotropic filters under other rotations or skews are fitted to the
     /// nearest axes.
@@ -1238,11 +1239,34 @@ impl ImageFilter for DisplacementMapImageFilter {
         // Skia maps the scale as a size; this filter has one scale for
         // both axes, so take the mean of the two mapped lengths.
         let (sx, sy) = map_size(matrix, self.scale, self.scale);
+        // The local displacement (scale * (cx, cy)) maps through the linear
+        // part. One signed scale can express that exactly when both device
+        // axes get the same sign: scale/translate with equal signs (incl. a
+        // half turn), or an axis swap with equal signs (channels swap).
+        // Other quarter turns and single-axis mirrors are approximated by
+        // the magnitude with the original sign.
+        let values = &matrix.values;
+        let (scale_x, skew_x, skew_y, scale_y) = (
+            values[Matrix::SCALE_X],
+            values[Matrix::SKEW_X],
+            values[Matrix::SKEW_Y],
+            values[Matrix::SCALE_Y],
+        );
+        let same_sign =
+            |lhs: Scalar, rhs: Scalar| lhs != 0.0 && rhs != 0.0 && (lhs > 0.0) == (rhs > 0.0);
+        let (x_channel, y_channel, sign) =
+            if skew_x == 0.0 && skew_y == 0.0 && same_sign(scale_x, scale_y) {
+                (self.x_channel, self.y_channel, scale_x.signum())
+            } else if scale_x == 0.0 && scale_y == 0.0 && same_sign(skew_x, skew_y) {
+                (self.y_channel, self.x_channel, skew_x.signum())
+            } else {
+                (self.x_channel, self.y_channel, 1.0)
+            };
         Some(Arc::new(Self {
-            x_channel: self.x_channel,
-            y_channel: self.y_channel,
-            // Lengths lose the sign; the scale's sign sets the direction.
-            scale: f32::midpoint(sx, sy).copysign(self.scale),
+            x_channel,
+            y_channel,
+            // Lengths lose the sign: restore it from the scale and matrix.
+            scale: f32::midpoint(sx, sy).copysign(self.scale) * sign,
             displacement: map_image_filter(&self.displacement, matrix),
             color: map_input(self.color.as_ref(), matrix),
         }))
@@ -3042,6 +3066,32 @@ mod tests {
         // Mapping (done for every layer) leaves the bogus kernel alone.
         let mapped = map_image_filter(&conv, &Matrix::rotate(90.0_f32.to_radians()));
         assert!(format!("{mapped:?}").contains("kernel_size: (65536, 65536)"));
+    }
+
+    #[test]
+    fn displacement_mapping_follows_half_turns_and_diagonal_swaps() {
+        let map: ImageFilterRef = Arc::new(OffsetImageFilter::new(0.0, 0.0, None));
+        let filter: ImageFilterRef = Arc::new(DisplacementMapImageFilter::new(
+            ColorChannel::R,
+            ColorChannel::G,
+            20.0,
+            map,
+            None,
+        ));
+        // A half turn reverses both axes: the scale's sign flips.
+        let turned = format!(
+            "{:?}",
+            map_image_filter(&filter, &Matrix::rotate(180.0_f32.to_radians()))
+        );
+        assert!(turned.contains("scale: -20.0"), "{turned}");
+        // Reflecting across the diagonal swaps which channel drives which axis.
+        let mut swap = Matrix::identity();
+        swap.values = [0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let swapped = format!("{:?}", map_image_filter(&filter, &swap));
+        assert!(
+            swapped.contains("x_channel: G") && swapped.contains("y_channel: R"),
+            "{swapped}"
+        );
     }
 
     #[test]
