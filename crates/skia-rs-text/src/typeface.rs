@@ -242,21 +242,29 @@ fn next_typeface_id() -> u32 {
     NEXT_TYPEFACE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Whether a font read error may clear up later (so the lookup should not
-/// be cached), as opposed to a path that is permanently missing or
-/// unreadable.
+/// Whether a font read error is clearly transient (so a miss should not be
+/// cached). Anything else (missing, forbidden, a loop, an I/O error) counts
+/// as permanent for that candidate.
 fn is_transient(error: &std::io::Error) -> bool {
     use std::io::ErrorKind;
-    !matches!(
+    // Too many open files: EMFILE/ENFILE, or Windows'
+    // ERROR_TOO_MANY_OPEN_FILES.
+    #[cfg(unix)]
+    const TOO_MANY_OPEN_FILES: &[i32] = &[23, 24];
+    #[cfg(windows)]
+    const TOO_MANY_OPEN_FILES: &[i32] = &[4];
+    #[cfg(not(any(unix, windows)))]
+    const TOO_MANY_OPEN_FILES: &[i32] = &[];
+    matches!(
         error.kind(),
-        ErrorKind::NotFound
-            | ErrorKind::PermissionDenied
-            | ErrorKind::NotADirectory
-            | ErrorKind::IsADirectory
-            | ErrorKind::InvalidInput
-            | ErrorKind::InvalidFilename
-            | ErrorKind::InvalidData
-    )
+        ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+            | ErrorKind::ResourceBusy
+            | ErrorKind::OutOfMemory
+    ) || error
+        .raw_os_error()
+        .is_some_and(|code| TOO_MANY_OPEN_FILES.contains(&code))
 }
 
 /// Well-known locations of each platform's default sans-serif font, in order
@@ -355,10 +363,11 @@ impl Typeface {
     /// [`from_data`](Self::from_data)). Like Skia's default typeface (set
     /// up once with `SkOnce`), the lookup runs once per process whether it
     /// finds a font or not, so a font-less environment does not re-probe the
-    /// candidate paths on every call. A result is not remembered after a
-    /// transient read error (too many open files, an interrupted or timed-out
-    /// read): the next call tries again, so the preferred font can still
-    /// load. Missing or permanently unreadable candidates do not count.
+    /// candidate paths on every call. A font that loads is always kept, even
+    /// a fallback reached because a preferred candidate failed, so every call
+    /// returns the same typeface. A miss is not kept when a candidate failed
+    /// with a clearly transient error (too many open files, an interrupted,
+    /// timed-out or busy read): the next call tries again.
     #[must_use]
     pub fn system_default() -> Option<Self> {
         // A hit, or a definite miss, is cached; every call shares it.
@@ -378,10 +387,9 @@ impl Typeface {
                         None
                     }
                 });
-        // After a transient error the result (hit or miss) is not final: a
-        // preferred candidate may load next time.
-        if transient_error {
-            return found;
+        // A miss after a transient error may clear up: try again next call.
+        if found.is_none() && transient_error {
+            return None;
         }
         // If two threads look up concurrently, the first result is kept.
         TYPEFACE.get_or_init(|| found).clone()
@@ -590,6 +598,22 @@ pub type TypefaceRef = Arc<Typeface>;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_clearly_transient_read_errors_are_retried() {
+        use std::io::{Error, ErrorKind};
+        assert!(super::is_transient(&Error::from(ErrorKind::Interrupted)));
+        assert!(super::is_transient(&Error::from(ErrorKind::TimedOut)));
+        #[cfg(unix)]
+        assert!(super::is_transient(&Error::from_raw_os_error(24)));
+        #[cfg(windows)]
+        assert!(super::is_transient(&Error::from_raw_os_error(4)));
+        assert!(!super::is_transient(&Error::from(ErrorKind::NotFound)));
+        assert!(!super::is_transient(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!super::is_transient(&Error::other("I/O error")));
+    }
+
     use super::*;
 
     #[test]
