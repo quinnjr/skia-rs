@@ -713,9 +713,15 @@ impl<'a> Canvas<'a> {
         let src_w = src_buf.width;
         let src_h = src_buf.height;
 
-        for y in 0..src_h {
+        let (x_range, y_range) = composite_window(
+            (offset_x, offset_y, src_w, src_h),
+            (tox, toy, target.width, target.height),
+            clip_stack.bounds().round_out(),
+        );
+
+        for y in y_range {
             let dy = offset_y + y;
-            for x in 0..src_w {
+            for x in x_range.clone() {
                 let dx = offset_x + x;
                 let src_offset = usize::try_from(y).unwrap_or(0) * src_buf.stride
                     + usize::try_from(x).unwrap_or(0) * 4;
@@ -3296,6 +3302,28 @@ fn device_clip_path(path: &Path, matrix: &Matrix) -> Path {
     };
     out.transform(matrix);
     out
+}
+
+/// The layer pixel ranges (x, y) that can change anything when compositing
+/// a `layer` (origin and size) onto a `target` (origin and size) through a
+/// clip with integer bounds `clip`: elsewhere the clip coverage is 0 or the
+/// write falls off the target. A filtered layer may be several times the
+/// device, so compositing walks just this window.
+fn composite_window(
+    layer: (i32, i32, i32, i32),
+    target: (i32, i32, i32, i32),
+    clip: IRect,
+) -> (std::ops::Range<i32>, std::ops::Range<i32>) {
+    let (lx, ly, lw, lh) = layer;
+    let (tx, ty, tw, th) = target;
+    let left = tx.max(clip.left);
+    let top = ty.max(clip.top);
+    let right = tx.saturating_add(tw).min(clip.right);
+    let bottom = ty.saturating_add(th).min(clip.bottom);
+    (
+        (left - lx).clamp(0, lw)..(right - lx).clamp(0, lw),
+        (top - ly).clamp(0, lh)..(bottom - ly).clamp(0, lh),
+    )
 }
 
 /// The device area a layer with image `filter` must cover to produce the
