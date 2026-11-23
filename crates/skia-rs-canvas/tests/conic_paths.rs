@@ -2151,3 +2151,69 @@ fn pictures_collapsed_by_their_matrix_draw_nothing() {
         );
     }
 }
+
+#[test]
+fn picture_quick_reject_keeps_what_filters_or_recordings_may_show() {
+    use skia_rs_canvas::{ClipOp, Picture};
+    use skia_rs_paint::OffsetImageFilter;
+    use std::sync::Arc;
+
+    let two_op_picture = |cull: Rect| {
+        let mut cmds = Vec::new();
+        {
+            let mut rec = Canvas::new_recording(&mut cmds, SIZE, SIZE);
+            rec.draw_rect(&cull, &white(Style::Fill));
+            rec.draw_rect(&cull, &white(Style::Fill));
+        }
+        Picture::from_parts(cmds, cull)
+    };
+
+    // An offset filter on the paint moves the content into the clip.
+    let picture = two_op_picture(Rect::new(0.0, 0.0, 50.0, 50.0));
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.clip_rect(
+            &Rect::new(60.0, 0.0, 200.0, 200.0),
+            ClipOp::Intersect,
+            false,
+        );
+        let mut paint = Paint::new();
+        paint.set_image_filter(Some(Arc::new(OffsetImageFilter::new(100.0, 0.0, None))));
+        canvas.draw_picture(&picture, None, Some(&paint));
+    }
+    assert!(lit(&buffer, 120, 20), "the offset content is drawn");
+
+    // A recording keeps pictures outside its record-time size.
+    let outside = two_op_picture(Rect::new(150.0, 0.0, 200.0, 50.0));
+    let mut cmds = Vec::new();
+    Canvas::new_recording(&mut cmds, 100, 100).draw_picture(&outside, None, None);
+    assert!(!cmds.is_empty(), "the picture is recorded");
+}
+
+#[test]
+fn quick_reject_under_perspective_never_rejects_visible_rects() {
+    // map_rect flips corners behind the camera; quick_reject must clip to
+    // the w plane first, so any rect it rejects really draws nothing.
+    use skia_rs_core::Matrix;
+
+    // (These rects' map_rect bounds miss the device entirely, though their
+    // in-front parts draw.)
+    let mut persp = Matrix::translate(0.0, 100.0);
+    persp.values[Matrix::PERSP_0] = -0.01;
+    for rect in [
+        Rect::new(-600.0, -600.0, 200.0, 200.0),
+        Rect::new(-600.0, -550.0, 200.0, 250.0),
+    ] {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        let rejected = {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            canvas.set_matrix(&persp);
+            let rejected = canvas.quick_reject(&rect);
+            canvas.draw_rect(&rect, &white(Style::Fill));
+            rejected
+        };
+        let drawn = (0..SIZE).any(|y| (0..SIZE).any(|x| lit(&buffer, x, y)));
+        assert!(!(rejected && drawn), "{rect:?} was rejected but draws");
+    }
+}

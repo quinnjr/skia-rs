@@ -1488,7 +1488,23 @@ impl<'a> Canvas<'a> {
         // the CTM against the clip (a matrix that collapses it, e.g. a zero
         // scale, draws nothing). An empty cull means "unknown" here (the C
         // API records one when no bounds are given), so it is not rejected.
-        if picture.approximate_op_count() > 1 && !cull.is_empty() && self.quick_reject(&bounds) {
+        // Like Skia, only bounds it can compute are rejected: not with a
+        // paint whose image filter may move content into view or whose color
+        // filter lights transparent black (canComputeFastBounds). And only
+        // when drawing pixels: a recording (SkRecorder) keeps every picture.
+        let fast_bounds = paint.is_none_or(|p| {
+            p.image_filter().is_none()
+                && !p.color_filter().is_some_and(|cf| {
+                    skia_rs_paint::color_filter_affects_transparent_black(cf.as_ref())
+                })
+        });
+        let drawing = matches!(self.backing, Backing::Raster(_));
+        if drawing
+            && fast_bounds
+            && picture.approximate_op_count() > 1
+            && !cull.is_empty()
+            && self.quick_reject(&bounds)
+        {
             return;
         }
         let restore_count = if let Some(p) = paint {
@@ -1522,7 +1538,17 @@ impl<'a> Canvas<'a> {
     #[inline]
     #[must_use]
     pub fn quick_reject(&self, rect: &Rect) -> bool {
-        let transformed = self.total_matrix().map_rect(rect);
+        // Under perspective, clip to the w plane before taking bounds (as
+        // SkMatrixPriv::MapRect does): map_rect would flip corners behind
+        // the camera and could reject a visible rect.
+        let matrix = self.total_matrix();
+        let transformed = if matrix.has_perspective() {
+            let mut b = skia_rs_path::PathBuilder::new();
+            b.add_rect(rect);
+            device_clip_path(&b.build(), matrix).bounds()
+        } else {
+            matrix.map_rect(rect)
+        };
         self.clip_stack.quick_reject(&transformed)
     }
 
