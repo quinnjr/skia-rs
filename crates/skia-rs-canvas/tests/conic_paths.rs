@@ -1638,3 +1638,71 @@ fn clip_rect_under_perspective_clips_to_the_projected_quad() {
     };
     assert_eq!(render(false), render(true));
 }
+
+#[test]
+fn init_with_previous_layers_start_from_the_pixels_below() {
+    // A Src-mode layer composites its own pixels over the destination. With
+    // INIT_WITH_PREVIOUS it starts as a copy of what is below, so an empty
+    // layer leaves the red fill; a transparent start would clear it.
+    use skia_rs_canvas::{SaveLayerFlags, SaveLayerRec};
+    use skia_rs_paint::BlendMode;
+
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        let mut red = Paint::new();
+        red.set_color32(Color::from_argb(255, 255, 0, 0));
+        canvas.draw_rect(&Rect::new(0.0, 0.0, 200.0, 200.0), &red);
+        let mut layer_paint = Paint::new();
+        layer_paint.set_blend_mode(BlendMode::Src);
+        canvas.save_layer(&SaveLayerRec {
+            paint: Some(&layer_paint),
+            flags: SaveLayerFlags::INIT_WITH_PREVIOUS,
+            ..SaveLayerRec::default()
+        });
+        canvas.restore();
+    }
+    let c = buffer.get_pixel(100, 100).unwrap_or(Color::BLACK);
+    assert_eq!(
+        (c.alpha(), c.red()),
+        (255, 255),
+        "the red fill survives: {c:?}"
+    );
+}
+
+#[test]
+fn layer_image_filters_apply_on_restore() {
+    // A blur image filter on the layer paint spreads the layer's content
+    // when it is composited, including into pixels just outside the clip
+    // set before the layer (Skia sizes the layer to the filter's input).
+    use skia_rs_canvas::{ClipOp, SaveLayerRec};
+    use skia_rs_paint::{BlurImageFilter, TileMode};
+    use std::sync::Arc;
+
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.clip_rect(&Rect::new(0.0, 0.0, 200.0, 100.0), ClipOp::Intersect, false);
+        let mut layer_paint = Paint::new();
+        layer_paint.set_image_filter(Some(Arc::new(BlurImageFilter::new(
+            4.0,
+            4.0,
+            TileMode::Decal,
+        ))));
+        canvas.save_layer(&SaveLayerRec {
+            paint: Some(&layer_paint),
+            ..SaveLayerRec::default()
+        });
+        // Half inside the clip: rows 100..120 are outside it.
+        canvas.draw_rect(&Rect::new(60.0, 80.0, 140.0, 120.0), &white(Style::Fill));
+        canvas.restore();
+    }
+    let alpha = |x, y| buffer.get_pixel(x, y).map_or(0, |c| c.alpha());
+    assert!(alpha(55, 90) > 0, "the blur spreads past the drawn edge");
+    assert!(alpha(57, 90) < 255, "the drawn edge is softened");
+    assert!(
+        alpha(100, 99) > 200,
+        "content beyond the clip feeds the blur"
+    );
+    assert_eq!(alpha(100, 101), 0, "the result is still clipped");
+}

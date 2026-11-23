@@ -46,6 +46,13 @@ impl SaveLayerFlags {
     pub const PRESERVE_LCD_TEXT: Self = Self(1 << 1);
     /// Initialize with previous layer.
     pub const INIT_WITH_PREVIOUS: Self = Self(1 << 2);
+
+    /// Whether every flag in `other` is set.
+    #[inline]
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
 }
 
 /// Save layer record.
@@ -300,6 +307,7 @@ impl<'a> Canvas<'a> {
             commands.push(DrawCommand::SaveLayer {
                 bounds,
                 paint: paint.clone(),
+                flags: rec.flags,
             });
         }
 
@@ -312,27 +320,14 @@ impl<'a> Canvas<'a> {
         // Only raster backings allocate an offscreen layer — Recording and
         // Null have no pixels to composite.
         if matches!(self.backing, Backing::Raster(_)) {
-            // `rec.bounds` is a CONTENT HINT in **local** space
-            // (SkCanvas::saveLayer): map it through the CTM to device space,
-            // intersect with the current clip and the device bounds, round,
-            // and size the layer buffer from that. No bounds -> the clip.
-            let ctm = *self.matrix_stack.last().unwrap();
-            let device_full = Rect::from_xywh(
-                0.0,
-                0.0,
-                scalar_from_i32(self.width),
-                scalar_from_i32(self.height),
-            );
-            let clip_bounds = self.clip_stack.bounds();
-            let hinted = bounds.map_or(Some(clip_bounds), |b| {
-                ctm.map_rect(&b).intersect(&clip_bounds)
-            });
-            let device_rect = hinted
-                .and_then(|r| r.intersect(&device_full))
-                .map_or_else(|| IRect::new(0, 0, 0, 0), |r| r.round_out());
-
+            let device_rect = self.layer_bounds(rec);
             let (w, h) = (device_rect.width().max(0), device_rect.height().max(0));
-            let buffer = PixelBuffer::new(w, h);
+            let mut buffer = PixelBuffer::new(w, h);
+            if rec.flags.contains(SaveLayerFlags::INIT_WITH_PREVIOUS) {
+                // kInitWithPrevious: the layer starts as a copy of what is
+                // under it.
+                self.copy_target_into(&mut buffer, (device_rect.left, device_rect.top));
+            }
             // Skia's layer device starts wide open (clipped only to its
             // bounds): the prior clip, AA mask included, applies once, when
             // restore() composites the layer through it. Keeping it here
@@ -343,10 +338,6 @@ impl<'a> Canvas<'a> {
                 scalar_from_i32(device_rect.left + w),
                 scalar_from_i32(device_rect.top + h),
             ));
-            // INIT_WITH_PREVIOUS is left unimplemented here — the buffer is
-            // left fully transparent. Pre-seeding from the parent is left
-            // as a follow-up because it requires reading back and mapping
-            // bounds between coordinate spaces.
             self.layer_stack.push(Layer {
                 buffer,
                 device_origin: (device_rect.left, device_rect.top),
@@ -404,19 +395,133 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Composite a popped [`Layer`] back onto the enclosing target (the
-    /// next layer below, or the base [`Backing::Raster`] buffer).
+    /// The device-space bounds of the offscreen layer that
+    /// [`save_layer`](Self::save_layer) with `rec` would allocate now.
+    ///
+    /// As in `SkCanvas::saveLayer`, `rec.bounds` is a content hint in local
+    /// space: it is mapped through the current matrix and intersected with
+    /// the clip bounds (no hint: the clip bounds), then rounded out. With an
+    /// image filter on `rec.paint`, the clip bounds are first outset by the
+    /// filter's reach, so pixels just outside the clip that the filter
+    /// spreads into view (a blur, a shadow) are drawn into the layer; the
+    /// layer may then extend past the device.
+    #[must_use]
+    pub fn layer_bounds(&self, rec: &SaveLayerRec<'_>) -> IRect {
+        use skia_rs_core::cast::scalar_from_i32;
+
+        let ctm = *self.total_matrix();
+        let device_full = Rect::from_xywh(
+            0.0,
+            0.0,
+            scalar_from_i32(self.width),
+            scalar_from_i32(self.height),
+        );
+        let mut clip_bounds = self.clip_stack.bounds();
+        let filter = rec.paint.and_then(Paint::image_filter);
+        if let Some(filter) = filter {
+            // The input a filter needs mirrors how far it spreads its
+            // output (a blur's radius, a shadow's offset): outset by the
+            // largest spread on any side, at most the device size.
+            let out = filter.filter_bounds(&clip_bounds);
+            let reach = [
+                clip_bounds.left - out.left,
+                clip_bounds.top - out.top,
+                out.right - clip_bounds.right,
+                out.bottom - clip_bounds.bottom,
+            ]
+            .into_iter()
+            .fold(0.0, Scalar::max)
+            .min(device_full.width().max(device_full.height()));
+            clip_bounds = clip_bounds.inset(-reach, -reach);
+        }
+        let hinted = rec.bounds.map_or(Some(clip_bounds), |b| {
+            ctm.map_rect(b).intersect(&clip_bounds)
+        });
+        let limited = if filter.is_some() {
+            hinted
+        } else {
+            hinted.and_then(|r| r.intersect(&device_full))
+        };
+        limited.map_or_else(|| IRect::new(0, 0, 0, 0), |r| r.round_out())
+    }
+
+    /// Copies the pixels under a new layer (the top layer, or the base
+    /// raster) into it, for `SaveLayerFlags::INIT_WITH_PREVIOUS`.
+    fn copy_target_into(&self, dst: &mut PixelBuffer, origin: (i32, i32)) {
+        let (src, (sox, soy)): (&PixelBuffer, (i32, i32)) =
+            if let Some(parent) = self.layer_stack.last() {
+                (&parent.buffer, parent.device_origin)
+            } else {
+                match &self.backing {
+                    Backing::Raster(buf) => (&**buf, (0, 0)),
+                    _ => return,
+                }
+            };
+        // The overlap, in source coordinates.
+        let x0 = (origin.0 - sox).max(0);
+        let y0 = (origin.1 - soy).max(0);
+        let x1 = (origin.0 - sox + dst.width).min(src.width);
+        let y1 = (origin.1 - soy + dst.height).min(src.height);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let to_usize = |v: i32| usize::try_from(v).unwrap_or(0);
+        let bytes = to_usize(x1 - x0) * 4;
+        for sy in y0..y1 {
+            let dx = to_usize(x0 - (origin.0 - sox));
+            let dy = to_usize(sy - (origin.1 - soy));
+            let s_off = to_usize(sy) * src.stride + to_usize(x0) * 4;
+            let d_off = dy * dst.stride + dx * 4;
+            dst.pixels[d_off..d_off + bytes].copy_from_slice(&src.pixels[s_off..s_off + bytes]);
+        }
+    }
+
+    /// Composite a popped [`Layer`] back onto the enclosing target.
+    fn composite_layer(&mut self, layer: Layer) {
+        self.composite_pixels(layer.buffer, layer.device_origin, layer.paint);
+    }
+
+    /// Composites premultiplied layer `pixels` whose top-left is at
+    /// `device_origin` (in this canvas's device space) onto the current
+    /// target (the top layer, or the base raster), through the current clip,
+    /// as [`restore`](Self::restore) composites a layer: the paint's image
+    /// filter runs on the pixels first, then its color filter, alpha and
+    /// blend mode apply. For callers that keep a layer's pixels across
+    /// canvases (the C API's canvas). A no-op for non-raster canvases.
+    pub fn composite_layer_pixels(
+        &mut self,
+        pixels: PixelBuffer,
+        device_origin: (i32, i32),
+        paint: Option<&Paint>,
+    ) {
+        self.composite_pixels(pixels, device_origin, paint.cloned());
+    }
+
+    /// Composite layer pixels back onto the enclosing target (the next
+    /// layer below, or the base [`Backing::Raster`] buffer).
     ///
     /// The composite goes **through the current clip** (per-pixel coverage)
-    /// and applies the layer paint's alpha, blend mode, and color filter.
-    /// (An image filter, if present, is not yet applied here.)
-    fn composite_layer(&mut self, layer: Layer) {
-        let paint = layer.paint.unwrap_or_default();
+    /// and applies the layer paint's image filter (to the layer pixels,
+    /// first), color filter, alpha and blend mode.
+    fn composite_pixels(
+        &mut self,
+        mut src_pixels: PixelBuffer,
+        device_origin: (i32, i32),
+        paint: Option<Paint>,
+    ) {
+        let paint = paint.unwrap_or_default();
+        if let Some(filter) = paint.image_filter() {
+            let to_usize = |v: i32| usize::try_from(v).unwrap_or(0);
+            let (w, h) = (to_usize(src_pixels.width), to_usize(src_pixels.height));
+            if src_pixels.stride == w * 4 {
+                filter.apply(&mut src_pixels.pixels, w, h);
+            }
+        }
         let blend_mode = paint.blend_mode();
         // Layer paint alpha scales the (premultiplied) source per-pixel.
         let layer_alpha = paint.alpha().clamp(0.0, 1.0);
         let color_filter = paint.color_filter().cloned();
-        let (offset_x, offset_y) = layer.device_origin;
+        let (offset_x, offset_y) = device_origin;
 
         // The clip stack lives in a disjoint field, so we can query it while
         // holding the mutable target borrow below.
@@ -437,7 +542,7 @@ impl<'a> Canvas<'a> {
                 }
             };
 
-        let src_buf = &layer.buffer;
+        let src_buf = &src_pixels;
         let src_w = src_buf.width;
         let src_h = src_buf.height;
 

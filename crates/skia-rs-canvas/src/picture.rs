@@ -98,6 +98,8 @@ pub enum DrawCommand {
         bounds: Option<Rect>,
         /// Paint for the layer.
         paint: Option<Paint>,
+        /// Save-layer flags (e.g. `INIT_WITH_PREVIOUS`).
+        flags: crate::SaveLayerFlags,
     },
     /// Translate the canvas.
     Translate {
@@ -275,11 +277,15 @@ impl DrawCommand {
             Self::Restore => {
                 canvas.restore();
             }
-            Self::SaveLayer { bounds, paint } => {
+            Self::SaveLayer {
+                bounds,
+                paint,
+                flags,
+            } => {
                 let rec = crate::SaveLayerRec {
                     bounds: bounds.as_ref(),
                     paint: paint.as_ref(),
-                    flags: crate::SaveLayerFlags::NONE,
+                    flags: *flags,
                 };
                 canvas.save_layer(&rec);
             }
@@ -475,6 +481,7 @@ impl RecordingCanvas {
         self.inner.commands.push(DrawCommand::SaveLayer {
             bounds,
             paint: paint.cloned(),
+            flags: crate::SaveLayerFlags::NONE,
         });
     }
 
