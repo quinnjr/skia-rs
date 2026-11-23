@@ -459,8 +459,14 @@ pub fn map_image_filter(filter: &ImageFilterRef, matrix: &Matrix) -> ImageFilter
 const MAX_BLUR_SIGMA: Scalar = 532.0;
 
 /// A blur sigma clamped like `SkBlurImageFilter` (to [`MAX_BLUR_SIGMA`]).
+/// A non-finite or negative sigma, which `SkImageFilters::Blur` rejects
+/// (no filter), is 0: no blur.
 const fn max_sigma(sigma: Scalar) -> Scalar {
-    sigma.min(MAX_BLUR_SIGMA)
+    if sigma.is_finite() && sigma > 0.0 {
+        sigma.min(MAX_BLUR_SIGMA)
+    } else {
+        0.0
+    }
 }
 
 /// `output` outset by the largest amount `spread` (a filter's output bounds
@@ -560,7 +566,7 @@ impl BlurImageFilter {
 
 impl ImageFilter for BlurImageFilter {
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
-        let (sigma_x, sigma_y) = map_size(matrix, self.sigma_x, self.sigma_y);
+        let (sigma_x, sigma_y) = map_size(matrix, max_sigma(self.sigma_x), max_sigma(self.sigma_y));
         let (sigma_x, sigma_y) = (max_sigma(sigma_x), max_sigma(sigma_y));
         Some(Arc::new(Self {
             sigma_x,
@@ -657,7 +663,7 @@ impl ImageFilter for DropShadowImageFilter {
 
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         let (dx, dy) = map_vector(matrix, self.dx, self.dy);
-        let (sigma_x, sigma_y) = map_size(matrix, self.sigma_x, self.sigma_y);
+        let (sigma_x, sigma_y) = map_size(matrix, max_sigma(self.sigma_x), max_sigma(self.sigma_y));
         let (sigma_x, sigma_y) = (max_sigma(sigma_x), max_sigma(sigma_y));
         Some(Arc::new(Self {
             dx,
@@ -961,7 +967,9 @@ impl ImageFilter for MorphologyImageFilter {
     }
 
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
-        let (radius_x, radius_y) = map_size(matrix, self.radius_x, self.radius_y);
+        // A negative or NaN radius does nothing; mapping takes lengths, so
+        // keep it at 0 rather than let the sign drop.
+        let (radius_x, radius_y) = map_size(matrix, self.radius_x.max(0.0), self.radius_y.max(0.0));
         Some(Arc::new(Self {
             morph_type: self.morph_type,
             radius_x,
@@ -3051,6 +3059,31 @@ mod tests {
         let mut pixels = vec![200u8, 100, 50, 255];
         lighting.apply(&mut pixels, 1, 1);
         assert_eq!(pixels[3], 0, "the input cleared the pixel: {pixels:?}");
+    }
+
+    #[test]
+    fn invalid_blur_and_morphology_parameters_stay_no_ops() {
+        let ident = Matrix::identity();
+        for sigma in [f32::NAN, -5.0] {
+            let blur: ImageFilterRef = Arc::new(BlurImageFilter::new(
+                sigma,
+                sigma,
+                crate::shader::TileMode::Decal,
+            ));
+            let mapped = format!("{:?}", map_image_filter(&blur, &ident));
+            assert!(
+                mapped.contains("sigma_x: 0.0") && mapped.contains("sigma_y: 0.0"),
+                "{mapped}"
+            );
+            let r = Rect::new(0.0, 0.0, 10.0, 10.0);
+            assert_eq!(blur.filter_bounds(&r), r, "no reach for sigma {sigma}");
+        }
+        let dilate: ImageFilterRef = Arc::new(MorphologyImageFilter::dilate(-3.0, -3.0, None));
+        let mapped = format!("{:?}", map_image_filter(&dilate, &ident));
+        assert!(
+            mapped.contains("radius_x: 0.0") && mapped.contains("radius_y: 0.0"),
+            "{mapped}"
+        );
     }
 
     #[test]
