@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returns `None` for an odd number of intervals, like
   `SkDashPathEffect::Make`, instead of repeating the pattern. The SVG
   renderer still repeats an odd `stroke-dasharray`, as SVG specifies.
+- `PathBuilder::conic_to` degrades unusable weights like
+  `SkPath::conicTo`: a non-positive or NaN weight adds a line, an infinite
+  one two lines, and a weight of exactly 1 a quad, so the verbs built may
+  differ from the calls made.
 - **Breaking**: `skia-rs-core`'s `libm` feature is a deprecated no-op
   (it only forwarded to the unused, now removed, `glam` dependency).
 - Unused dependencies were removed across the workspace; `skia-rs-gpu`

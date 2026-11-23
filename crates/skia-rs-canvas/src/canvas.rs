@@ -1610,21 +1610,7 @@ impl<'a> Canvas<'a> {
         font: &skia_rs_text::Font,
         paint: &Paint,
     ) {
-        use skia_rs_paint::Style;
-        let mut deferred = paint.clone();
-        if font.is_embolden() {
-            let extra = fake_bold_extra(font.size());
-            match paint.style() {
-                Style::Fill => {
-                    use_fake_bold_stroke_params(&mut deferred);
-                    deferred.set_style(Style::StrokeAndFill);
-                    deferred.set_stroke_width(extra);
-                }
-                Style::Stroke | Style::StrokeAndFill => {
-                    deferred.set_stroke_width(paint.stroke_width() + extra);
-                }
-            }
-        }
+        let deferred = paint_with_fake_bold(paint, font);
         self.save();
         self.translate(x, y);
         self.draw_path(outline, &deferred);
@@ -1669,10 +1655,14 @@ impl<'a> Canvas<'a> {
                 StrokeRec::StrokeAndFill(w) => StrokeRec::StrokeAndFill(w + extra),
             };
         }
-        // Same resolution scale as rasterize_path, so dashed glyph
-        // curves stay smooth when zoomed; the outline is in glyph space,
-        // so no cull is passed.
-        let filtered = effect.filter_path_culled(outline, &mut rec, None, self.res_scale());
+        // Same resolution scale and cull as rasterize_path gives the
+        // recorded glyph on playback: the local cull for the
+        // fake-bold-folded paint, moved into glyph space.
+        let cull = self
+            .local_cull(&paint_with_fake_bold(paint, font))
+            .map(|c| Rect::new(c.left - x, c.top - y, c.right - x, c.bottom - y));
+        let filtered =
+            effect.filter_path_culled(outline, &mut rec, cull.as_ref(), self.res_scale());
         let glyph = filtered.as_ref().unwrap_or(outline);
         // Draw with the record's style, and drop the effect so draw_path
         // does not apply it a second time.
@@ -2681,6 +2671,29 @@ fn paint_with_stroke_rec(paint: &Paint, rec: skia_rs_path::StrokeRec) -> Option<
     styled.set_style(style);
     styled.set_stroke_width(width);
     Some(styled)
+}
+
+/// `paint` with fake bold folded into its stroke the way the stroke record
+/// folds it (`useStrokeForFakeBold`): a fill becomes stroke-and-fill of the
+/// extra width with Skia's fake-bold stroke defaults; a stroke widens.
+#[cfg(feature = "text")]
+fn paint_with_fake_bold(paint: &Paint, font: &skia_rs_text::Font) -> Paint {
+    use skia_rs_paint::Style;
+    let mut folded = paint.clone();
+    if font.is_embolden() {
+        let extra = fake_bold_extra(font.size());
+        match paint.style() {
+            Style::Fill => {
+                use_fake_bold_stroke_params(&mut folded);
+                folded.set_style(Style::StrokeAndFill);
+                folded.set_stroke_width(extra);
+            }
+            Style::Stroke | Style::StrokeAndFill => {
+                folded.set_stroke_width(paint.stroke_width() + extra);
+            }
+        }
+    }
+    folded
 }
 
 /// Skia emboldens glyph outlines in the scaler context with a fresh
