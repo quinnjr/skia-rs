@@ -79,15 +79,18 @@ pub trait PathEffect: Send + Sync + std::fmt::Debug {
 
     /// [`filter_path`](Self::filter_path) given the area that can be seen,
     /// in the path's coordinate space (Skia's `cullRect` argument to
-    /// `filterPath`). Effects may skip output entirely outside `cull`; the
-    /// default ignores it.
+    /// `filterPath`), and the device resolution scale (`res_scale`, the
+    /// CTM's maximum scale, Skia's `SkStrokeRec::getResScale`): effects that
+    /// flatten curves do so finely enough for that scale. Effects may skip
+    /// output entirely outside `cull`; the default ignores both.
     fn filter_path_culled(
         &self,
         path: &Path,
         rec: &mut StrokeRec,
         cull: Option<&skia_rs_core::Rect>,
+        res_scale: Scalar,
     ) -> Option<Path> {
-        let _ = cull;
+        let _ = (cull, res_scale);
         self.filter_path(path, rec)
     }
 
@@ -350,25 +353,59 @@ impl DashEffect {
 
 impl PathEffect for DashEffect {
     fn filter_path(&self, path: &Path, rec: &mut StrokeRec) -> Option<Path> {
+        self.filter_path_culled(path, rec, None, 1.0)
+    }
+
+    /// As [`filter_path`](PathEffect::filter_path), flattening curves for
+    /// `res_scale` (`SkDashPath` measures with the stroke record's `resScale`),
+    /// so dashes on zoomed-in curves stay smooth.
+    fn filter_path_culled(
+        &self,
+        path: &Path,
+        rec: &mut StrokeRec,
+        cull: Option<&skia_rs_core::Rect>,
+        res_scale: Scalar,
+    ) -> Option<Path> {
+        let _ = cull;
         // SkDashPath::InternalFilter does nothing for geometry that wants to
         // be filled (Fill or StrokeAndFill): the source is drawn unchanged.
         if matches!(rec, StrokeRec::Fill | StrokeRec::StrokeAndFill(_)) {
             return None;
         }
-        self.apply(path)
+        let scale = if res_scale.is_finite() && res_scale > 0.0 {
+            res_scale
+        } else {
+            1.0
+        };
+        self.dash(path, DASH_FLATTEN_TOLERANCE / scale)
     }
 
+    fn apply(&self, path: &Path) -> Option<Path> {
+        self.dash(path, DASH_FLATTEN_TOLERANCE)
+    }
+
+    fn effect_kind(&self) -> PathEffectKind {
+        PathEffectKind::Dash
+    }
+}
+
+/// Curve-flattening tolerance for dashing, in local units at a resolution
+/// scale of 1 (divided by the scale otherwise).
+const DASH_FLATTEN_TOLERANCE: Scalar = 0.5;
+
+impl DashEffect {
+    /// Dash `path`, flattening curves to within `tolerance` local units.
     #[allow(
         clippy::too_many_lines,
         reason = "faithful port of SkDashPath::InternalFilter's per-verb dash state machine"
     )]
-    fn apply(&self, path: &Path) -> Option<Path> {
+    fn dash(&self, path: &Path, tolerance: Scalar) -> Option<Path> {
         if path.is_empty() {
             return None;
         }
 
         // Pre-flatten curves to lines so dash logic can transition mid-curve.
-        let flattened = flatten_path_to_lines(path, 0.5);
+        let flattened = flatten_path_to_lines(path, tolerance);
         let path = &flattened;
         if !self.dash_count_is_bounded(path) {
             return None;
@@ -491,10 +528,6 @@ impl PathEffect for DashEffect {
         }
 
         Some(builder.build())
-    }
-
-    fn effect_kind(&self) -> PathEffectKind {
-        PathEffectKind::Dash
     }
 }
 
@@ -1070,13 +1103,16 @@ impl PathEffect for ComposeEffect {
         path: &Path,
         rec: &mut StrokeRec,
         cull: Option<&skia_rs_core::Rect>,
+        res_scale: Scalar,
     ) -> Option<Path> {
         // The outer effect measures the inner one's output (dash phase,
         // trim lengths, stamp spacing), so the inner effect must produce its
         // full, unculled geometry; only the outer one may cull.
-        let intermediate = self.inner.filter_path(path, rec);
+        // (The inner effect still gets the resolution scale: it only
+        // refines flattening, never removes geometry.)
+        let intermediate = self.inner.filter_path_culled(path, rec, None, res_scale);
         self.outer
-            .filter_path_culled(intermediate.as_ref().unwrap_or(path), rec, cull)
+            .filter_path_culled(intermediate.as_ref().unwrap_or(path), rec, cull, res_scale)
     }
 
     fn apply(&self, path: &Path) -> Option<Path> {
@@ -1123,9 +1159,22 @@ impl PathEffect for SumEffect {
         path: &Path,
         rec: &mut StrokeRec,
         cull: Option<&skia_rs_core::Rect>,
+        res_scale: Scalar,
     ) -> Option<Path> {
-        let path1 = self.first.filter_path_culled(path, rec, cull);
-        let path2 = self.second.filter_path_culled(path, rec, cull);
+        // Both outputs are drawn with the record as `second` leaves it. If
+        // `second` changes it (e.g. Line2D sets a stroke), `first` culled
+        // for the wrong stroke, so run it again without culling.
+        let rec_before = *rec;
+        let path1 = self.first.filter_path_culled(path, rec, cull, res_scale);
+        let rec_after_first = *rec;
+        let path2 = self.second.filter_path_culled(path, rec, cull, res_scale);
+        let path1 = if cull.is_some() && *rec != rec_after_first {
+            let mut fresh = rec_before;
+            self.first
+                .filter_path_culled(path, &mut fresh, None, res_scale)
+        } else {
+            path1
+        };
         Self::combine(path1, path2)
     }
 
@@ -1591,6 +1640,7 @@ impl PathEffect for Path2DEffect {
         path: &Path,
         rec: &mut StrokeRec,
         cull: Option<&skia_rs_core::Rect>,
+        res_scale: Scalar,
     ) -> Option<Path> {
         // The stamps are drawn with whatever stroke the record holds, which
         // an earlier effect (a Sum's first child, a Compose's inner effect)
@@ -1598,6 +1648,7 @@ impl PathEffect for Path2DEffect {
         // limit, which this effect cannot see, so a stroked record is not
         // culled (the point budget still bounds the output). Fills and
         // hairlines reach at most a pixel past the stamp.
+        let _ = res_scale;
         let cull = match *rec {
             StrokeRec::Stroke(_) | StrokeRec::StrokeAndFill(_) => None,
             StrokeRec::Fill | StrokeRec::Hairline => cull.map(|c| c.inset(-1.0, -1.0)),
@@ -1964,7 +2015,7 @@ impl PathEffect for Line2DEffect {
     /// with the record set to stroke them at the effect's width
     /// (`rec->setStrokeStyle(fWidth)`). A failure leaves the record alone.
     fn filter_path(&self, path: &Path, rec: &mut StrokeRec) -> Option<Path> {
-        self.filter_path_culled(path, rec, None)
+        self.filter_path_culled(path, rec, None, 1.0)
     }
 
     /// As [`filter_path`](PathEffect::filter_path), skipping hatch lines
@@ -1974,7 +2025,9 @@ impl PathEffect for Line2DEffect {
         path: &Path,
         rec: &mut StrokeRec,
         cull: Option<&skia_rs_core::Rect>,
+        res_scale: Scalar,
     ) -> Option<Path> {
+        let _ = res_scale;
         let cull = cull.map(|c| c.inset(-self.width, -self.width));
         let lines = self.hatch_lines(path, cull.as_ref())?;
         rec.set_stroke_style(self.width);
@@ -2278,7 +2331,7 @@ mod tests {
         let cull = skia_rs_core::Rect::new(0.0, 0.0, 40.0, 40.0);
         let mut rec = StrokeRec::Fill;
         let lines = hatch
-            .filter_path_culled(&square(4000.0), &mut rec, Some(&cull))
+            .filter_path_culled(&square(4000.0), &mut rec, Some(&cull), 1.0)
             .expect("applies");
         // Only rows near the cull remain (each still spans the source).
         let max_y = lines.points().iter().map(|p| p.y).fold(0.0, Scalar::max);
@@ -2436,7 +2489,7 @@ mod tests {
         let cull = skia_rs_core::Rect::new(200.0, 0.0, 220.0, 400.0);
         let mut rec = StrokeRec::Fill;
         let culled = composed
-            .filter_path_culled(&source, &mut rec, Some(&cull))
+            .filter_path_culled(&source, &mut rec, Some(&cull), 1.0)
             .expect("applies");
         let mut rec = StrokeRec::Fill;
         let full = composed.filter_path(&source, &mut rec).expect("applies");
@@ -2526,7 +2579,7 @@ mod tests {
         let cull = skia_rs_core::Rect::new(0.0, 0.0, 100.0, 100.0);
         let mut rec = StrokeRec::Fill;
         let culled = sum
-            .filter_path_culled(&source, &mut rec, Some(&cull))
+            .filter_path_culled(&source, &mut rec, Some(&cull), 1.0)
             .expect("applies");
         // 4-unit cells: the cull's one-cell margin ends near x = 102, but a
         // stamp at x = 106..110 still shows its 20-wide stroke inside.
@@ -2572,7 +2625,7 @@ mod tests {
         let cull = skia_rs_core::Rect::new(0.0, 0.0, 100.0, 100.0);
         let (mut a, mut b) = (StrokeRec::Fill, StrokeRec::Fill);
         let culled = hatch
-            .filter_path_culled(&source, &mut a, Some(&cull))
+            .filter_path_culled(&source, &mut a, Some(&cull), 1.0)
             .expect("applies");
         let full = hatch.filter_path(&source, &mut b).expect("applies");
         assert_eq!(culled.points(), full.points());
@@ -2623,11 +2676,66 @@ mod tests {
         let cull = skia_rs_core::Rect::new(103.0, 0.0, 300.0, 200.0);
         let mut rec = StrokeRec::Fill;
         let lines = hatch
-            .filter_path_culled(&b.build(), &mut rec, Some(&cull))
+            .filter_path_culled(&b.build(), &mut rec, Some(&cull), 1.0)
             .expect("applies");
         assert!(
             lines.points().iter().any(|p| p.x > 105.0),
             "hatch reaches into the cull"
+        );
+    }
+
+    #[test]
+    fn sum_recomputes_first_unculled_when_second_sets_a_stroke() {
+        // Sum(Path2D, Line2D): Line2D (second) sets Stroke(8) after Path2D
+        // (first) culled for a fill. Both draw with the stroke, so Path2D's
+        // stamps outside the cull must come back.
+        let tile: PathEffectRef = Arc::new(
+            Path2DEffect::new(skia_rs_core::Matrix::scale(4.0, 4.0), square(1.0)).unwrap(),
+        );
+        let line: PathEffectRef =
+            Arc::new(Line2DEffect::new(8.0, skia_rs_core::Matrix::scale(50.0, 50.0)).unwrap());
+        let sum = SumEffect::new(tile, line);
+        let cull = skia_rs_core::Rect::new(0.0, 0.0, 100.0, 100.0);
+        let mut rec = StrokeRec::Fill;
+        let out = sum
+            .filter_path_culled(&square(400.0), &mut rec, Some(&cull), 1.0)
+            .expect("applies");
+        assert_eq!(rec, StrokeRec::Stroke(8.0));
+        // x = 302: a stamp-only coordinate (4-unit cell center) far outside.
+        assert!(out.points().iter().any(|p| (p.x - 302.0).abs() < 0.01));
+    }
+
+    #[test]
+    fn dashes_flatten_curves_for_the_resolution_scale() {
+        // Long dashes on a radius-5 circle: with res_scale 20 the chords
+        // must be short enough to look smooth at 20x (sagitta <= 0.5 px).
+        let mut b = PathBuilder::new();
+        b.add_circle(0.0, 0.0, 5.0);
+        let circle = b.build();
+        let dash = DashEffect::new(vec![20.0, 1.0], 0.0).unwrap();
+        let longest = |res_scale: Scalar| {
+            let mut rec = StrokeRec::Stroke(1.0);
+            let out = dash
+                .filter_path_culled(&circle, &mut rec, None, res_scale)
+                .expect("applies");
+            let (mut current, mut max) = (Point::zero(), 0.0_f32);
+            for e in &out {
+                match e {
+                    PathElement::Move(p) => current = p,
+                    PathElement::Line(p) => {
+                        max = max.max(current.distance(&p));
+                        current = p;
+                    }
+                    _ => {}
+                }
+            }
+            max
+        };
+        assert!(longest(20.0) <= 1.1, "zoomed chords: {}", longest(20.0));
+        assert!(
+            longest(1.0) > 2.0,
+            "unzoomed chords stay coarse: {}",
+            longest(1.0)
         );
     }
 

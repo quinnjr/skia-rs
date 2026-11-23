@@ -921,7 +921,13 @@ impl<'a> Canvas<'a> {
         };
         let mut rec = stroke_rec_from_paint(paint);
         let cull = self.local_cull(paint);
-        let filtered = effect.filter_path_culled(path, &mut rec, cull.as_ref());
+        // Skia's SkStrokeRec::getResScale: the CTM's maximum scale.
+        let res_scale = self
+            .total_matrix()
+            .max_scale()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(1.0);
+        let filtered = effect.filter_path_culled(path, &mut rec, cull.as_ref(), res_scale);
         let final_path = filtered.as_ref().unwrap_or(path);
         let styled = paint_with_stroke_rec(paint, rec);
         let styled = styled.as_ref().unwrap_or(paint);
