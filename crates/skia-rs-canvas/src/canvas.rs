@@ -2520,6 +2520,7 @@ impl Canvas<'_> {
         let Some(visible_dst) = transformed_dst.intersect(&clip) else {
             return;
         };
+        let has_perspective = matrix.has_perspective();
 
         let scale_x = scalar_from_i32(src_rect.width()) / dst.width();
         let scale_y = scalar_from_i32(src_rect.height()) / dst.height();
@@ -2571,6 +2572,18 @@ impl Canvas<'_> {
                     || local.x >= dst.right
                     || local.y < dst.top
                     || local.y >= dst.bottom
+                {
+                    continue;
+                }
+                // Under perspective a device pixel can map back to a point
+                // behind the camera; drawing it would show a mirrored copy
+                // of the hidden part (Skia clips at w = 1/16384).
+                if has_perspective
+                    && matrix.values[Matrix::PERSP_0].mul_add(
+                        local.x,
+                        matrix.values[Matrix::PERSP_1]
+                            .mul_add(local.y, matrix.values[Matrix::PERSP_2]),
+                    ) < 1.0 / 16384.0
                 {
                     continue;
                 }
@@ -2922,17 +2935,7 @@ impl Canvas<'_> {
                 kept.push(from);
             }
             if (w_from >= W_MIN) != (w_to >= W_MIN) {
-                // w is affine in local coordinates: cut where it is W_MIN.
-                let along = (W_MIN - w_from) / (w_to - w_from);
-                let cut = Point::new(
-                    (to.0.x - from.0.x) * along + from.0.x,
-                    (to.0.y - from.0.y) * along + from.0.y,
-                );
-                let color = match (from.1, to.1) {
-                    (Some(start), Some(end)) => Some(lerp_color(start, end, along)),
-                    (start, end) => start.or(end),
-                };
-                kept.push((cut, color));
+                kept.push(w_plane_cut(from, to, W_MIN, &weight));
             }
         }
         for fan in 1..kept.len().saturating_sub(1) {
@@ -3459,6 +3462,39 @@ fn layer_buffer_is_valid(buffer: &PixelBuffer) -> bool {
     });
     buffer.stride >= row && needed.is_some_and(|n| buffer.pixels.len() >= n)
 }
+/// The point (and interpolated color) where the local edge `from`-`to`
+/// crosses `w = w_min`, `weight` being w (affine in local coordinates).
+/// Computed with the endpoints in one fixed order, so the two triangles
+/// sharing an edge get the same cut bit for bit (and the triangle fill rule
+/// keeps their seam exact).
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "unfused, like the other perspective-clip arithmetic"
+)]
+fn w_plane_cut(
+    from: (Point, Option<Color>),
+    to: (Point, Option<Color>),
+    w_min: Scalar,
+    weight: &impl Fn(Point) -> Scalar,
+) -> (Point, Option<Color>) {
+    let (start, end) = if (from.0.y, from.0.x) < (to.0.y, to.0.x) {
+        (from, to)
+    } else {
+        (to, from)
+    };
+    let (w_start, w_end) = (weight(start.0), weight(end.0));
+    let along = (w_min - w_start) / (w_end - w_start);
+    let cut = Point::new(
+        (end.0.x - start.0.x) * along + start.0.x,
+        (end.0.y - start.0.y) * along + start.0.y,
+    );
+    let color = match (start.1, end.1) {
+        (Some(a), Some(b)) => Some(lerp_color(a, b, along)),
+        (a, b) => a.or(b),
+    };
+    (cut, color)
+}
+
 /// `a + (b - a) * t` per ARGB channel.
 #[allow(clippy::suboptimal_flops, reason = "unfused interpolation")]
 fn lerp_color(a: Color, b: Color, t: Scalar) -> Color {
@@ -5286,6 +5322,84 @@ mod tests {
             0,
             "vertices must be clipped per pixel"
         );
+    }
+
+    #[test]
+    fn w_plane_cuts_do_not_depend_on_edge_direction() {
+        // Two triangles walk a shared edge in opposite directions; their cut
+        // points (and colors) must match bit for bit.
+        let weight = |p: Point| (-0.01f32).mul_add(p.x, 0.003f32.mul_add(p.y, 1.0));
+        let (red, blue) = (
+            Some(Color::from_argb(255, 255, 0, 0)),
+            Some(Color::from_argb(255, 0, 0, 255)),
+        );
+        let mut seed = 0x2545_f491_u32;
+        let mut next = |lo: f32, hi: f32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            #[allow(clippy::cast_precision_loss)]
+            let unit = (seed >> 8) as f32 / 16_777_216.0;
+            unit.mul_add(hi - lo, lo)
+        };
+        for _ in 0..200 {
+            let p = (Point::new(next(5.0, 95.0), next(-30.0, 30.0)), red);
+            let q = (Point::new(next(101.0, 400.0), next(-30.0, 30.0)), blue);
+            let forward = super::w_plane_cut(p, q, 1.0 / 16384.0, &weight);
+            let backward = super::w_plane_cut(q, p, 1.0 / 16384.0, &weight);
+            assert_eq!(forward, backward, "{p:?} {q:?}");
+        }
+    }
+
+    #[cfg(feature = "codec")]
+    #[test]
+    fn image_parts_behind_the_camera_are_not_drawn_mirrored() {
+        // Under this perspective the front part's device box covers the
+        // whole surface, but every pixel there maps back to a point of dst
+        // behind the camera: nothing may be drawn.
+        let info = skia_rs_codec::ImageInfo::new(
+            4,
+            4,
+            skia_rs_core::ColorType::Rgba8888,
+            skia_rs_core::AlphaType::Premul,
+        );
+        let image =
+            skia_rs_codec::Image::from_raster_data_owned(info, vec![255u8; 64], 16).unwrap();
+        let mut matrix = Matrix::IDENTITY;
+        matrix.values = [
+            1.827_839,
+            1.755_064,
+            -153.749_71,
+            -1.811_568,
+            -0.666_68,
+            66.174_02,
+            0.029_855_44,
+            -0.028_383_23,
+            0.749_653,
+        ];
+        let mut buffer = PixelBuffer::new(200, 200);
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.set_matrix(&matrix);
+        canvas.draw_image_rect(&image, None, &Rect::from_xywh(0.0, 0.0, 100.0, 100.0), None);
+        drop(canvas);
+        let inverse = matrix.invert().unwrap();
+        for y in 0..200 {
+            for x in 0..200 {
+                if buffer.get_pixel(x, y).is_some_and(|c| c.alpha() > 0) {
+                    #[allow(clippy::cast_precision_loss)]
+                    let local = inverse.map_point(Point::new(x as f32 + 0.5, y as f32 + 0.5));
+                    let w = matrix.values[Matrix::PERSP_0].mul_add(
+                        local.x,
+                        matrix.values[Matrix::PERSP_1]
+                            .mul_add(local.y, matrix.values[Matrix::PERSP_2]),
+                    );
+                    assert!(
+                        w > 0.0,
+                        "({x}, {y}) shows a point behind the camera (w {w})"
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(feature = "codec")]
