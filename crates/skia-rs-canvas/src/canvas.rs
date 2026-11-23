@@ -642,10 +642,14 @@ impl<'a> Canvas<'a> {
         {
             let to_usize = |v: i32| usize::try_from(v).unwrap_or(0);
             let (w, h) = (to_usize(src_pixels.width), to_usize(src_pixels.height));
+            // Checked throughout: on 32-bit targets a bogus width overflows.
+            let Some(row) = w.checked_mul(4) else {
+                return;
+            };
             let needed = h.checked_sub(1).map_or(Some(0), |rows| {
-                rows.checked_mul(src_pixels.stride)?.checked_add(w * 4)
+                rows.checked_mul(src_pixels.stride)?.checked_add(row)
             });
-            if src_pixels.stride < w * 4 || needed.is_none_or(|n| src_pixels.pixels.len() < n) {
+            if src_pixels.stride < row || needed.is_none_or(|n| src_pixels.pixels.len() < n) {
                 return;
             }
         }
@@ -3248,7 +3252,8 @@ fn device_clip_path(path: &Path, matrix: &Matrix) -> Path {
 /// tile's source rect), and the output area itself, since the filter runs
 /// in place on the layer's pixels. Skia downsamples layers that would be
 /// too large; here a layer past 9x the device area is cut to the device
-/// outset by its size instead.
+/// outset by its size instead, so filter input from beyond that window
+/// (e.g. an offset of more than the device size) is lost.
 fn filtered_layer_area(filter: &dyn skia_rs_paint::ImageFilter, clip: Rect, device: &Rect) -> Rect {
     // Nothing is visible through an empty clip: no layer area.
     if clip.is_empty() {

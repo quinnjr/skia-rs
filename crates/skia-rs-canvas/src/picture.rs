@@ -58,21 +58,15 @@ impl Picture {
     /// Restores that would pop below that save are dropped, as `SkRecorder`
     /// drops unbalanced restores, so the caller's own saves are never undone.
     ///
-    /// Played into a recording canvas, the wrapper save is not recorded (it
-    /// would add a Save/Restore pair to every re-recorded picture); the
-    /// recording is still balanced back to its starting save count.
+    /// Played into a recording canvas, the wrapper is recorded too (as
+    /// `SkRecordDraw` under `SkAutoCanvasRestore` records it), so the
+    /// picture's top-level transforms and clips cannot leak into the
+    /// recording's later draws; a re-recorded picture grows by that pair.
     pub fn playback(&self, canvas: &mut Canvas) {
-        let wrap = !canvas.is_recording();
-        let restore_count = if wrap {
-            canvas.save()
-        } else {
-            canvas.save_count()
-        };
-        // Restores that would pop the wrapper (or below the start).
-        let floor = restore_count + usize::from(wrap);
+        let restore_count = canvas.save();
         let initial = *canvas.total_matrix();
         for command in &self.commands {
-            if matches!(command, DrawCommand::Restore) && canvas.save_count() <= floor {
+            if matches!(command, DrawCommand::Restore) && canvas.save_count() <= restore_count + 1 {
                 continue;
             }
             command.execute_with_base(canvas, &initial);
@@ -857,9 +851,12 @@ mod tests {
     }
 
     #[test]
-    fn test_playback_into_a_recording_adds_no_wrapper() {
+    fn test_playback_into_a_recording_keeps_its_state_contained() {
+        // A picture's top-level translate must not leak into the recording's
+        // later draws: the playback wrapper is recorded around it.
         let mut recorder = PictureRecorder::new();
         let rc = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, 10.0, 10.0));
+        rc.translate(50.0, 0.0);
         rc.draw_rect(&Rect::from_xywh(0.0, 0.0, 5.0, 5.0), &Paint::new());
         let picture = recorder.finish_recording().unwrap();
 
@@ -867,8 +864,21 @@ mod tests {
         {
             let mut canvas = Canvas::new_recording(&mut cmds, 10, 10);
             picture.playback(&mut canvas);
+            canvas.draw_rect(&Rect::from_xywh(0.0, 0.0, 5.0, 5.0), &Paint::new());
         }
-        assert_eq!(cmds.len(), 1, "only the draw is re-recorded: {cmds:?}");
+        let translate = cmds
+            .iter()
+            .position(|c| matches!(c, DrawCommand::Translate { .. }))
+            .expect("translate recorded");
+        let restore = cmds
+            .iter()
+            .rposition(|c| matches!(c, DrawCommand::Restore))
+            .expect("wrapper restore recorded");
+        let last_draw = cmds
+            .iter()
+            .rposition(|c| matches!(c, DrawCommand::DrawRect { .. }))
+            .unwrap();
+        assert!(translate < restore && restore < last_draw, "{cmds:?}");
     }
 
     #[test]
