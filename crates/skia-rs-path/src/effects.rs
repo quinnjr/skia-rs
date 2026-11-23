@@ -474,10 +474,6 @@ impl PathEffect for DashEffect {
         // the cull (keeping the dash phase), so only the visible part counts
         // against kMaxDashCount.
         let culled = cull.and_then(|c| cull_dash_source(path, c, *rec, self.interval_sum));
-        if culled.as_ref().is_some_and(Path::is_empty) {
-            // Entirely outside the cull: nothing visible to dash.
-            return Some(Path::new());
-        }
         // A culled closed rect is dashed as open edges; if the pattern is
         // "on" both where it starts and where it ends, SkDashPath adds a
         // tiny right angle at the start corner so the stroke joins there.
@@ -506,14 +502,10 @@ impl PathEffect for DashEffect {
 
 /// `SkDashPath`'s `cull_path`: a line, or the edges of a rect, trimmed to
 /// `cull` outset for the stroke. Trimmed ends move by whole interval lengths
-/// so the dash pattern is unchanged (`clip_line`). `None` when the source is
-/// neither (or a diagonal line); an empty path when it lies entirely outside
-/// the cull. (Skia dashes such an off-screen source in full; skipping it
-/// draws the same pixels without the work.)
-#[allow(
-    clippy::float_cmp,
-    reason = "exact axis-alignment test, as in clip_line"
-)]
+/// so the dash pattern is unchanged (`clip_line`). `None`, meaning "dash the
+/// source unchanged", when the source is neither, or nothing of it could be
+/// trimmed to the cull, exactly as in Skia: never an empty path, since an
+/// outer effect (Compose/Sum) may move the dashes into view.
 fn cull_dash_source(
     path: &Path,
     cull: &skia_rs_core::Rect,
@@ -532,19 +524,8 @@ fn cull_dash_source(
     if path.is_line() {
         let pts = path.points();
         let (mut a, mut b) = (pts[0], pts[1]);
-        // Beyond Skia's clip_line (which trims only along the line's own
-        // axis): a horizontal or vertical line outside the cull across its
-        // axis is off-screen too.
-        let off_across = (a.y == b.y && (a.y < bounds.top || a.y > bounds.bottom))
-            || (a.x == b.x && (a.x < bounds.left || a.x > bounds.right));
-        if off_across {
-            return Some(Path::new());
-        }
         if !clip_dash_line(&mut a, &mut b, &bounds, interval_len, 0.0) {
-            // A horizontal/vertical line that missed the cull is off-screen;
-            // a diagonal one cannot be trimmed here.
-            let axis_aligned = a.x == b.x || a.y == b.y;
-            return axis_aligned.then(Path::new);
+            return None;
         }
         builder.move_to(a.x, a.y).line_to(b.x, b.y);
         return Some(builder.build());
@@ -588,8 +569,10 @@ fn cull_dash_source(
         }
         accum += f64::from((b.x - a.x + b.y - a.y).abs());
     }
-    // An empty result means every edge missed the cull: off-screen.
-    Some(builder.build())
+    // cull_path returns !builder.isEmpty(): with every edge missed, the
+    // source is dashed unchanged.
+    let out = builder.build();
+    (!out.is_empty()).then_some(out)
 }
 
 /// `SkDashPath`'s `clip_line` for a horizontal or vertical line: trim it to
@@ -3089,18 +3072,28 @@ mod tests {
     }
 
     #[test]
-    fn off_screen_dashed_lines_are_skipped() {
-        // A long dashed line entirely outside the cull draws nothing and is
-        // not dashed along its whole (off-screen) length.
+    fn off_screen_dashed_lines_are_dashed_like_skia() {
+        // Skia's cull_path never turns a source into nothing: a line that
+        // cannot be trimmed is dashed unchanged (an outer effect may move
+        // the dashes into view), and one off the cull across its axis is
+        // still trimmed along it.
         let dash = DashEffect::new(vec![2.0, 2.0], 0.0).unwrap();
-        let mut b = PathBuilder::new();
-        b.move_to(0.0, -5000.0).line_to(1e6, -5000.0);
         let cull = skia_rs_core::Rect::new(0.0, 0.0, 100.0, 100.0);
-        let mut rec = StrokeRec::Stroke(1.0);
-        let out = dash
-            .filter_path_culled(&b.build(), &mut rec, Some(&cull), 1.0)
-            .expect("succeeds");
-        assert!(out.is_empty(), "{} points", out.points().len());
+        let dashes = |x0: Scalar, y: Scalar, x1: Scalar| {
+            let mut b = PathBuilder::new();
+            b.move_to(x0, y).line_to(x1, y);
+            let mut rec = StrokeRec::Stroke(1.0);
+            let out = dash
+                .filter_path_culled(&b.build(), &mut rec, Some(&cull), 1.0)
+                .expect("succeeds");
+            out.iter()
+                .filter(|e| matches!(e, PathElement::Move(_)))
+                .count()
+        };
+        // Above the cull: trimmed to its x range, still dashed (~25 dashes).
+        assert!(dashes(-1e6, -50.0, 1e6) >= 20);
+        // Beyond the cull along its axis: dashed in full (500 dashes).
+        assert_eq!(dashes(1000.0, 50.0, 3000.0), 500);
     }
 
     #[test]
@@ -3210,6 +3203,24 @@ mod tests {
         // inner effect (checked by compose_does_not_cull_the_inner_effect).
         let hatch = Line2DEffect::new(1.0, skia_rs_core::Matrix::scale(4.0, 4.0)).unwrap();
         assert!(!hatch.cull_is_exact());
+    }
+
+    #[test]
+    fn an_inner_dash_never_culls_its_source_away() {
+        // Compose(Discrete, Dash) on a line above the cull: Skia's inner dash
+        // trims it along its axis but still dashes it, and the outer
+        // discrete jitter may carry those dashes into view.
+        let dash: PathEffectRef = Arc::new(DashEffect::new(vec![5.0, 5.0], 0.0).unwrap());
+        let jitter: PathEffectRef = Arc::new(DiscreteEffect::new(10.0, 100.0, 1).unwrap());
+        let composed = ComposeEffect::new(jitter, dash);
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, -50.0).line_to(100.0, -50.0);
+        let cull = skia_rs_core::Rect::new(0.0, 0.0, 100.0, 100.0);
+        let mut rec = StrokeRec::Stroke(1.0);
+        let out = composed
+            .filter_path_culled(&b.build(), &mut rec, Some(&cull), 1.0)
+            .expect("applies");
+        assert!(!out.is_empty(), "the dashes survive for the outer effect");
     }
 
     #[test]
