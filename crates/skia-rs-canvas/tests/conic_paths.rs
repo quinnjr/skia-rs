@@ -2080,3 +2080,27 @@ fn malformed_layer_buffers_are_not_composited() {
     Canvas::new_raster(&mut buffer).composite_layer_pixels(short, (0, 0), Some(&layer_paint));
     assert_eq!(buffer.get_pixel(0, 0).map_or(0, |c| c.alpha()), 0);
 }
+
+#[test]
+fn layer_hints_under_perspective_are_clipped_to_the_w_plane() {
+    // A hint reaching behind the camera (w <= 0 for y < -500): map_rect
+    // flips its far corners, giving device y 136..1166, which misses the
+    // content drawn at (100, 100).
+    use skia_rs_canvas::SaveLayerRec;
+    use skia_rs_core::Matrix;
+
+    let mut persp = Matrix::translate(100.0, 100.0);
+    persp.values[Matrix::PERSP_1] = 0.002;
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.set_matrix(&persp);
+        canvas.save_layer(&SaveLayerRec {
+            bounds: Some(&Rect::new(-50.0, -800.0, 50.0, 50.0)),
+            ..SaveLayerRec::default()
+        });
+        canvas.draw_rect(&Rect::new(-20.0, -20.0, 20.0, 20.0), &white(Style::Fill));
+        canvas.restore();
+    }
+    assert!(lit(&buffer, 100, 100), "the layer content is drawn");
+}

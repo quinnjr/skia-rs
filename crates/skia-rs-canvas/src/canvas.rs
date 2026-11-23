@@ -505,7 +505,16 @@ impl<'a> Canvas<'a> {
             device_full
         };
         let hinted = rec.bounds.map_or(Some(clip_bounds), |b| {
-            ctm.map_rect(b).intersect(&clip_bounds)
+            // Under perspective, clip the hint to the w plane first (as
+            // clips are): map_rect would flip corners behind the camera.
+            let mapped = if ctm.has_perspective() {
+                let mut hint = skia_rs_path::PathBuilder::new();
+                hint.add_rect(b);
+                device_clip_path(&hint.build(), &ctm).bounds()
+            } else {
+                ctm.map_rect(b)
+            };
+            mapped.intersect(&clip_bounds)
         });
         let content = hinted.and_then(|r| r.intersect(&limit));
         let round = |r: Option<Rect>| r.map_or_else(|| IRect::new(0, 0, 0, 0), |r| r.round_out());
@@ -919,7 +928,10 @@ impl<'a> Canvas<'a> {
         use skia_rs_core::cast::scalar_from_i32;
 
         let matrix = *self.matrix_stack.last().unwrap();
-        let clip_stack = self.clip_stack.clone();
+        // Lend the clip stack to the rasterizer and take it back after the
+        // draw (its saves balance within a draw), instead of cloning it, and
+        // every clip mask in it, per draw.
+        let clip_stack = std::mem::replace(&mut self.clip_stack, ClipStack::new(&Rect::EMPTY));
 
         // An active layer takes priority over the base backing. The layer
         // buffer is positioned at its device origin, so we pre-compose a
@@ -937,15 +949,20 @@ impl<'a> Canvas<'a> {
             raster.set_matrix(&adjusted);
             raster.set_clip_stack(clip_stack);
             raster.set_origin(ox, oy);
-            return Some(f(&mut raster));
+            let result = f(&mut raster);
+            self.clip_stack = raster.take_clip_stack();
+            return Some(result);
         }
 
         if let Backing::Raster(buffer) = &mut self.backing {
             let mut raster = Rasterizer::new(buffer);
             raster.set_matrix(&matrix);
             raster.set_clip_stack(clip_stack);
-            Some(f(&mut raster))
+            let result = f(&mut raster);
+            self.clip_stack = raster.take_clip_stack();
+            Some(result)
         } else {
+            self.clip_stack = clip_stack;
             None
         }
     }
@@ -2671,6 +2688,15 @@ impl Canvas<'_> {
 
     /// Draw a region.
     pub fn draw_region(&mut self, region: &skia_rs_core::Region, paint: &Paint) {
+        // Recorded as a region: playback picks rect-by-rect or the outline
+        // for its own matrix and paint (and the union is not computed now).
+        if let Backing::Recording(commands) = &mut self.backing {
+            commands.push(DrawCommand::DrawRegion {
+                region: region.clone(),
+                paint: paint.clone(),
+            });
+            return;
+        }
         // SkDevice::drawRegion: with a path effect, mask filter, non-fill
         // style, a non-translate matrix, or AA under a fractional translate,
         // the region is drawn as its boundary path (one outline, so dashes
@@ -2690,11 +2716,7 @@ impl Canvas<'_> {
         // maps equal coordinates to equal device values, so rect-by-rect
         // stays exact there (and avoids the costly boundary union).
         let not_scale_translate = !m.is_scale_translate();
-        // A recording does not know the matrix it will be played back
-        // under: record the boundary, which is right for any matrix.
-        let recording = matches!(self.backing, Backing::Recording(_));
-        if recording
-            || not_scale_translate
+        if not_scale_translate
             || complex_paint
             || (paint.is_anti_alias() && (non_translate || fractional_translate))
         {
@@ -3560,10 +3582,10 @@ const fn colr_composite_to_blend(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn recorded_regions_record_their_boundary() {
+    fn recorded_regions_are_recorded_as_regions() {
         // The playback matrix is unknown when recording, so a region is
-        // recorded as one boundary path (seam-free under any matrix), not
-        // rect by rect.
+        // recorded as a region: playback chooses rect-by-rect or the
+        // seam-free outline for its own matrix.
         use super::{Canvas, DrawCommand, Paint};
 
         let mut region = skia_rs_core::Region::new();
@@ -3580,14 +3602,7 @@ mod tests {
         c.draw_region(&region, &Paint::new());
         drop(c);
         assert!(
-            cmds.iter()
-                .any(|c| matches!(c, DrawCommand::DrawPath { .. })),
-            "{cmds:?}"
-        );
-        assert!(
-            !cmds
-                .iter()
-                .any(|c| matches!(c, DrawCommand::DrawRect { .. })),
+            matches!(cmds.as_slice(), [DrawCommand::DrawRegion { .. }]),
             "{cmds:?}"
         );
     }

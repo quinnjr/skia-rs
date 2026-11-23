@@ -405,6 +405,12 @@ impl<'a> Rasterizer<'a> {
         self.use_advanced_clip = false;
     }
 
+    /// Takes the clip stack back out (leaving an empty one), for a caller
+    /// that lent it with [`set_clip_stack`](Self::set_clip_stack).
+    pub const fn take_clip_stack(&mut self) -> ClipStack {
+        std::mem::replace(&mut self.clip_stack, ClipStack::new(&Rect::EMPTY))
+    }
+
     /// Set the clip stack (advanced mode).
     pub fn set_clip_stack(&mut self, clip_stack: ClipStack) {
         self.clip_stack = clip_stack;

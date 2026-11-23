@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `composite_layer_pixels`.
 - **Breaking**: `DrawCommand::SaveLayer` has a `flags` field, so recorded
   layers keep `INIT_WITH_PREVIOUS` on playback.
+- **Breaking**: new `DrawCommand::DrawRegion` variant. Recorded regions
+  stay regions, so playback draws them rect by rect or as one outline
+  depending on its own matrix and paint.
 - The `serde` feature (core, path, paint, and `skia-rs-safe`/`skia-rs`)
   now does something: it derives `Serialize`/`Deserialize` for the plain
   value types (points, sizes, rects, `RRect`, `Matrix`, `Matrix44`,

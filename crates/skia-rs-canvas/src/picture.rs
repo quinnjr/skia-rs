@@ -200,6 +200,15 @@ pub enum DrawCommand {
         /// The paint to use.
         paint: Paint,
     },
+    /// Draw a region (`SkCanvas::drawRegion`). Recorded as a region so
+    /// playback chooses rect-by-rect or the boundary outline for the
+    /// playback matrix and paint.
+    DrawRegion {
+        /// The region to draw.
+        region: skia_rs_core::Region,
+        /// The paint to use.
+        paint: Paint,
+    },
     /// Draw an oval.
     DrawOval {
         /// The bounding rectangle of the oval.
@@ -345,6 +354,9 @@ impl DrawCommand {
             }
             Self::DrawRect { rect, paint } => {
                 canvas.draw_rect(rect, paint);
+            }
+            Self::DrawRegion { region, paint } => {
+                canvas.draw_region(region, paint);
             }
             Self::DrawOval { rect, paint } => {
                 canvas.draw_oval(rect, paint);
