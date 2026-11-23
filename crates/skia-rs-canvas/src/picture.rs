@@ -478,10 +478,21 @@ impl RecordingCanvas {
 
     /// Record a save layer command.
     pub fn save_layer(&mut self, bounds: Option<Rect>, paint: Option<&Paint>) {
-        self.inner.commands.push(DrawCommand::SaveLayer {
-            bounds,
-            paint: paint.cloned(),
+        self.save_layer_rec(&crate::SaveLayerRec {
+            bounds: bounds.as_ref(),
+            paint,
             flags: crate::SaveLayerFlags::NONE,
+        });
+    }
+
+    /// Record a save layer command with flags (such as
+    /// `SaveLayerFlags::INIT_WITH_PREVIOUS`), like `SkCanvas::saveLayer`
+    /// with a `SaveLayerRec`.
+    pub fn save_layer_rec(&mut self, rec: &crate::SaveLayerRec<'_>) {
+        self.inner.commands.push(DrawCommand::SaveLayer {
+            bounds: rec.bounds.copied(),
+            paint: rec.paint.cloned(),
+            flags: rec.flags,
         });
     }
 
@@ -816,6 +827,22 @@ mod tests {
         let picture = recorder.finish_recording().unwrap();
         assert!(!recorder.is_recording());
         assert_eq!(picture.approximate_op_count(), 4); // save, translate, draw_rect, restore
+    }
+
+    #[test]
+    fn test_recorded_save_layer_keeps_its_flags() {
+        let mut recorder = PictureRecorder::new();
+        let canvas = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, 10.0, 10.0));
+        canvas.save_layer_rec(&crate::SaveLayerRec {
+            flags: crate::SaveLayerFlags::INIT_WITH_PREVIOUS,
+            ..crate::SaveLayerRec::default()
+        });
+        canvas.restore();
+        let picture = recorder.finish_recording().unwrap();
+        assert!(picture.commands.iter().any(|c| matches!(
+            c,
+            DrawCommand::SaveLayer { flags, .. } if flags.contains(crate::SaveLayerFlags::INIT_WITH_PREVIOUS)
+        )));
     }
 
     #[test]
