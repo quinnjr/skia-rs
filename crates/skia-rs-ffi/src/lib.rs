@@ -2321,8 +2321,9 @@ pub unsafe extern "C" fn sk_canvas_clip_path(
 /// Fill `out` with the device-space integer clip bounds of this canvas.
 ///
 /// Returns true on success. With no clips `out` is the device bounds
-/// `[0, 0, width, height]` (inside a layer, the layer's bounds); an empty
-/// clip gives `[0, 0, 0, 0]`, as `SkCanvas::getDeviceClipBounds`.
+/// `[0, 0, width, height]` (inside a layer, the layer's content bounds:
+/// its `bounds` hint, if one was given); an empty clip gives
+/// `[0, 0, 0, 0]`, as `SkCanvas::getDeviceClipBounds`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_canvas_get_clip_ibounds(
     canvas: *mut sk_canvas_t,

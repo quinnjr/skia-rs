@@ -901,8 +901,9 @@ bool sk_canvas_clip_path(struct sk_canvas_t *canvas,
 // Fill `out` with the device-space integer clip bounds of this canvas.
 //
 // Returns true on success. With no clips `out` is the device bounds
-// `[0, 0, width, height]` (inside a layer, the layer's bounds); an empty
-// clip gives `[0, 0, 0, 0]`, as `SkCanvas::getDeviceClipBounds`.
+// `[0, 0, width, height]` (inside a layer, the layer's content bounds:
+// its `bounds` hint, if one was given); an empty clip gives
+// `[0, 0, 0, 0]`, as `SkCanvas::getDeviceClipBounds`.
 bool sk_canvas_get_clip_ibounds(struct sk_canvas_t *canvas,
                                 struct sk_irect_t *out);
 
