@@ -1809,6 +1809,9 @@ struct FfiLayer {
     pixels: *mut PixelBuffer,
     /// The layer's top-left in device space.
     origin: (i32, i32),
+    /// The area draws into the layer may cover, in device space (the
+    /// `bounds` hint limits content, not the filtered result).
+    content: skia_rs_core::IRect,
     /// The draw target to return to on restore.
     parent: *mut PixelBuffer,
     /// The layer paint (alpha, blend mode, color and image filters).
@@ -1873,7 +1876,26 @@ impl sk_canvas_t {
         let base = Matrix::translate(-scalar_from_i32(ox), -scalar_from_i32(oy));
         let transform = base.concat(&self.state.matrix);
         let clips = self.state.clips[clip_base.min(self.state.clips.len())..].to_vec();
+        let content = self
+            .state
+            .stack
+            .iter()
+            .rev()
+            .find_map(|f| f.layer.as_ref().map(|l| l.content));
         let mut c = self.canvas();
+        if let Some(content) = content {
+            c.set_matrix(&base);
+            c.clip_rect(
+                &Rect::new(
+                    scalar_from_i32(content.left),
+                    scalar_from_i32(content.top),
+                    scalar_from_i32(content.right),
+                    scalar_from_i32(content.bottom),
+                ),
+                ClipOp::Intersect,
+                false,
+            );
+        }
         for entry in &clips {
             match entry {
                 ClipEntry::Rect {
@@ -2085,24 +2107,29 @@ pub unsafe extern "C" fn sk_canvas_save_layer(
             scalar_from_i32(c.width - ox),
             scalar_from_i32(c.height - oy),
         );
-        let (rect, paint) = {
+        let (rect, content, paint) = {
             let inner = c.canvas_with_state();
-            let rect = inner.layer_bounds_within(
-                &skia_rs_canvas::SaveLayerRec {
-                    bounds: bounds.as_ref(),
-                    paint: paint.as_ref(),
-                    flags: skia_rs_canvas::SaveLayerFlags::NONE,
-                },
-                &device,
-            );
+            let rec = skia_rs_canvas::SaveLayerRec {
+                bounds: bounds.as_ref(),
+                paint: paint.as_ref(),
+                flags: skia_rs_canvas::SaveLayerFlags::NONE,
+            };
+            let rect = inner.layer_bounds_within(&rec, &device);
+            let content = inner.layer_content_bounds_within(&rec, &device);
             let paint = inner.layer_paint(paint.as_ref(), &rect);
-            (rect, paint)
+            (rect, content, paint)
         };
         let (w, h) = (rect.width().max(0), rect.height().max(0));
         let pixels = Box::into_raw(Box::new(PixelBuffer::new(w, h)));
         let layer = FfiLayer {
             pixels,
             origin: (rect.left + ox, rect.top + oy),
+            content: skia_rs_core::IRect::new(
+                content.left + ox,
+                content.top + oy,
+                content.right + ox,
+                content.bottom + oy,
+            ),
             parent: c.buffer,
             paint,
         };
@@ -5174,6 +5201,41 @@ mod tests {
             sk_canvas_get_clip_ibounds(canvas, &raw mut out);
             assert_eq!((out.left, out.top, out.right, out.bottom), (0, 0, 0, 0));
             sk_canvas_release(canvas);
+            sk_surface_unref(surface);
+        }
+    }
+
+    #[test]
+    fn test_canvas_save_layer_hint_limits_content_not_the_filter_output() {
+        // Skia's bounds hint clips what is drawn into the layer, but a blur
+        // still spreads its result past the hint.
+        unsafe {
+            let surface = sk_surface_new_raster(20, 20);
+            let canvas = sk_surface_lock_canvas(surface);
+            let blur = sk_imagefilter_new_blur(1.5, 1.5, 0);
+            let layer_paint = sk_paint_new();
+            sk_paint_set_image_filter(layer_paint, blur);
+            let hint = rect(8.0, 8.0, 12.0, 12.0);
+            sk_canvas_save_layer(canvas, &raw const hint, layer_paint);
+            let paint = sk_paint_new();
+            sk_paint_set_color(paint, 0xFFFF_FFFF);
+            sk_canvas_draw_rect(canvas, &raw const hint, paint);
+            let outside = rect(0.0, 0.0, 3.0, 3.0);
+            sk_canvas_draw_rect(canvas, &raw const outside, paint);
+            sk_canvas_restore(canvas);
+            sk_paint_unref(paint);
+            sk_paint_unref(layer_paint);
+            sk_imagefilter_unref(blur);
+            sk_canvas_release(canvas);
+            assert!(
+                surface_alpha(surface, 6, 10) > 0,
+                "the blur spreads past the hint"
+            );
+            assert_eq!(
+                surface_alpha(surface, 1, 1),
+                0,
+                "content outside the hint is dropped"
+            );
             sk_surface_unref(surface);
         }
     }

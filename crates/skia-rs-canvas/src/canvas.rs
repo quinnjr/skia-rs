@@ -327,6 +327,15 @@ impl<'a> Canvas<'a> {
         // Null have no pixels to composite.
         if matches!(self.backing, Backing::Raster(_)) {
             let device_rect = self.layer_bounds(rec);
+            let content = self.layer_content_bounds_within(
+                rec,
+                &Rect::from_xywh(
+                    0.0,
+                    0.0,
+                    scalar_from_i32(self.width),
+                    scalar_from_i32(self.height),
+                ),
+            );
             let (w, h) = (device_rect.width().max(0), device_rect.height().max(0));
             let mut buffer = PixelBuffer::new(w, h);
             if rec.flags.contains(SaveLayerFlags::INIT_WITH_PREVIOUS) {
@@ -338,11 +347,13 @@ impl<'a> Canvas<'a> {
             // bounds): the prior clip, AA mask included, applies once, when
             // restore() composites the layer through it. Keeping it here
             // too would square partial edge coverage.
+            // ... clipped to the content bounds (the hint), which may be
+            // smaller than the buffer when a filter spreads past the hint.
             self.clip_stack.reset_to_rect(&Rect::new(
-                scalar_from_i32(device_rect.left),
-                scalar_from_i32(device_rect.top),
-                scalar_from_i32(device_rect.left + w),
-                scalar_from_i32(device_rect.top + h),
+                scalar_from_i32(content.left),
+                scalar_from_i32(content.top),
+                scalar_from_i32(content.right),
+                scalar_from_i32(content.bottom),
             ));
             // The filter runs on the layer's pixels: map its parameters
             // from local space into them (Skia's layer-space mapping).
@@ -435,8 +446,30 @@ impl<'a> Canvas<'a> {
     /// past the device) plus, with an image filter, the filter's reach
     /// (blur sigmas are clamped as in Skia; at most the device size), so
     /// nested layers stay bounded.
+    ///
+    /// With an image filter and a `rec.bounds` hint, the layer also holds the
+    /// filter's output past the hint (up to the clip): Skia's hint limits
+    /// the layer's *content* (see
+    /// [`layer_content_bounds_within`](Self::layer_content_bounds_within)),
+    /// not the filtered result, and here the filter runs in place on the
+    /// layer's pixels.
     #[must_use]
     pub fn layer_bounds_within(&self, rec: &SaveLayerRec<'_>, device: &Rect) -> IRect {
+        self.layer_rects(rec, device).0
+    }
+
+    /// The device area draws into the layer may cover: the hint (mapped)
+    /// intersected with what the layer's filter reads (or the clip). Skia's
+    /// `getInputBounds(..., contentBounds)`: the hint acts as a hard clip on
+    /// the layer's content. Inside
+    /// [`layer_bounds_within`](Self::layer_bounds_within).
+    #[must_use]
+    pub fn layer_content_bounds_within(&self, rec: &SaveLayerRec<'_>, device: &Rect) -> IRect {
+        self.layer_rects(rec, device).1
+    }
+
+    /// (layer buffer bounds, content bounds) for `rec`.
+    fn layer_rects(&self, rec: &SaveLayerRec<'_>, device: &Rect) -> (IRect, IRect) {
         use skia_rs_core::cast::scalar_from_i32;
 
         let ctm = *self.total_matrix();
@@ -448,6 +481,7 @@ impl<'a> Canvas<'a> {
             device.bottom.max(scalar_from_i32(own.bottom)),
         );
         let mut clip_bounds = self.clip_stack.bounds();
+        let output_clip = clip_bounds;
         // The filter's parameters in device space, as it will run.
         let filter = rec
             .paint
@@ -464,9 +498,20 @@ impl<'a> Canvas<'a> {
         let hinted = rec.bounds.map_or(Some(clip_bounds), |b| {
             ctm.map_rect(b).intersect(&clip_bounds)
         });
-        hinted
-            .and_then(|r| r.intersect(&limit))
-            .map_or_else(|| IRect::new(0, 0, 0, 0), |r| r.round_out())
+        let content = hinted.and_then(|r| r.intersect(&limit));
+        let round = |r: Option<Rect>| r.map_or_else(|| IRect::new(0, 0, 0, 0), |r| r.round_out());
+        // The filtered result of the content may reach past the hint, up to
+        // the clip; the in-place filter needs room for it.
+        let buffer = match (content, &filter) {
+            (Some(c), Some(filter)) if rec.bounds.is_some() => Some(
+                filter
+                    .filter_bounds(&c)
+                    .intersect(&output_clip)
+                    .map_or(c, |out| c.union(&out)),
+            ),
+            _ => content,
+        };
+        (round(buffer), round(content))
     }
 
     /// The paint a layer at device rect `layer` composites with: `paint`

@@ -1925,3 +1925,36 @@ fn large_offset_layer_filters_keep_their_source() {
     let a = buffer.get_pixel(25, 20).map_or(0, |c| c.alpha());
     assert_eq!(a, 255, "the moved rect is drawn at x 10..40");
 }
+
+#[test]
+fn layer_bounds_hints_limit_content_not_the_filtered_result() {
+    // Skia's save_layer bounds hint clips the layer's content, but a blur
+    // still spreads its result past the hint; content outside the hint is
+    // dropped.
+    use skia_rs_canvas::SaveLayerRec;
+    use skia_rs_paint::{BlurImageFilter, TileMode};
+    use std::sync::Arc;
+
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        let mut layer_paint = Paint::new();
+        layer_paint.set_image_filter(Some(Arc::new(BlurImageFilter::new(
+            5.0,
+            5.0,
+            TileMode::Decal,
+        ))));
+        let hint = Rect::from_xywh(40.0, 40.0, 20.0, 20.0);
+        canvas.save_layer(&SaveLayerRec {
+            bounds: Some(&hint),
+            paint: Some(&layer_paint),
+            ..SaveLayerRec::default()
+        });
+        canvas.draw_rect(&hint, &white(Style::Fill));
+        canvas.draw_rect(&Rect::new(0.0, 0.0, 10.0, 10.0), &white(Style::Fill));
+        canvas.restore();
+    }
+    let alpha = |x, y| buffer.get_pixel(x, y).map_or(0, |c| c.alpha());
+    assert!(alpha(35, 50) > 0, "the halo reaches past the hint");
+    assert_eq!(alpha(5, 5), 0, "content outside the hint is dropped");
+}
