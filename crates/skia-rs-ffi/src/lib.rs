@@ -1626,20 +1626,21 @@ pub const unsafe extern "C" fn sk_is_available() -> bool {
 // Surface drawing helpers (simplified path; prefer sk_canvas_* for parity)
 // =============================================================================
 
-/// Global set of surface pointer addresses currently locked via
-/// [`sk_surface_lock_canvas`]. Backs the documented lock contract: only one
-/// canvas may be held per surface at a time, and the `sk_surface_draw_*` /
-/// [`sk_surface_clear`] convenience helpers (which draw directly on the
-/// surface, bypassing the locked canvas) are rejected while a lock is held.
-/// The locked-surfaces set, usable even if another thread panicked while
-/// holding its mutex (the set stays consistent: every update is a single
-/// insert or remove), so a stale entry can never outlive its surface.
+/// The [`locked_surfaces`] set, usable even if another thread panicked
+/// while holding its mutex (the set stays consistent: every update is a
+/// single insert or remove), so a stale entry can never outlive its surface.
 fn locked_surface_set() -> std::sync::MutexGuard<'static, std::collections::HashSet<usize>> {
     locked_surfaces()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Global set of surface pointer addresses currently locked via
+/// [`sk_surface_lock_canvas`]. Backs the documented lock contract: only one
+/// canvas may be held per surface at a time, and the `sk_surface_draw_*` /
+/// [`sk_surface_clear`] convenience helpers (which draw directly on the
+/// surface, bypassing the locked canvas) are rejected while a lock is held.
+/// Access it through [`locked_surface_set`].
 fn locked_surfaces() -> &'static std::sync::Mutex<std::collections::HashSet<usize>> {
     static LOCKED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
         std::sync::OnceLock::new();
@@ -1773,7 +1774,7 @@ pub struct sk_canvas_t {
     height: i32,
     state: CanvasState,
     /// Identity (pointer address) of the [`sk_surface_t`] this canvas was
-    /// locked from, used to release the entry in [`LOCKED_SURFACES`] on
+    /// locked from, used to release the entry in [`locked_surfaces`] on
     /// [`sk_canvas_release`]. 0 for canvases not tied to a surface lock.
     locked_surface: usize,
 }
@@ -1996,7 +1997,7 @@ pub unsafe extern "C" fn sk_canvas_release(canvas: *mut sk_canvas_t) {
     });
 }
 
-/// Releases a locked surface on drop: removes its [`LOCKED_SURFACES`] entry
+/// Releases a locked surface on drop: removes its [`locked_surfaces`] entry
 /// and the reference [`sk_surface_lock_canvas`] took. 0 means no surface.
 struct SurfaceUnlock(usize);
 
