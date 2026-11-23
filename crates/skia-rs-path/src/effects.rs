@@ -1621,16 +1621,18 @@ impl PathEffect for Path1DEffect {
         // failure into a truncated success.
         // Count by stepping `distance` exactly as the walk below (and Skia)
         // does, so rounding cannot make the two disagree at the limit; a
-        // direct estimate settles every contour that is clearly under or
-        // over it without stepping.
+        // direct estimate settles every contour clearly under or over it
+        // without stepping. "Clearly" is 2%: summing `advance` in f32 up to
+        // 1e5 times drifts by at most ~0.6% (1e5 * 2^-24 relative error per
+        // add), so only estimates within 2% of the limit need the walk.
         let limit = scalar_from_i32(i32::try_from(MAX_REASONABLE_ITERATIONS).unwrap_or(i32::MAX));
         for i in 0..measure.contour_count() {
             let length = measure.contour_length(i).unwrap_or(0.0);
             let estimate = ((length - self.initial_offset) / self.advance).ceil();
-            if !estimate.is_finite() || estimate > limit + 2.0 {
+            if !estimate.is_finite() || estimate > limit * 1.02 {
                 return None;
             }
-            if estimate < limit - 2.0 {
+            if estimate < limit * 0.98 {
                 continue;
             }
             let mut distance = self.initial_offset;
@@ -2989,6 +2991,37 @@ mod tests {
             .filter_path_culled(&b.build(), &mut rec, Some(&cull), 1.0)
             .expect("succeeds");
         assert!(out.is_empty(), "{} points", out.points().len());
+    }
+
+    #[test]
+    fn path1d_limit_matches_the_f32_walk_near_100k_stamps() {
+        // advance 0.1 over 9999 units: the estimate (99,990) is under the
+        // limit, but 1e5 f32 additions of 0.1 drift short of 9999, so the
+        // walk (Skia's governor) needs more than 100,000 stamps and fails.
+        // The effect must agree with that walk.
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0);
+        for i in 1..42 {
+            b.line_to(scalar_from_i32(i % 2) * 0.01, scalar_from_i32(i % 3) * 0.01);
+        }
+        let effect = Path1DEffect::new(b.build(), 0.1, 0.0, Path1DStyle::Translate).unwrap();
+        let length = 9999.0_f32;
+        let (mut distance, mut stamps) = (effect.initial_offset, 0_u32);
+        loop {
+            if distance >= length {
+                break;
+            }
+            stamps += 1;
+            distance += 0.1;
+        }
+        let mut line = PathBuilder::new();
+        line.move_to(0.0, 0.0).line_to(length, 0.0);
+        let result = effect.apply(&line.build());
+        assert_eq!(
+            result.is_none(),
+            stamps > MAX_REASONABLE_ITERATIONS,
+            "walk needs {stamps} stamps"
+        );
     }
 
     #[test]
