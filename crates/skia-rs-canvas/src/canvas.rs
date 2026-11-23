@@ -3010,8 +3010,14 @@ impl Canvas<'_> {
 
         // Edge function of (a, b) at (x, y): twice the signed area of
         // (a, b, (x, y)). Each weight is an edge function over the area.
+        // It is always evaluated with the endpoints in one fixed order (and
+        // negated when swapped), so the two triangles sharing an edge get
+        // exactly opposite values: float rounding cannot put a pixel center
+        // inside both, or outside both.
+        let first = |a: Point, b: Point| (a.y, a.x) < (b.y, b.x);
         let edge = |a: Point, b: Point, x: Scalar, y: Scalar| {
-            (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x)
+            let raw = |a: Point, b: Point| (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x);
+            if first(a, b) { raw(a, b) } else { -raw(b, a) }
         };
         let denom = edge(p1, p2, p0.x, p0.y);
         // Degenerate, or non-finite (NaN weights would pass every inside
@@ -3034,11 +3040,7 @@ impl Canvas<'_> {
         // translucent meshes get no double-blended seams: the triangle whose
         // opposite vertex lies left of the edge, taken in a fixed direction.
         let owns_edge = |a: Point, b: Point, opposite: Point| {
-            let (a, b) = if (a.y, a.x) < (b.y, b.x) {
-                (a, b)
-            } else {
-                (b, a)
-            };
+            let (a, b) = if first(a, b) { (a, b) } else { (b, a) };
             edge(a, b, opposite.x, opposite.y) > 0.0
         };
         let owns = [

@@ -2432,3 +2432,45 @@ fn triangles_sharing_an_edge_blend_its_pixels_once() {
     }
     assert_eq!(alpha(2, 5), alpha(5, 2), "both halves alike");
 }
+
+#[test]
+fn non_integer_shared_edges_are_drawn_once_without_holes() {
+    use skia_rs_canvas::VertexMode;
+    use skia_rs_core::Point;
+
+    // Two 50%-alpha triangles sharing an edge with non-integer ends, each
+    // listing it in the opposite order: every pixel is painted 0 or 1 times.
+    let (p, q) = (
+        Point::new(131.104_97, 106.678_01),
+        Point::new(19.767_51, 14.303_96),
+    );
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    let mut paint = Paint::new();
+    paint.set_color32(Color::from_argb(128, 255, 255, 255));
+    Canvas::new_raster(&mut buffer).draw_vertices(
+        VertexMode::Triangles,
+        &[p, q, Point::new(190.0, 20.0), q, p, Point::new(10.0, 190.0)],
+        None,
+        &paint,
+    );
+    let alpha = |x: i32, y: i32| buffer.get_pixel(x, y).map_or(0, |c| c.alpha());
+    let single = alpha(100, 60);
+    assert!(single > 0, "a single blend");
+    // Pixel centers within half a pixel of the shared edge, away from its
+    // ends, are inside the union: each must be painted exactly once.
+    let (dx, dy) = (p.x - q.x, p.y - q.y);
+    let len = dx.hypot(dy);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let a = alpha(x, y);
+            assert!(a == 0 || a == single, "({x}, {y}) blended twice: {a}");
+            #[allow(clippy::cast_precision_loss)]
+            let (cx, cy) = (x as f32 + 0.5 - q.x, y as f32 + 0.5 - q.y);
+            let along = cx.mul_add(dx, cy * dy) / len;
+            let across = cx.mul_add(dy, -(cy * dx)) / len;
+            if across.abs() < 0.5 && along > 5.0 && along < len - 5.0 {
+                assert_eq!(a, single, "({x}, {y}) on the shared edge is a hole");
+            }
+        }
+    }
+}
