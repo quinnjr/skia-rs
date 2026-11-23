@@ -832,23 +832,20 @@ int32_t sk_canvas_get_height(const struct sk_canvas_t *canvas);
 // nested one, ...). Returns 0 if `canvas` is null.
 int32_t sk_canvas_save(struct sk_canvas_t *canvas);
 
-// Save a layer — pushes a save frame that records the layer bounds and
-// paint for composition on restore.
+// Save a layer (currently the same as [`sk_canvas_save`]).
 //
-// Both `bounds` and `paint` are optional (null is acceptable). The layer
-// is allocated lazily (at the next draw) because draws go through the
-// transient [`Canvas`](skia_rs_canvas::Canvas) layer machinery already.
+// `bounds` and `paint` are accepted (null is fine) but ignored, so no
+// offscreen layer is made and the paint's alpha, blend mode and filters
+// are not applied on restore.
 //
 // Returns the same value as `SkCanvas::saveLayer()` (and
 // [`sk_canvas_save`]): the save count *before* this call in Skia's
 // 1-based counting (1 for the first save, 2 for a nested one, ...).
 // Returns 0 if `canvas` is null.
 //
-// **Pragmatic note:** because the FFI canvas reconstructs its underlying
-// [`Canvas`](skia_rs_canvas::Canvas) between calls, the `layer_paint` / `layer_bounds` are tracked but
-// composition is delegated to the transient canvas at the next draw — the
-// effective behavior matches the recording-only semantics in
-// [`skia_rs_canvas::Canvas::save_layer`].
+// The FFI canvas rebuilds its [`Canvas`](skia_rs_canvas::Canvas) for each
+// call, so a layer cannot yet live across calls; the parameters are part of
+// the ABI so it will not change when layer support lands.
 int32_t sk_canvas_save_layer(struct sk_canvas_t *canvas,
                              const struct sk_rect_t *_bounds,
                              const sk_paint_t *_paint);
