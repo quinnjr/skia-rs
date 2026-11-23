@@ -316,17 +316,7 @@ impl DashEffect {
         if source.is_rect().is_none() || !source.is_closed() {
             return culled;
         }
-        let mut start_phase = self.phase % self.interval_sum;
-        if start_phase < 0.0 {
-            start_phase += self.interval_sum;
-        }
-        // The initial dash index (SkDashPath::CalcDashParameters).
-        let mut index = 0;
-        let mut remaining = start_phase;
-        while index < self.intervals.len() && remaining >= self.intervals[index] {
-            remaining -= self.intervals[index];
-            index += 1;
-        }
+        let (start_phase, index, _) = self.dash_parameters();
         if !index.is_multiple_of(2) {
             return culled;
         }
@@ -371,6 +361,39 @@ impl DashEffect {
         );
         b.line_to(mid.x - wx, mid.y - wy);
         b.build()
+    }
+
+    /// `SkDashPath::CalcDashParameters`: the phase normalized into
+    /// `[0, interval_sum)` (a negative phase is flipped), the index of the
+    /// interval it falls in, and how much of that interval remains. A phase
+    /// exactly at an interval's end moves on only if the interval is
+    /// non-empty, and rounding that runs past the last interval falls back
+    /// to the start of the first, as in Skia.
+    #[allow(clippy::float_cmp, reason = "SkDashPath's exact phase == gap test")]
+    fn dash_parameters(&self) -> (Scalar, usize, Scalar) {
+        let len = self.interval_sum;
+        let mut phase = self.phase;
+        if phase < 0.0 {
+            phase = -phase;
+            if phase > len {
+                phase %= len;
+            }
+            phase = len - phase;
+            if phase == len {
+                phase = 0.0;
+            }
+        } else if phase >= len {
+            phase %= len;
+        }
+        let adjusted = phase;
+        for (index, &gap) in self.intervals.iter().enumerate() {
+            if phase > gap || (phase == gap && gap != 0.0) {
+                phase -= gap;
+            } else {
+                return (adjusted, index, gap - phase);
+            }
+        }
+        (adjusted, 0, self.intervals[0])
     }
 
     fn dash_line(
@@ -644,28 +667,12 @@ impl DashEffect {
         #[allow(unused_assignments)]
         let mut _distance_along_contour = 0.0_f32;
 
-        // Adjust phase to be within the interval sum
-        let mut phase = self.phase % self.interval_sum;
-        if phase < 0.0 {
-            phase += self.interval_sum;
-        }
-
-        // Find starting interval index and offset
-        let (mut interval_idx, interval_offset) = {
-            let mut accumulated = 0.0;
-            let mut idx = 0;
-            loop {
-                if accumulated + self.intervals[idx] > phase {
-                    break;
-                }
-                accumulated += self.intervals[idx];
-                idx = (idx + 1) % self.intervals.len();
-            }
-            (idx, phase - accumulated)
-        };
-
+        // SkDashPath::CalcDashParameters: where in the pattern each contour
+        // starts.
+        let (_, start_index, start_length) = self.dash_parameters();
+        let mut interval_idx = start_index;
         let mut is_on = interval_idx % 2 == 0;
-        let mut remaining_in_interval = self.intervals[interval_idx] - interval_offset;
+        let mut remaining_in_interval = start_length;
 
         for element in path {
             match element {
@@ -674,17 +681,9 @@ impl DashEffect {
                     contour_start = p;
                     _distance_along_contour = 0.0;
                     // Reset dash state for new contour
-                    let mut accumulated = 0.0;
-                    interval_idx = 0;
-                    loop {
-                        if accumulated + self.intervals[interval_idx] > phase {
-                            break;
-                        }
-                        accumulated += self.intervals[interval_idx];
-                        interval_idx = (interval_idx + 1) % self.intervals.len();
-                    }
+                    interval_idx = start_index;
                     is_on = interval_idx % 2 == 0;
-                    remaining_in_interval = self.intervals[interval_idx] - (phase - accumulated);
+                    remaining_in_interval = start_length;
                     if is_on {
                         builder.move_to(p.x, p.y);
                     }
@@ -3093,6 +3092,23 @@ mod tests {
             stamps > MAX_REASONABLE_ITERATIONS,
             "walk needs {stamps} stamps"
         );
+    }
+
+    #[test]
+    fn dash_parameters_match_skia_calc_dash_parameters() {
+        let params = |intervals: Vec<Scalar>, phase: Scalar| {
+            DashEffect::new(intervals, phase).unwrap().dash_parameters()
+        };
+        // A zero-length "on" interval at the phase is where the dash starts
+        // (index 0), not skipped.
+        assert_eq!(params(vec![0.0, 10.0], 0.0), (0.0, 0, 0.0));
+        // Phase exactly at a non-empty interval's end moves on.
+        assert_eq!(params(vec![10.0, 5.0], 10.0), (10.0, 1, 5.0));
+        // A phase equal to the total length wraps to 0 (phase >= len is
+        // reduced mod len), even with a zero-length tail interval.
+        assert_eq!(params(vec![10.0, 0.0], 10.0), (0.0, 0, 10.0));
+        // Negative phases are flipped into the pattern.
+        assert_eq!(params(vec![10.0, 5.0], -3.0), (12.0, 1, 3.0));
     }
 
     #[test]
