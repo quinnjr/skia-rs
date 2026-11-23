@@ -1525,9 +1525,13 @@ impl<'a> Rasterizer<'a> {
                         self.draw_line(pts[0], pts[1], paint);
                     }
                     current = contour_start;
+                    // Segments after a Close (without a Move) form a new
+                    // contour from the same start: Skia injects a moveTo, so
+                    // the cap state is that of a fresh contour.
+                    closed = contour_is_closed(verbs.get(index + 1..).unwrap_or_default());
                 }
             }
-            prev_is_move = matches!(element, PathElement::Move(_));
+            prev_is_move = matches!(element, PathElement::Move(_) | PathElement::Close);
         }
     }
 

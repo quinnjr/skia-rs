@@ -2363,11 +2363,17 @@ impl Canvas<'_> {
         let complex_paint = paint.path_effect().is_some()
             || paint.mask_filter().is_some()
             || paint.style() != skia_rs_paint::Style::Fill;
-        // Under a non-translate matrix even a plain aliased fill uses the
-        // boundary: rects meeting at T-junctions compute their shared edge
-        // from different endpoints, so after rotation the crossings can
-        // differ by an ulp and leave holes or double-blended pixels.
-        if non_translate || complex_paint || (paint.is_anti_alias() && fractional_translate) {
+        // Under rotation, skew or perspective even a plain aliased fill uses
+        // the boundary: rects meeting at T-junctions compute their shared
+        // edge from different endpoints, so the crossings can differ by an
+        // ulp and leave holes or double-blended pixels. Scale + translate
+        // maps equal coordinates to equal device values, so rect-by-rect
+        // stays exact there (and avoids the costly boundary union).
+        let not_scale_translate = !m.is_scale_translate();
+        if not_scale_translate
+            || complex_paint
+            || (paint.is_anti_alias() && (non_translate || fractional_translate))
+        {
             let mut rects = skia_rs_path::PathBuilder::new();
             for rect in region.iter() {
                 rects.add_rect(&rect.to_rect());
