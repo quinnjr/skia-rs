@@ -1,14 +1,5 @@
 //! Font configuration for text rendering.
 
-#![allow(
-    clippy::suboptimal_flops,
-    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
-)]
-#![allow(
-    clippy::manual_midpoint,
-    reason = "hot flattening/tessellation loops port Skia's SkScalarAve, (a + b) * 0.5, which stays in f32; f32::midpoint widens to f64 and gives the same result unless a + b overflows f32 (|coords| > ~1.7e38)"
-)]
-
 use crate::typeface::{Typeface, TypefaceRef};
 use skia_rs_core::{Matrix, Point, Scalar};
 use std::sync::Arc;
@@ -1236,6 +1227,11 @@ fn path_band_intercepts(path: &skia_rs_path::Path, y_top: Scalar, y_bottom: Scal
     clippy::similar_names,
     reason = "midx/midy are the natural names for a chord midpoint's x/y in curve-flattening math"
 )]
+#[allow(
+    clippy::suboptimal_flops,
+    clippy::manual_midpoint,
+    reason = "de Casteljau subdivision as Skia writes it: (a + b) * 0.5 and unfused products, so flattening matches Skia's rounding"
+)]
 fn flatten_quad(
     p0: skia_rs_core::Point,
     p1: skia_rs_core::Point,
@@ -1263,6 +1259,11 @@ fn flatten_quad(
 }
 
 /// Recursively subdivide a cubic bezier into chord approximations.
+#[allow(
+    clippy::suboptimal_flops,
+    clippy::manual_midpoint,
+    reason = "de Casteljau subdivision as Skia writes it: (a + b) * 0.5 and unfused products, so flattening matches Skia's rounding"
+)]
 fn flatten_cubic(
     p0: skia_rs_core::Point,
     p1: skia_rs_core::Point,

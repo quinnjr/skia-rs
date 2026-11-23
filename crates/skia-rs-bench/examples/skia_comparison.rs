@@ -9,10 +9,6 @@
     clippy::cast_precision_loss,
     reason = "loop indices are bounded by small fixed ranges (5, 100); precision loss cannot occur in practice"
 )]
-#![allow(
-    clippy::suboptimal_flops,
-    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
-)]
 
 use skia_rs_bench::skia_comparison::{
     BenchmarkRunner, ComparisonReport, ComparisonResult, reference_timings,
@@ -214,15 +210,15 @@ fn run_drawing_benchmarks(report: &mut ComparisonReport, runner: &BenchmarkRunne
     let mut builder = PathBuilder::new();
     let cx = 500.0;
     let cy = 500.0;
-    let outer = 100.0;
-    let inner = 40.0;
+    let outer: f32 = 100.0;
+    let inner: f32 = 40.0;
     for i in 0..5 {
         let angle_o = (i as f32).mul_add(72.0, -90.0).to_radians();
         let angle_i = ((i as f32).mul_add(72.0, 36.0) - 90.0).to_radians();
-        let ox = cx + outer * angle_o.cos();
-        let oy = cy + outer * angle_o.sin();
-        let ix = cx + inner * angle_i.cos();
-        let iy = cy + inner * angle_i.sin();
+        let ox = outer.mul_add(angle_o.cos(), cx);
+        let oy = outer.mul_add(angle_o.sin(), cy);
+        let ix = inner.mul_add(angle_i.cos(), cx);
+        let iy = inner.mul_add(angle_i.sin(), cy);
         if i == 0 {
             builder.move_to(ox, oy);
         } else {

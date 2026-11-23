@@ -2,11 +2,6 @@
 //!
 //! Images represent immutable pixel data that can be drawn to a canvas.
 
-#![allow(
-    clippy::suboptimal_flops,
-    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
-)]
-
 use skia_rs_core::cast::{floor_to_i32, scalar_from_i32};
 use skia_rs_core::{AlphaType, ColorSpace, ColorType, Rect, Scalar};
 use std::sync::Arc;
@@ -949,7 +944,7 @@ fn resample_linear(
 
                 let top = c00.mul_add(1.0 - tx, c01 * tx);
                 let bot = c10.mul_add(1.0 - tx, c11 * tx);
-                let v = top * (1.0 - ty) + bot * ty;
+                let v = top.mul_add(1.0 - ty, bot * ty);
 
                 new_pixels[dst_offset + i] = skia_rs_core::cast::f32_to_u8_sat(v);
             }

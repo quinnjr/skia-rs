@@ -6,11 +6,6 @@
 //! - Time-based functions
 //! - Simple conditionals
 
-#![allow(
-    clippy::suboptimal_flops,
-    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
-)]
-
 use skia_rs_core::Scalar;
 use std::collections::HashMap;
 
@@ -325,7 +320,7 @@ impl ExpressionEvaluator {
 
                     let normalized = (t - t_min) / (t_max - t_min);
                     let clamped = normalized.clamp(0.0, 1.0);
-                    Some(Value::Number(v_min + clamped * (v_max - v_min)))
+                    Some(Value::Number(clamped.mul_add(v_max - v_min, v_min)))
                 } else {
                     None
                 }
@@ -351,7 +346,7 @@ impl ExpressionEvaluator {
                         }
                         _ => normalized, // Default to linear
                     };
-                    Some(Value::Number(v_min + eased * (v_max - v_min)))
+                    Some(Value::Number(eased.mul_add(v_max - v_min, v_min)))
                 } else {
                     None
                 }

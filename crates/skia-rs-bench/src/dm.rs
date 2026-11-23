@@ -23,11 +23,6 @@
 //! runner.run();
 //! ```
 
-#![allow(
-    clippy::suboptimal_flops,
-    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
-)]
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -305,18 +300,18 @@ impl StandardGms {
             let mut builder = PathBuilder::new();
             let cx = 100.0;
             let cy = 100.0;
-            let outer = 80.0;
-            let inner = 30.0;
+            let outer: f32 = 80.0;
+            let inner: f32 = 30.0;
 
             for i in 0..5 {
                 let angle_outer =
                     std::f32::consts::PI * 2.0 * i as f32 / 5.0 - std::f32::consts::PI / 2.0;
                 let angle_inner = angle_outer + std::f32::consts::PI / 5.0;
 
-                let px = cx + outer * angle_outer.cos();
-                let py = cy + outer * angle_outer.sin();
-                let ix = cx + inner * angle_inner.cos();
-                let iy = cy + inner * angle_inner.sin();
+                let px = outer.mul_add(angle_outer.cos(), cx);
+                let py = outer.mul_add(angle_outer.sin(), cy);
+                let ix = inner.mul_add(angle_inner.cos(), cx);
+                let iy = inner.mul_add(angle_inner.sin(), cy);
 
                 if i == 0 {
                     builder.move_to(px, py);
