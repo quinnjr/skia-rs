@@ -463,7 +463,12 @@ impl<'a> Rasterizer<'a> {
     #[inline]
     fn get_clip_coverage(&self, x: i32, y: i32) -> u8 {
         use skia_rs_core::cast::scalar_from_i32;
-        let (dx, dy) = (x + self.origin.0, y + self.origin.1);
+        // Saturating: callers may pass saturated indices for far-off
+        // geometry, and a layer's origin must not overflow them.
+        let (dx, dy) = (
+            x.saturating_add(self.origin.0),
+            y.saturating_add(self.origin.1),
+        );
         if self.use_advanced_clip {
             self.clip_stack.get_coverage(dx, dy)
         } else if self
@@ -616,7 +621,13 @@ impl<'a> Rasterizer<'a> {
     pub fn draw_point(&mut self, point: Point, paint: &Paint) {
         use skia_rs_core::cast::floor_to_i32;
         let device = self.matrix.map_point(point);
-        if !(device.x.is_finite() && device.y.is_finite()) {
+        // Points off the device (beyond the 1-px AA square) draw nothing,
+        // and must not reach the pixel indexing with saturated values.
+        let (w, h) = (
+            skia_rs_core::cast::scalar_from_i32(self.buffer.width),
+            skia_rs_core::cast::scalar_from_i32(self.buffer.height),
+        );
+        if !(device.x > -2.0 && device.x < w + 2.0 && device.y > -2.0 && device.y < h + 2.0) {
             return;
         }
         let source = self.make_source(paint);

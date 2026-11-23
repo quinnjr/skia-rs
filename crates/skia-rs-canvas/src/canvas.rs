@@ -886,13 +886,21 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// The resolution scale path effects flatten for: the CTM's maximum
-    /// scale (Skia's `SkStrokeRec::getResScale`), or 1 when degenerate.
+    /// The resolution scale path effects flatten for, as Skia's
+    /// `SkStrokeRec::GetResScale` / `ComputeResScaleForStroking` computes it:
+    /// the longer of the 2x2 part's column vectors (perspective is ignored),
+    /// capped at 1e5, or 1 when that is not finite and positive.
     fn res_scale(&self) -> Scalar {
-        self.total_matrix()
-            .max_scale()
-            .filter(|s| s.is_finite() && *s > 0.0)
-            .unwrap_or(1.0)
+        const MAX_STROKE_SCALE: Scalar = 1e5;
+        let v = &self.total_matrix().values;
+        let sx = v[Matrix::SCALE_X].hypot(v[Matrix::SKEW_Y]);
+        let sy = v[Matrix::SKEW_X].hypot(v[Matrix::SCALE_Y]);
+        let scale = sx.max(sy);
+        if sx.is_finite() && sy.is_finite() && scale > 0.0 {
+            scale.min(MAX_STROKE_SCALE)
+        } else {
+            1.0
+        }
     }
 
     /// The clip bounds mapped into local space, outset for the paint's
@@ -2988,6 +2996,28 @@ const fn colr_composite_to_blend(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn res_scale_matches_skia_compute_res_scale_for_stroking() {
+        use skia_rs_core::Matrix;
+
+        let mut buffer = PixelBuffer::new(4, 4);
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        // Shear [[1, 1], [0, 1]]: max column length is sqrt(2), not the
+        // largest singular value (1.618).
+        canvas.concat(&Matrix::skew(1.0, 0.0));
+        assert!((canvas.res_scale() - std::f32::consts::SQRT_2).abs() < 1e-5);
+        // Perspective is ignored: scale 8 with a perspective term is 8.
+        canvas.reset_matrix();
+        canvas.concat(&Matrix {
+            values: [8.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.001, 0.0, 1.0],
+        });
+        assert!((canvas.res_scale() - 8.0).abs() < 1e-5);
+        // Capped at 1e5.
+        canvas.reset_matrix();
+        canvas.concat(&Matrix::scale(1e7, 1e7));
+        assert!((canvas.res_scale() - 1e5).abs() < 1.0);
+    }
+
     use super::*;
     use skia_rs_core::{Color, Rect};
     use skia_rs_paint::Style;
