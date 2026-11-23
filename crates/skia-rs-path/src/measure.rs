@@ -137,8 +137,8 @@ impl PathMeasure {
         };
         let (dx, dy) = (seg.end.x - seg.start.x, seg.end.y - seg.start.y);
         let pos = Point::new(
-            lerp(seg.start.x, seg.start.x + dx, t),
-            lerp(seg.start.y, seg.start.y + dy, t),
+            lerp(seg.start.x, seg.end.x, t),
+            lerp(seg.start.y, seg.end.y, t),
         );
         let len = dx.hypot(dy);
         let tangent = if len > 0.0 {
