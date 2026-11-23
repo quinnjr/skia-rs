@@ -3148,7 +3148,10 @@ pub struct sk_picture_recorder_t {
     commands: Vec<skia_rs_canvas::DrawCommand>,
     /// Cull rect recorded by `begin_recording`.
     cull_rect: Rect,
-    /// State of the borrowed recording canvas (if any).
+    /// State of the borrowed recording canvas (if any). Only the save stack
+    /// is used (to drop unbalanced restores): transforms are recorded as
+    /// commands and geometry stays local, so playback applies them; never
+    /// bake the matrix or clips here into recorded geometry.
     state: Option<CanvasState>,
     recording: bool,
     /// Liveness flag shared with every [`sk_recording_canvas_t`] handed out
@@ -3351,11 +3354,10 @@ pub unsafe extern "C" fn sk_recording_canvas_translate(
     dy: f32,
 ) {
     catch_panic_void(|| {
-        let Some((commands, state)) = resolve_recording_canvas(canvas) else {
+        let Some((commands, _)) = resolve_recording_canvas(canvas) else {
             return;
         };
         commands.push(skia_rs_canvas::DrawCommand::Translate { dx, dy });
-        state.matrix = state.matrix.concat(&Matrix::translate(dx, dy));
     });
 }
 
