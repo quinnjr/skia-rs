@@ -1806,3 +1806,60 @@ fn clips_inside_an_off_device_layer_keep_its_content() {
         "the inner clip changed the blurred edge by up to {worst}"
     );
 }
+
+#[test]
+fn layers_inside_a_filtered_layer_keep_its_off_device_reach() {
+    // A plain layer inside a blurred layer that reaches past the device is
+    // sized from the parent, not cut to the device, so content left of the
+    // device still feeds the outer blur.
+    use skia_rs_canvas::SaveLayerRec;
+    use skia_rs_paint::{BlurImageFilter, TileMode};
+    use std::sync::Arc;
+
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        let mut blur = Paint::new();
+        blur.set_image_filter(Some(Arc::new(BlurImageFilter::new(
+            8.0,
+            8.0,
+            TileMode::Decal,
+        ))));
+        canvas.save_layer(&SaveLayerRec {
+            paint: Some(&blur),
+            ..SaveLayerRec::default()
+        });
+        canvas.save_layer(&SaveLayerRec::default());
+        canvas.draw_rect(&Rect::new(-40.0, 80.0, -2.0, 120.0), &white(Style::Fill));
+        canvas.restore();
+        canvas.restore();
+    }
+    let a = buffer.get_pixel(0, 100).map_or(0, |c| c.alpha());
+    assert!(a > 0, "the blur bleeds in from off-device content");
+}
+
+#[test]
+fn huge_layer_blurs_are_clamped_like_skia() {
+    // SkBlurImageFilter clamps sigma to 532, which bounds the layer's reach.
+    use skia_rs_canvas::SaveLayerRec;
+    use skia_rs_paint::{BlurImageFilter, TileMode};
+    use std::sync::Arc;
+
+    let mut buffer = PixelBuffer::new(4000, 10);
+    let canvas = Canvas::new_raster(&mut buffer);
+    let mut blur = Paint::new();
+    blur.set_image_filter(Some(Arc::new(BlurImageFilter::new(
+        100_000.0,
+        100_000.0,
+        TileMode::Decal,
+    ))));
+    let bounds = canvas.layer_bounds(&SaveLayerRec {
+        paint: Some(&blur),
+        ..SaveLayerRec::default()
+    });
+    // About 3 * 532 per side, not the 4000-pixel device-size cap.
+    assert!(
+        bounds.left >= -1700 && bounds.right <= 4000 + 1700,
+        "{bounds:?}"
+    );
+}

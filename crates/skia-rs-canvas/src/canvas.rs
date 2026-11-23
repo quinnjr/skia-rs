@@ -278,17 +278,23 @@ impl<'a> Canvas<'a> {
         self.save_count - 1
     }
 
-    /// Save the current state with a layer.
+    /// Save the current state with a layer, like `SkCanvas::saveLayer`.
     ///
-    /// For raster backings this allocates an offscreen [`PixelBuffer`] sized
-    /// to `rec.bounds` (or the full canvas if no bounds are given) and
-    /// redirects all subsequent draws into it until the matching
-    /// [`restore`](Self::restore). On restore the buffer is composited back
-    /// onto the enclosing target using `rec.paint`'s alpha and blend mode.
+    /// For raster backings this allocates an offscreen [`PixelBuffer`] over
+    /// [`layer_bounds`](Self::layer_bounds): `rec.bounds` (a local-space
+    /// hint) intersected with the clip bounds, outset by the reach of the
+    /// paint's image filter (so the layer may extend past the device, and
+    /// its origin may be negative). The layer starts transparent, or as a
+    /// copy of the pixels below with `SaveLayerFlags::INIT_WITH_PREVIOUS`.
+    /// Inside it the clip is wide open (only the layer's bounds and clips
+    /// set after this call apply), as in Skia; the outer clip applies once,
+    /// when the matching [`restore`](Self::restore) composites the layer
+    /// through it with the paint's image filter (mapped through the current
+    /// matrix), color filter, alpha and blend mode.
     ///
-    /// Recording backings simply emit a [`DrawCommand::SaveLayer`] and rely
-    /// on playback (against a raster canvas) to do the actual composition.
-    /// Null backings behave like plain [`save`](Self::save) — no layer is
+    /// Recording backings emit a [`DrawCommand::SaveLayer`] and rely on
+    /// playback (against a raster canvas) to do the composition. Null
+    /// backings behave like plain [`save`](Self::save) — no layer is
     /// allocated — but the save count is incremented so the matching
     /// restore still balances.
     ///
@@ -424,13 +430,23 @@ impl<'a> Canvas<'a> {
     /// [`layer_bounds`](Self::layer_bounds) for a canvas whose pixels are
     /// part of a larger device: `device` is that device's rect in this
     /// canvas's coordinates (the C API's canvas draws into one layer at a
-    /// time). A filtered layer extends at most the filter's reach (itself
-    /// at most the device size) past `device`, so nested filtered layers
-    /// stay bounded.
+    /// time). The new layer may cover the current target (the device, this
+    /// canvas's pixels, and the top layer, which a filtered parent extends
+    /// past the device) plus, with an image filter, the filter's reach
+    /// (blur sigmas are clamped as in Skia; at most the device size), so
+    /// nested layers stay bounded.
     #[must_use]
     pub fn layer_bounds_within(&self, rec: &SaveLayerRec<'_>, device: &Rect) -> IRect {
+        use skia_rs_core::cast::scalar_from_i32;
+
         let ctm = *self.total_matrix();
-        let device_full = *device;
+        let own = self.clip_mask_bounds();
+        let device_full = Rect::new(
+            device.left.min(scalar_from_i32(own.left)),
+            device.top.min(scalar_from_i32(own.top)),
+            device.right.max(scalar_from_i32(own.right)),
+            device.bottom.max(scalar_from_i32(own.bottom)),
+        );
         let mut clip_bounds = self.clip_stack.bounds();
         // The filter's parameters in device space, as it will run.
         let filter = rec
@@ -451,7 +467,7 @@ impl<'a> Canvas<'a> {
             ]
             .into_iter()
             .fold(0.0, Scalar::max)
-            .min(device_full.width().max(device_full.height()));
+            .min(device.width().max(device.height()));
             clip_bounds = clip_bounds.inset(-reach, -reach);
         }
         let hinted = rec.bounds.map_or(Some(clip_bounds), |b| {

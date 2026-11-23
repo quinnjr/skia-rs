@@ -27,7 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filter's reach past the clip, at most the device size past the device).
   As in Skia, the filter's parameters are mapped from local space into the
   layer (sigmas, offsets and radii scale and rotate with the matrix) via the
-  new `ImageFilter::map_params` / `map_image_filter`. New
+  new `ImageFilter::map_params` / `map_image_filter`. Blur and drop-shadow
+  sigmas are clamped to 532, like `SkBlurImageFilter`'s `kMaxSigma`. New
   `Canvas::layer_bounds`, `layer_bounds_within`, `layer_paint` and
   `composite_layer_pixels`.
 - **Breaking**: `DrawCommand::SaveLayer` has a `flags` field, so recorded

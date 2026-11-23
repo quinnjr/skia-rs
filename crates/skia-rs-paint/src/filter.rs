@@ -417,6 +417,15 @@ pub fn map_image_filter(filter: &ImageFilterRef, matrix: &Matrix) -> ImageFilter
         .unwrap_or_else(|| Arc::clone(filter))
 }
 
+/// `SkBlurImageFilter`'s `kMaxSigma`: blur sigmas (in layer space) are
+/// clamped to this, which also bounds how far a blur reaches.
+const MAX_BLUR_SIGMA: Scalar = 532.0;
+
+/// A blur sigma clamped like `SkBlurImageFilter` (to [`MAX_BLUR_SIGMA`]).
+const fn max_sigma(sigma: Scalar) -> Scalar {
+    sigma.min(MAX_BLUR_SIGMA)
+}
+
 /// Maps an optional input filter.
 fn map_input(input: Option<&ImageFilterRef>, matrix: &Matrix) -> Option<ImageFilterRef> {
     input.map(|f| map_image_filter(f, matrix))
@@ -461,6 +470,7 @@ impl BlurImageFilter {
 impl ImageFilter for BlurImageFilter {
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         let (sigma_x, sigma_y) = map_size(matrix, self.sigma_x, self.sigma_y);
+        let (sigma_x, sigma_y) = (max_sigma(sigma_x), max_sigma(sigma_y));
         Some(Arc::new(Self {
             sigma_x,
             sigma_y,
@@ -470,8 +480,8 @@ impl ImageFilter for BlurImageFilter {
 
     fn filter_bounds(&self, src: &Rect) -> Rect {
         // Blur expands bounds by ~3 sigma
-        let dx = self.sigma_x * 3.0;
-        let dy = self.sigma_y * 3.0;
+        let dx = max_sigma(self.sigma_x) * 3.0;
+        let dy = max_sigma(self.sigma_y) * 3.0;
         Rect::new(src.left - dx, src.top - dy, src.right + dx, src.bottom + dy)
     }
 
@@ -480,8 +490,8 @@ impl ImageFilter for BlurImageFilter {
             return;
         }
         // SkBlurMask::ConvertSigmaToRadius; do not truncate sigma directly.
-        let rx = sigma_to_int_box_radius(self.sigma_x);
-        let ry = sigma_to_int_box_radius(self.sigma_y);
+        let rx = sigma_to_int_box_radius(max_sigma(self.sigma_x));
+        let ry = sigma_to_int_box_radius(max_sigma(self.sigma_y));
         if rx == 0 && ry == 0 {
             return;
         }
@@ -542,6 +552,7 @@ impl ImageFilter for DropShadowImageFilter {
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         let (dx, dy) = map_vector(matrix, self.dx, self.dy);
         let (sigma_x, sigma_y) = map_size(matrix, self.sigma_x, self.sigma_y);
+        let (sigma_x, sigma_y) = (max_sigma(sigma_x), max_sigma(sigma_y));
         Some(Arc::new(Self {
             dx,
             dy,
@@ -556,8 +567,8 @@ impl ImageFilter for DropShadowImageFilter {
         reason = "blur_dx/blur_dy are the conventional x/y-axis pair for this offset+blur computation"
     )]
     fn filter_bounds(&self, src: &Rect) -> Rect {
-        let blur_dx = self.sigma_x * 3.0;
-        let blur_dy = self.sigma_y * 3.0;
+        let blur_dx = max_sigma(self.sigma_x) * 3.0;
+        let blur_dy = max_sigma(self.sigma_y) * 3.0;
 
         if self.shadow_only {
             Rect::new(
@@ -600,8 +611,8 @@ impl ImageFilter for DropShadowImageFilter {
             shadow[i] = pixels[i * 4 + 3];
         }
         // 2. Blur shadow (sigma converted per SkBlurMask::ConvertSigmaToRadius)
-        let rx = sigma_to_int_box_radius(self.sigma_x);
-        let ry = sigma_to_int_box_radius(self.sigma_y);
+        let rx = sigma_to_int_box_radius(max_sigma(self.sigma_x));
+        let ry = sigma_to_int_box_radius(max_sigma(self.sigma_y));
         if rx > 0 {
             box_blur_horizontal(&mut shadow, width, height, rx);
         }
