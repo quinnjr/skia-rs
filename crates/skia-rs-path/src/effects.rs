@@ -391,7 +391,7 @@ impl DashEffect {
 
     fn dash_line(
         &self,
-        builder: &mut PathBuilder,
+        dashes: &mut Vec<Vec<Point>>,
         from: Point,
         to: Point,
         is_on: &mut bool,
@@ -420,7 +420,7 @@ impl DashEffect {
             let remaining_segment = segment_length - pos;
             if *remaining_in_interval >= remaining_segment {
                 if *is_on {
-                    builder.line_to(to.x, to.y);
+                    push_dash_point(dashes, to);
                 }
                 *remaining_in_interval -= remaining_segment;
                 return;
@@ -428,13 +428,13 @@ impl DashEffect {
             pos += *remaining_in_interval;
             let mid = point_at(pos);
             if *is_on {
-                builder.line_to(mid.x, mid.y);
+                push_dash_point(dashes, mid);
             }
             *interval_idx = (*interval_idx + 1) % self.intervals.len();
             *is_on = (*interval_idx).is_multiple_of(2);
             *remaining_in_interval = self.intervals[*interval_idx];
             if *is_on {
-                builder.move_to(mid.x, mid.y);
+                dashes.push(vec![mid]);
             }
         }
     }
@@ -632,6 +632,35 @@ fn clip_dash_line(
     true
 }
 
+/// Extend the current dash with `p` (starting one if there is none).
+fn push_dash_point(dashes: &mut Vec<Vec<Point>>, p: Point) {
+    match dashes.last_mut() {
+        Some(dash) => dash.push(p),
+        None => dashes.push(vec![p]),
+    }
+}
+
+/// Emit a contour's dashes (polylines) into `builder`. With `join_ends`
+/// (a closed contour that is "on" where it starts and where it ends), the
+/// first dash continues the last one, as `SkDashPath`'s `skipFirstSegment`
+/// does, so the stroke joins across the start point.
+fn emit_dashes(builder: &mut PathBuilder, dashes: &mut Vec<Vec<Point>>, join_ends: bool) {
+    if join_ends && dashes.len() >= 2 {
+        let first = dashes.remove(0);
+        if let Some(last) = dashes.last_mut() {
+            last.extend(first.into_iter().skip(1));
+        }
+    }
+    for dash in dashes.drain(..) {
+        if dash.len() >= 2 {
+            builder.move_to(dash[0].x, dash[0].y);
+            for q in &dash[1..] {
+                builder.line_to(q.x, q.y);
+            }
+        }
+    }
+}
+
 /// Curve-flattening tolerance for dashing, in local units at a resolution
 /// scale of 1 (divided by the scale otherwise).
 const DASH_FLATTEN_TOLERANCE: Scalar = 0.5;
@@ -662,36 +691,45 @@ impl DashEffect {
         };
         let path = &flattened;
 
+        // Each contour's dashes are collected as polylines first, so a closed
+        // contour can join its last dash to its first (SkDashPath skips the
+        // first dash of a closed contour and appends it after the closing
+        // edge, continuing the last dash when that is still "on").
         let mut builder = PathBuilder::new();
+        let mut dashes: Vec<Vec<Point>> = Vec::new();
         let mut current_pos = Point::zero();
         let mut contour_start = Point::zero();
-        #[allow(unused_assignments)]
-        let mut _distance_along_contour = 0.0_f32;
 
         // SkDashPath::CalcDashParameters: where in the pattern each contour
         // starts.
         let (_, start_index, start_length) = self.dash_parameters();
+        let starts_on = start_index % 2 == 0;
         let mut interval_idx = start_index;
-        let mut is_on = interval_idx % 2 == 0;
+        let mut is_on = starts_on;
         let mut remaining_in_interval = start_length;
 
         for element in path {
             match element {
                 PathElement::Move(p) => {
+                    emit_dashes(&mut builder, &mut dashes, false);
                     current_pos = p;
                     contour_start = p;
-                    _distance_along_contour = 0.0;
-                    // Reset dash state for new contour
+                    // Reset dash state for the new contour.
                     interval_idx = start_index;
-                    is_on = interval_idx % 2 == 0;
+                    is_on = starts_on;
                     remaining_in_interval = start_length;
                     if is_on {
-                        builder.move_to(p.x, p.y);
+                        dashes.push(vec![p]);
                     }
                 }
-                PathElement::Line(end) => {
+                // (The source is flattened to lines above, so curves only
+                // appear here defensively, as their chords.)
+                PathElement::Line(end)
+                | PathElement::Quad(_, end)
+                | PathElement::Conic(_, end, _)
+                | PathElement::Cubic(_, _, end) => {
                     self.dash_line(
-                        &mut builder,
+                        &mut dashes,
                         current_pos,
                         end,
                         &mut is_on,
@@ -705,7 +743,7 @@ impl DashEffect {
                     // distance across it), not solid/dropped.
                     if current_pos != contour_start {
                         self.dash_line(
-                            &mut builder,
+                            &mut dashes,
                             current_pos,
                             contour_start,
                             &mut is_on,
@@ -713,46 +751,20 @@ impl DashEffect {
                             &mut remaining_in_interval,
                         );
                     }
+                    // Join the last dash to the first across the start when
+                    // the pattern is "on" at both ends.
+                    emit_dashes(&mut builder, &mut dashes, starts_on && is_on);
                     current_pos = contour_start;
-                }
-                // For curves, we approximate with lines (simplified)
-                PathElement::Quad(ctrl, end) => {
-                    // Subdivide and treat as lines
-                    let steps: i32 = 8;
-                    for i in 1..=steps {
-                        let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                        let p = quadratic_point(current_pos, ctrl, end, t);
-                        if is_on {
-                            builder.line_to(p.x, p.y);
-                        }
+                    interval_idx = start_index;
+                    is_on = starts_on;
+                    remaining_in_interval = start_length;
+                    if is_on {
+                        dashes.push(vec![contour_start]);
                     }
-                    current_pos = end;
-                }
-                PathElement::Conic(ctrl, end, _weight) => {
-                    // Approximate as quad
-                    let steps: i32 = 8;
-                    for i in 1..=steps {
-                        let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                        let p = quadratic_point(current_pos, ctrl, end, t);
-                        if is_on {
-                            builder.line_to(p.x, p.y);
-                        }
-                    }
-                    current_pos = end;
-                }
-                PathElement::Cubic(ctrl1, ctrl2, end) => {
-                    let steps: i32 = 12;
-                    for i in 1..=steps {
-                        let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                        let p = cubic_point(current_pos, ctrl1, ctrl2, end, t);
-                        if is_on {
-                            builder.line_to(p.x, p.y);
-                        }
-                    }
-                    current_pos = end;
                 }
             }
         }
+        emit_dashes(&mut builder, &mut dashes, false);
 
         Some(builder.build())
     }
@@ -3110,6 +3122,37 @@ mod tests {
         assert_eq!(params(vec![10.0, 0.0], 10.0), (0.0, 0, 10.0));
         // Negative phases are flipped into the pattern.
         assert_eq!(params(vec![10.0, 5.0], -3.0), (12.0, 1, 3.0));
+    }
+
+    #[test]
+    fn closed_contours_join_the_last_dash_to_the_first() {
+        // A closed 10x10 square (perimeter 40) with [8, 3]: 40 = 3 * 11 + 7,
+        // so the last dash (33..40) runs into the start corner while \"on\"
+        // and must continue the first dash (0..8) instead of ending there.
+        let dash = DashEffect::new(vec![8.0, 3.0], 0.0).unwrap();
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0)
+            .line_to(10.0, 0.0)
+            .line_to(10.0, 10.0)
+            .line_to(0.0, 10.0)
+            .close();
+        let out = dash.apply(&b.build()).expect("applies");
+        let moves = out
+            .iter()
+            .filter(|e| matches!(e, PathElement::Move(_)))
+            .count();
+        // Dashes: 0..8, 11..19, 22..30, 33..40+0..8 joined: 3 subpaths.
+        assert_eq!(moves, 3);
+        // The joined dash passes through the start corner as an interior
+        // vertex (no subpath starts at the origin).
+        let starts: Vec<Point> = out
+            .iter()
+            .filter_map(|e| match e {
+                PathElement::Move(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert!(starts.iter().all(|p| p.x.hypot(p.y) > 1e-3), "{starts:?}");
     }
 
     #[test]
