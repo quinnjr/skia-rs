@@ -381,6 +381,10 @@ impl PathEffect for DashEffect {
         // the cull (keeping the dash phase), so only the visible part counts
         // against kMaxDashCount.
         let culled = cull.and_then(|c| cull_dash_source(path, c, *rec, self.interval_sum));
+        if culled.as_ref().is_some_and(Path::is_empty) {
+            // Entirely outside the cull: nothing visible to dash.
+            return Some(Path::new());
+        }
         let path = culled.as_ref().unwrap_or(path);
         let scale = if res_scale.is_finite() && res_scale > 0.0 {
             res_scale
@@ -402,7 +406,13 @@ impl PathEffect for DashEffect {
 /// `SkDashPath`'s `cull_path`: a line, or the edges of a rect, trimmed to
 /// `cull` outset for the stroke. Trimmed ends move by whole interval lengths
 /// so the dash pattern is unchanged (`clip_line`). `None` when the source is
-/// neither, or nothing of it is near the cull.
+/// neither (or a diagonal line); an empty path when it lies entirely outside
+/// the cull. (Skia dashes such an off-screen source in full; skipping it
+/// draws the same pixels without the work.)
+#[allow(
+    clippy::float_cmp,
+    reason = "exact axis-alignment test, as in clip_line"
+)]
 fn cull_dash_source(
     path: &Path,
     cull: &skia_rs_core::Rect,
@@ -421,8 +431,19 @@ fn cull_dash_source(
     if path.is_line() {
         let pts = path.points();
         let (mut a, mut b) = (pts[0], pts[1]);
+        // Beyond Skia's clip_line (which trims only along the line's own
+        // axis): a horizontal or vertical line outside the cull across its
+        // axis is off-screen too.
+        let off_across = (a.y == b.y && (a.y < bounds.top || a.y > bounds.bottom))
+            || (a.x == b.x && (a.x < bounds.left || a.x > bounds.right));
+        if off_across {
+            return Some(Path::new());
+        }
         if !clip_dash_line(&mut a, &mut b, &bounds, interval_len, 0.0) {
-            return None;
+            // A horizontal/vertical line that missed the cull is off-screen;
+            // a diagonal one cannot be trimmed here.
+            let axis_aligned = a.x == b.x || a.y == b.y;
+            return axis_aligned.then(Path::new);
         }
         builder.move_to(a.x, a.y).line_to(b.x, b.y);
         return Some(builder.build());
@@ -466,8 +487,8 @@ fn cull_dash_source(
         }
         accum += f64::from((b.x - a.x + b.y - a.y).abs());
     }
-    let out = builder.build();
-    (!out.is_empty()).then_some(out)
+    // An empty result means every edge missed the cull: off-screen.
+    Some(builder.build())
 }
 
 /// `SkDashPath`'s `clip_line` for a horizontal or vertical line: trim it to
@@ -2953,6 +2974,21 @@ mod tests {
             .map(|p| p.x.hypot(p.y))
             .fold(0.0, Scalar::max);
         assert!((max_r - 40.0).abs() < 0.05, "max radius {max_r}");
+    }
+
+    #[test]
+    fn off_screen_dashed_lines_are_skipped() {
+        // A long dashed line entirely outside the cull draws nothing and is
+        // not dashed along its whole (off-screen) length.
+        let dash = DashEffect::new(vec![2.0, 2.0], 0.0).unwrap();
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, -5000.0).line_to(1e6, -5000.0);
+        let cull = skia_rs_core::Rect::new(0.0, 0.0, 100.0, 100.0);
+        let mut rec = StrokeRec::Stroke(1.0);
+        let out = dash
+            .filter_path_culled(&b.build(), &mut rec, Some(&cull), 1.0)
+            .expect("succeeds");
+        assert!(out.is_empty(), "{} points", out.points().len());
     }
 
     #[test]
