@@ -1179,6 +1179,21 @@ impl Default for Matrix {
 /// near-zero scalar comparisons in matrix classification.
 const SCALAR_NEARLY_ZERO: Scalar = 1.0 / 4096.0;
 
+/// `SkScalarSinSnapToZero` / `SkScalarCosSnapToZero`: sin and cos with
+/// values within `SCALAR_NEARLY_ZERO` of zero snapped to it, as
+/// `SkMatrix::setRotate` uses, so multiples of 90 degrees give exact zeros.
+fn snapped_sin_cos(radians: Scalar) -> (Scalar, Scalar) {
+    let (sin, cos) = radians.sin_cos();
+    let snap = |v: Scalar| {
+        if v.abs() <= SCALAR_NEARLY_ZERO {
+            0.0
+        } else {
+            v
+        }
+    };
+    (snap(sin), snap(cos))
+}
+
 impl Matrix {
     /// The identity matrix constant.
     pub const IDENTITY: Self = Self {
@@ -1233,7 +1248,7 @@ impl Matrix {
     #[inline]
     #[must_use]
     pub fn rotate(radians: Scalar) -> Self {
-        let (sin, cos) = radians.sin_cos();
+        let (sin, cos) = snapped_sin_cos(radians);
         Self {
             values: [cos, -sin, 0.0, sin, cos, 0.0, 0.0, 0.0, 1.0],
         }
@@ -1243,7 +1258,7 @@ impl Matrix {
     #[inline]
     #[must_use]
     pub fn rotate_around(radians: Scalar, pivot: Point) -> Self {
-        let (sin, cos) = radians.sin_cos();
+        let (sin, cos) = snapped_sin_cos(radians);
         Self {
             values: [
                 cos,
@@ -1293,6 +1308,41 @@ impl Matrix {
             && self.values[Self::PERSP_0] == 0.0
             && self.values[Self::PERSP_1] == 0.0
             && self.values[Self::PERSP_2] == 1.0
+    }
+
+    /// Returns true if the matrix maps every rectangle to a rectangle: no
+    /// perspective, and either (scale, no skew) or (skew, no scale, i.e. a
+    /// 90- or 270-degree rotation), with no zero scale on either axis.
+    ///
+    /// Corresponds to Skia's `SkMatrix::rectStaysRect`.
+    ///
+    /// # Examples
+    /// ```
+    /// use skia_rs_core::Matrix;
+    /// assert!(Matrix::scale(2.0, 3.0).rect_stays_rect());
+    /// assert!(Matrix::rotate(90.0_f32.to_radians()).rect_stays_rect());
+    /// assert!(!Matrix::rotate(45.0_f32.to_radians()).rect_stays_rect());
+    /// ```
+    #[must_use]
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact comparison is intentional and matches Skia's exact SkScalar comparison"
+    )]
+    pub fn rect_stays_rect(&self) -> bool {
+        if self.has_perspective() {
+            return false;
+        }
+        let v = &self.values;
+        let (sx, kx, ky, sy) = (
+            v[Self::SCALE_X],
+            v[Self::SKEW_X],
+            v[Self::SKEW_Y],
+            v[Self::SCALE_Y],
+        );
+        // Exact zero tests, as in Skia (rotate() snaps the sin/cos residue
+        // of multiples of 90 degrees to zero, like SkMatrix::setRotate).
+        (kx == 0.0 && ky == 0.0 && sx != 0.0 && sy != 0.0)
+            || (sx == 0.0 && sy == 0.0 && kx != 0.0 && ky != 0.0)
     }
 
     /// Returns true if the matrix only contains scale and translation.

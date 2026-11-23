@@ -1442,7 +1442,7 @@ fn full_sweep_stroked_wedges_keep_their_center_line() {
 }
 
 #[test]
-fn inverted_arc_ovals_are_sorted() {
+fn inverted_arc_ovals_draw_nothing() {
     let mut paint = white(Style::Stroke);
     paint.set_stroke_width(2.0);
     let mut buffer = PixelBuffer::new(SIZE, SIZE);
@@ -1453,8 +1453,10 @@ fn inverted_arc_ovals_are_sorted() {
         false,
         &paint,
     );
+    // SkCanvas::drawArc returns on oval.isEmpty(), which an inverted oval
+    // is (it sorts only in drawOval).
     let drawn = (0..SIZE).any(|y| (0..SIZE).any(|x| lit(&buffer, x, y)));
-    assert!(drawn, "the quarter arc is drawn");
+    assert!(!drawn, "an inverted oval draws no arc");
 }
 
 #[test]
@@ -1549,4 +1551,57 @@ fn layers_apply_an_outer_aa_clip_once() {
         .max()
         .unwrap_or(0);
     assert!(worst <= 2, "layered edges differ by up to {worst}");
+}
+
+#[test]
+fn hairline_rects_under_a_quarter_turn_are_closed_frames() {
+    // SkDraw uses SkScan::HairRect whenever the CTM keeps rects rects,
+    // including 90-degree rotations: the frame includes its far corner
+    // pixel, which per-segment half-open hairlines leave out.
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    paint.set_anti_alias(false);
+    let draw = |rotated: bool| {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            if rotated {
+                canvas.translate(200.0, 0.0);
+                canvas.rotate(90.0);
+                canvas.draw_rect(&Rect::new(20.0, 20.0, 60.0, 80.0), &paint);
+            } else {
+                canvas.draw_rect(&Rect::new(120.0, 20.0, 180.0, 60.0), &paint);
+            }
+        }
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .filter(|&(x, y)| lit(&buffer, x, y))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        draw(true),
+        draw(false),
+        "the rotated frame equals the plain one"
+    );
+}
+
+#[test]
+fn fractional_layer_bounds_round_out() {
+    // SkCanvas rounds layer bounds out: a fill reaching into a partial
+    // edge pixel of the bounds hint keeps that pixel.
+    use skia_rs_canvas::SaveLayerRec;
+
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        let bounds = Rect::new(10.6, 10.6, 50.4, 50.4);
+        canvas.save_layer(&SaveLayerRec {
+            bounds: Some(&bounds),
+            ..SaveLayerRec::default()
+        });
+        canvas.draw_rect(&Rect::new(0.0, 0.0, 100.0, 100.0), &white(Style::Fill));
+        canvas.restore();
+    }
+    assert!(lit(&buffer, 10, 30), "the partial left column is kept");
+    assert!(lit(&buffer, 50, 30), "the partial right column is kept");
 }

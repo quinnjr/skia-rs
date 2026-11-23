@@ -329,7 +329,7 @@ impl<'a> Canvas<'a> {
             });
             let device_rect = hinted
                 .and_then(|r| r.intersect(&device_full))
-                .map_or_else(|| IRect::new(0, 0, 0, 0), |r| r.round());
+                .map_or_else(|| IRect::new(0, 0, 0, 0), |r| r.round_out());
 
             let (w, h) = (device_rect.width().max(0), device_rect.height().max(0));
             let buffer = PixelBuffer::new(w, h);
@@ -1087,12 +1087,17 @@ impl<'a> Canvas<'a> {
         use_center: bool,
         paint: &Paint,
     ) {
-        // SkCanvas::drawArc quick-rejects non-finite ovals and sorts the rest;
-        // a non-finite angle has no arc to draw.
-        if !oval.is_finite() || !start_angle.is_finite() || !sweep_angle.is_finite() {
+        // SkCanvas::drawArc returns on oval.isEmpty() (true for an inverted
+        // oval: unlike drawOval it does not sort) or a zero sweep;
+        // non-finite values have no arc to draw.
+        if !oval.is_finite()
+            || !start_angle.is_finite()
+            || !sweep_angle.is_finite()
+            || oval.left >= oval.right
+            || oval.top >= oval.bottom
+        {
             return;
         }
-        let oval = &sorted_rect(oval);
         match &mut self.backing {
             Backing::Raster(_) => {
                 // Build the arc path here so recording stays authoritative

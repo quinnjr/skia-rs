@@ -1056,14 +1056,15 @@ impl<'a> Rasterizer<'a> {
             return;
         }
 
-        // SkDraw::drawRect: an aliased hairline rect under a scale/translate
-        // CTM is blitted by SkScan::HairRect as a closed pixel frame. Other
+        // SkDraw::drawRect: an aliased hairline rect under a rect-preserving
+        // CTM (rectStaysRect: scale/translate or a 90-degree rotation) is
+        // blitted by SkScan::HairRect as a closed pixel frame. Other
         // hairline rects are four hairline segments, as in Skia:
         // SkScan::AntiHairRect is a 5-point AntiHairLine polyline (drawn
         // segment by segment, so AA corners blend twice there too), and a
         // non-rect-preserving CTM goes through hair_path's per-segment
         // HairLine.
-        if !paint.is_anti_alias() && self.matrix.is_scale_translate() {
+        if !paint.is_anti_alias() && self.matrix.rect_stays_rect() {
             self.hair_rect(rect, paint);
             return;
         }
