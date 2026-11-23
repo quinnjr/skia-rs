@@ -164,7 +164,9 @@ fn export_node(output: &mut String, node: &SvgNode, options: &SvgExportOptions, 
             )
             .unwrap();
 
-            if rect.rx > 0.0 {
+            // Write both radii when either is set: a missing one reads back as
+            // "auto" (copying the other), which would round square corners.
+            if rect.rx > 0.0 || rect.ry > 0.0 {
                 write!(
                     output,
                     " rx=\"{}\"",
@@ -172,7 +174,7 @@ fn export_node(output: &mut String, node: &SvgNode, options: &SvgExportOptions, 
                 )
                 .unwrap();
             }
-            if rect.ry > 0.0 {
+            if rect.rx > 0.0 || rect.ry > 0.0 {
                 write!(
                     output,
                     " ry=\"{}\"",
@@ -1067,6 +1069,29 @@ mod tests {
                     .contains(" transform="),
             "linearGradient element must not use `transform=`, got:\n{svg}"
         );
+    }
+
+    #[test]
+    fn test_export_keeps_an_explicit_zero_radius() {
+        // rx="10" ry="0" draws square corners; exporting only rx would read
+        // back with ry "auto" = 10, rounding them.
+        use crate::parser::parse_svg;
+
+        let svg_in = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+          <rect width="80" height="80" rx="10" ry="0"/>
+        </svg>"#;
+        let exported = export_svg(&parse_svg(svg_in).unwrap());
+        let reparsed = parse_svg(&exported).unwrap();
+        let rect = reparsed
+            .root
+            .children
+            .iter()
+            .find_map(|n| match &n.kind {
+                crate::dom::SvgNodeKind::Rect(r) => Some(*r),
+                _ => None,
+            })
+            .expect("a rect");
+        assert_eq!((rect.rx, rect.ry), (10.0, 0.0), "{exported}");
     }
 
     #[test]

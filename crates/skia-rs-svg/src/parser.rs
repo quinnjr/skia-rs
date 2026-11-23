@@ -193,14 +193,10 @@ fn build_node(
         "rect" => {
             // SVG: a missing (or negative) rx/ry is "auto", taking the
             // other radius (SkSVGRect::resolve).
-            let rx = attrs
-                .contains_key("rx")
-                .then(|| hlen("rx", "0"))
-                .filter(|r| *r >= 0.0);
-            let ry = attrs
-                .contains_key("ry")
-                .then(|| vlen("ry", "0"))
-                .filter(|r| *r >= 0.0);
+            // `auto` or any value that is not a length counts as missing.
+            let given = |k: &str| attrs.get(k).is_some_and(|v| is_length(v));
+            let rx = given("rx").then(|| hlen("rx", "0")).filter(|r| *r >= 0.0);
+            let ry = given("ry").then(|| vlen("ry", "0")).filter(|r| *r >= 0.0);
             let (rx, ry) = match (rx, ry) {
                 (Some(rx), Some(ry)) => (rx, ry),
                 (Some(r), None) | (None, Some(r)) => (r, r),
@@ -518,6 +514,27 @@ fn parse_gradient_units(s: Option<&str>) -> GradientUnits {
 /// 96dpi.
 #[must_use]
 pub fn parse_length(s: &str) -> Scalar {
+    parse_length_inner(s)
+}
+
+/// Whether `s` is a length [`parse_length`] understands (a number with an
+/// optional unit or `%`), as opposed to a keyword such as `auto` or junk
+/// that would read as 0.
+fn is_length(s: &str) -> bool {
+    const UNITS: &[&str] = &[
+        "vmin", "vmax", "rem", "px", "pt", "pc", "em", "ex", "ch", "vw", "vh", "cm", "mm", "in",
+        "%",
+    ];
+    let s = s.trim();
+    let number = UNITS
+        .iter()
+        .find_map(|unit| s.strip_suffix(unit))
+        .unwrap_or(s)
+        .trim();
+    number.parse::<Scalar>().is_ok_and(Scalar::is_finite)
+}
+
+fn parse_length_inner(s: &str) -> Scalar {
     // Strip optional trailing unit; anything else is treated as a plain
     // number in user units. Ordered longest-first so that `1rem` matches
     // `rem` before falling through to `em`.

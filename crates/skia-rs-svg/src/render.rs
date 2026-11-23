@@ -442,11 +442,10 @@ fn render_node(
     };
 
     match &node.kind {
-        SvgNodeKind::Rect(rect) => {
+        // SVG does not render a rect with a non-positive width or height.
+        SvgNodeKind::Rect(rect) if rect.width > 0.0 && rect.height > 0.0 => {
             let r = Rect::from_xywh(rect.x, rect.y, rect.width, rect.height);
-            // SVG clamps each radius to half the matching side.
-            let rx = rect.rx.min(rect.width / 2.0);
-            let ry = rect.ry.min(rect.height / 2.0);
+            let (rx, ry) = rect_radii(rect);
             if rx > 0.0 || ry > 0.0 {
                 if let Some(paint) = &fill_paint {
                     canvas.draw_round_rect(&r, rx, ry, paint);
@@ -571,7 +570,9 @@ fn render_node(
                 render_node(child, canvas, ctx, &state, depth);
             }
         }
-        SvgNodeKind::Defs
+        // (A rect reaching here has a non-positive size: nothing to draw.)
+        SvgNodeKind::Rect(_)
+        | SvgNodeKind::Defs
         | SvgNodeKind::ClipPath(_)
         | SvgNodeKind::LinearGradient(_)
         | SvgNodeKind::RadialGradient(_) => {
@@ -645,11 +646,19 @@ fn build_clip_path(clip_node: &SvgNode) -> Path {
 fn add_node_geometry(node: &SvgNode, builder: &mut PathBuilder, parent: &Matrix) {
     let m = parent.concat(&node.transform);
     let shape: Option<Path> = match &node.kind {
-        SvgNodeKind::Rect(rect) => {
+        // A rect with a non-positive size adds nothing; otherwise the same
+        // rounded corners as when it is drawn.
+        SvgNodeKind::Rect(rect) => (rect.width > 0.0 && rect.height > 0.0).then(|| {
+            let r = Rect::from_xywh(rect.x, rect.y, rect.width, rect.height);
+            let (rx, ry) = rect_radii(rect);
             let mut b = PathBuilder::new();
-            b.add_rect(&Rect::from_xywh(rect.x, rect.y, rect.width, rect.height));
-            Some(b.build())
-        }
+            if rx > 0.0 && ry > 0.0 {
+                b.add_round_rect(&r, rx, ry);
+            } else {
+                b.add_rect(&r);
+            }
+            b.build()
+        }),
         SvgNodeKind::Circle(c) => {
             let mut b = PathBuilder::new();
             b.add_oval(&Rect::from_xywh(
@@ -1005,6 +1014,15 @@ pub fn render_svg_string(svg: &str, width: i32, height: i32) -> Option<Surface> 
     Some(surface)
 }
 
+/// A rect's corner radii as drawn: each clamped to half the matching side,
+/// as SVG specifies.
+fn rect_radii(rect: &crate::dom::SvgRect) -> (Scalar, Scalar) {
+    (
+        rect.rx.min(rect.width / 2.0),
+        rect.ry.min(rect.height / 2.0),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1040,6 +1058,38 @@ mod tests {
         let green = |x: i32, y: i32| pixel_at(&surface, x, y).map_or(0, |c| c.green());
         assert!(green(11, 11) > 200, "rounded corner left unfilled");
         assert!(green(50, 50) < 50, "interior filled");
+    }
+
+    #[test]
+    fn rect_radius_auto_keyword_counts_as_missing() {
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="80" height="80" rx="auto" ry="20" fill="red"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = pixel_at(&surface, 11, 11).map_or(0, |c| c.green());
+        assert!(green > 200, "rx=auto takes ry: the corner is rounded");
+    }
+
+    #[test]
+    fn rects_with_negative_size_are_not_drawn() {
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <rect x="50" y="10" width="-40" height="40" rx="5" fill="red"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = pixel_at(&surface, 30, 30).map_or(0, |c| c.green());
+        assert!(green > 200, "nothing drawn");
+    }
+
+    #[test]
+    fn rounded_clip_rects_clip_with_their_corners() {
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <clipPath id="c"><rect width="100" height="100" rx="50"/></clipPath>
+            <rect width="100" height="100" fill="red" clip-path="url(#c)"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = |x: i32, y: i32| pixel_at(&surface, x, y).map_or(0, |c| c.green());
+        assert!(green(3, 3) > 200, "the corner is clipped away");
+        assert!(green(50, 50) < 50, "the middle is drawn");
     }
 
     #[test]
