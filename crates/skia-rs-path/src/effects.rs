@@ -478,7 +478,12 @@ impl PathEffect for DashEffect {
         // SkDashPath's cull_path: a line or rect source is first trimmed to
         // the cull (keeping the dash phase), so only the visible part counts
         // against kMaxDashCount.
-        let culled = cull.and_then(|c| cull_dash_source(path, c, *rec, self.interval_sum));
+        // Without a cull, cull_path still lengthens a zero-length line
+        // (adjust_zero_length_line) so it dashes to a capped dot.
+        let culled = cull.map_or_else(
+            || lengthen_zero_length_line(path),
+            |c| cull_dash_source(path, c, *rec, self.interval_sum),
+        );
         // A culled closed rect is dashed as open edges; if the pattern is
         // "on" both where it starts and where it ends, SkDashPath adds a
         // tiny right angle at the start corner so the stroke joins there.
@@ -580,6 +585,34 @@ fn cull_dash_source(
     (!out.is_empty()).then_some(out)
 }
 
+/// `SkDashPath`'s `adjust_zero_length_line`: moves the end of a zero-length
+/// line by a tiny, magnitude-scaled amount (`SK_ScalarNearlyZero`), so path
+/// measuring sees a non-empty line and the dash yields a capped dot.
+fn adjust_zero_length_line(p0: Point, p1: &mut Point) {
+    debug_assert_eq!(p0, *p1);
+    // Unfused, as in Skia.
+    let nudge = 1.001_f32.max(p1.x) * (1.0 / 4096.0);
+    p1.x += nudge;
+}
+
+/// The uncull branch of `SkDashPath`'s `cull_path`: a zero-length line
+/// source, lengthened by [`adjust_zero_length_line`]; `None` otherwise.
+#[allow(clippy::float_cmp, reason = "exact zero-length test, as in Skia")]
+fn lengthen_zero_length_line(path: &Path) -> Option<Path> {
+    if !path.is_line() {
+        return None;
+    }
+    let pts = path.points();
+    let (p0, mut p1) = (pts[0], pts[1]);
+    if p0 != p1 {
+        return None;
+    }
+    adjust_zero_length_line(p0, &mut p1);
+    let mut builder = PathBuilder::new();
+    builder.move_to(p0.x, p0.y).line_to(p1.x, p1.y);
+    Some(builder.build())
+}
+
 /// `SkDashPath`'s `clip_line` for a horizontal or vertical line: trim it to
 /// `bounds` along its axis, moving each trimmed end by a whole number of
 /// `interval_len` (and `prior_phase` for rect edges) so the dash pattern is
@@ -630,6 +663,9 @@ fn clip_dash_line(
         (p0.y, p1.y) = (min, max);
     } else {
         (p0.x, p1.x) = (min, max);
+    }
+    if min == max {
+        adjust_zero_length_line(*p0, p1);
     }
     true
 }
@@ -3228,6 +3264,27 @@ mod tests {
             .filter_path_culled(&b.build(), &mut rec, Some(&cull), 1.0)
             .expect("applies");
         assert!(!out.is_empty(), "the dashes survive for the outer effect");
+    }
+
+    #[test]
+    fn zero_length_dash_lines_are_lengthened_like_skia() {
+        // A line trimmed to zero length by the cull, and a zero-length
+        // source with no cull, are nudged (adjust_zero_length_line) so they
+        // still dash to a capped dot.
+        let (mut p0, mut p1) = (Point::new(-10.0, 5.0), Point::new(0.0, 5.0));
+        let bounds = skia_rs_core::Rect::new(0.0, 0.0, 100.0, 100.0);
+        assert!(clip_dash_line(&mut p0, &mut p1, &bounds, 10.0, 0.0));
+        assert_eq!(p0.x, 0.0);
+        assert!(p1.x > p0.x, "nudged: {p1:?}");
+
+        let dash = DashEffect::new(vec![10.0, 10.0], 0.0).unwrap();
+        let mut b = PathBuilder::new();
+        b.move_to(5.0, 5.0).line_to(5.0, 5.0);
+        let mut rec = StrokeRec::Stroke(4.0);
+        let out = dash
+            .filter_path_culled(&b.build(), &mut rec, None, 1.0)
+            .expect("dashes");
+        assert!(!out.is_empty(), "a zero-length line dashes to a dot");
     }
 
     #[test]
