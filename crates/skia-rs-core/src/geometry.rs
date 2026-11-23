@@ -1032,9 +1032,16 @@ struct RRectData {
     radii: [Point; 4],
 }
 
+/// A serialized [`RRect`] whose rect is unsorted or non-finite, or whose
+/// radius is out of range.
+#[cfg(feature = "serde")]
+#[derive(Debug, thiserror::Error)]
+#[error("invalid RRect: unsorted or non-finite rect, or a radius out of range")]
+struct InvalidRRect;
+
 #[cfg(feature = "serde")]
 impl TryFrom<RRectData> for RRect {
-    type Error = &'static str;
+    type Error = InvalidRRect;
 
     fn try_from(data: RRectData) -> Result<Self, Self::Error> {
         // SkRRect's are_radius_check_predicates_valid, per axis.
@@ -1054,7 +1061,7 @@ impl TryFrom<RRectData> for RRect {
             // SkRRect::readFromMemory then normalizes through setRectRadii.
             Ok(Self::from_rect_radii(data.rect, data.radii))
         } else {
-            Err("invalid RRect: unsorted or non-finite rect, or a radius out of range")
+            Err(InvalidRRect)
         }
     }
 }
