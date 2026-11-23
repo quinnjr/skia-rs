@@ -1172,7 +1172,8 @@ impl ImageFilter for DisplacementMapImageFilter {
         Some(Arc::new(Self {
             x_channel: self.x_channel,
             y_channel: self.y_channel,
-            scale: f32::midpoint(sx, sy),
+            // Lengths lose the sign; the scale's sign sets the direction.
+            scale: f32::midpoint(sx, sy).copysign(self.scale),
             displacement: map_image_filter(&self.displacement, matrix),
             color: map_input(self.color.as_ref(), matrix),
         }))
@@ -2664,6 +2665,21 @@ pub(crate) fn deserialize_image_filter(bytes: &[u8], offset: &mut usize) -> Opti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn displacement_mapping_keeps_the_scale_sign() {
+        let map: ImageFilterRef = Arc::new(OffsetImageFilter::new(0.0, 0.0, None));
+        let filter: ImageFilterRef = Arc::new(DisplacementMapImageFilter::new(
+            ColorChannel::R,
+            ColorChannel::G,
+            -20.0,
+            map,
+            None,
+        ));
+        let mapped = map_image_filter(&filter, &Matrix::scale(2.0, 2.0));
+        let debug = format!("{mapped:?}");
+        assert!(debug.contains("scale: -40.0"), "{debug}");
+    }
+
     #[test]
     fn lighting_and_convolution_map_their_inputs_and_lights() {
         // A point light at (10, 20, 5) under scale(4) moves to (40, 80, 20),
