@@ -2402,3 +2402,33 @@ fn vertices_skip_non_finite_triangles_clip_to_the_camera_and_record() {
     Canvas::new_raster(&mut buffer).draw_picture(&picture, None, None);
     assert!(lit(&buffer, 20, 20), "the recorded triangle is played back");
 }
+
+#[test]
+fn triangles_sharing_an_edge_blend_its_pixels_once() {
+    use skia_rs_canvas::VertexMode;
+    use skia_rs_core::Point;
+
+    // A quad split along its diagonal, drawn at 50% alpha: pixel centers on
+    // the diagonal belong to one triangle only, so the quad is uniform.
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    let mut paint = Paint::new();
+    paint.set_color32(Color::from_argb(128, 255, 255, 255));
+    Canvas::new_raster(&mut buffer).draw_vertices(
+        VertexMode::Triangles,
+        &[
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 0.0),
+            Point::new(10.0, 10.0),
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 10.0),
+            Point::new(0.0, 10.0),
+        ],
+        None,
+        &paint,
+    );
+    let alpha = |x: i32, y: i32| buffer.get_pixel(x, y).map_or(0, |c| c.alpha());
+    for i in 0..10 {
+        assert_eq!(alpha(i, i), alpha(5, 2), "diagonal pixel ({i}, {i})");
+    }
+    assert_eq!(alpha(2, 5), alpha(5, 2), "both halves alike");
+}

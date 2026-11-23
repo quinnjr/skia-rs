@@ -2958,6 +2958,10 @@ impl Canvas<'_> {
         clippy::too_many_arguments,
         reason = "one vertex-color pair per triangle corner (p0/c0, p1/c1, p2/c2) plus paint mirrors the SkDraw triangle-rasterizer parameter shape; bundling would obscure the correspondence"
     )]
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "unfused edge functions: a pixel center exactly on a shared edge must give exactly 0 for both triangles"
+    )]
     fn draw_triangle(
         &mut self,
         p0: Point,
@@ -3004,7 +3008,12 @@ impl Canvas<'_> {
         let min_y = floor_to_i32(p0.y.min(p1.y).min(p2.y));
         let max_y = ceil_to_i32(p0.y.max(p1.y).max(p2.y));
 
-        let denom = (p1.y - p2.y).mul_add(p0.x - p2.x, (p2.x - p1.x) * (p0.y - p2.y));
+        // Edge function of (a, b) at (x, y): twice the signed area of
+        // (a, b, (x, y)). Each weight is an edge function over the area.
+        let edge = |a: Point, b: Point, x: Scalar, y: Scalar| {
+            (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x)
+        };
+        let denom = edge(p1, p2, p0.x, p0.y);
         // Degenerate, or non-finite (NaN weights would pass every inside
         // test and fill the whole box; Skia draws nothing).
         let finite = [p0, p1, p2]
@@ -3020,16 +3029,38 @@ impl Canvas<'_> {
         let (min_x, max_x) = (min_x.max(clip.left), max_x.min(clip.right));
         let (min_y, max_y) = (min_y.max(clip.top), max_y.min(clip.bottom));
 
+        // A pixel center exactly on an edge belongs to just one of the two
+        // triangles sharing it (a fill rule, like the scan converter's), so
+        // translucent meshes get no double-blended seams: the triangle whose
+        // opposite vertex lies left of the edge, taken in a fixed direction.
+        let owns_edge = |a: Point, b: Point, opposite: Point| {
+            let (a, b) = if (a.y, a.x) < (b.y, b.x) {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            edge(a, b, opposite.x, opposite.y) > 0.0
+        };
+        let owns = [
+            owns_edge(p1, p2, p0),
+            owns_edge(p2, p0, p1),
+            owns_edge(p0, p1, p2),
+        ];
+
         for y in min_y..max_y {
             for x in min_x..max_x {
                 let px = scalar_from_i32(x) + 0.5;
                 let py = scalar_from_i32(y) + 0.5;
 
                 // Barycentric coordinates at the pixel center.
-                let w0 = (p1.y - p2.y).mul_add(px - p2.x, (p2.x - p1.x) * (py - p2.y)) / denom;
-                let w1 = (p2.y - p0.y).mul_add(px - p2.x, (p0.x - p2.x) * (py - p2.y)) / denom;
-                let w2 = 1.0 - w0 - w1;
-                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                let w0 = edge(p1, p2, px, py) / denom;
+                let w1 = edge(p2, p0, px, py) / denom;
+                let w2 = edge(p0, p1, px, py) / denom;
+                let inside = [w0, w1, w2]
+                    .iter()
+                    .zip(owns)
+                    .all(|(&w, owned)| w > 0.0 || (w == 0.0 && owned));
+                if !inside {
                     continue;
                 }
 
@@ -4693,8 +4724,11 @@ mod tests {
         );
         drop(canvas);
 
-        // Center should be bright (white vertex)
-        let center = buffer.get_pixel(50, 50).unwrap();
+        // Near the center, bright (white vertex). Pixel (50, 50)'s center
+        // lies exactly on the fan's outer diagonal edge, which the fill rule
+        // leaves to the (absent) triangle on the other side; sample just
+        // inside instead.
+        let center = buffer.get_pixel(52, 48).unwrap();
         assert!(
             center.red() > 200 && center.green() > 200 && center.blue() > 200,
             "Center should be bright white"
