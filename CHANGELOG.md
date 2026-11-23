@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MSRV-aware `resolver = "3"`.
 - **Breaking**: the C API's `sk_canvas_save_layer` returns `int32_t`
   (was `uint32_t`), the same type and value as `sk_canvas_save`.
+- The C API's `sk_canvas_save_layer` now makes a real offscreen layer
+  (it was a plain save): later draws go into it, and `sk_canvas_restore`
+  (or `sk_canvas_release`, which like `~SkCanvas` unwinds open saves)
+  composites it through the outer clip with the paint's alpha, blend mode,
+  color filter and image filter. C API clips now keep the matrix they were
+  set under, as in Skia; a later transform no longer moves them.
+- Layers implement `SaveLayerFlags::INIT_WITH_PREVIOUS` and apply the
+  layer paint's image filter on restore (the layer is sized to include the
+  filter's reach past the clip). New `Canvas::layer_bounds` and
+  `Canvas::composite_layer_pixels`.
+- **Breaking**: `DrawCommand::SaveLayer` has a `flags` field, so recorded
+  layers keep `INIT_WITH_PREVIOUS` on playback.
 - **Breaking**: `DashEffect::new` (and the C API's dash constructor)
   returns `None` for an odd number of intervals, like
   `SkDashPathEffect::Make`, instead of repeating the pattern. The SVG

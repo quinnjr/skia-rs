@@ -832,23 +832,22 @@ int32_t sk_canvas_get_height(const struct sk_canvas_t *canvas);
 // nested one, ...). Returns 0 if `canvas` is null.
 int32_t sk_canvas_save(struct sk_canvas_t *canvas);
 
-// Save a layer (currently the same as [`sk_canvas_save`]).
+// Save a layer, like `SkCanvas::saveLayer`.
 //
-// `bounds` and `paint` are accepted (null is fine) but ignored, so no
-// offscreen layer is made and the paint's alpha, blend mode and filters
-// are not applied on restore.
+// Later draws go into an offscreen layer until the matching
+// [`sk_canvas_restore`] (or [`sk_canvas_release`]), which composites it
+// through the clip in effect here using `paint`'s alpha, blend mode, color
+// filter and image filter. `bounds` (local coordinates) is a hint limiting
+// the layer. Both may be null. Inside the layer only clips set after this
+// call apply, as in Skia.
 //
 // Returns the same value as `SkCanvas::saveLayer()` (and
 // [`sk_canvas_save`]): the save count *before* this call in Skia's
 // 1-based counting (1 for the first save, 2 for a nested one, ...).
 // Returns 0 if `canvas` is null.
-//
-// The FFI canvas rebuilds its [`Canvas`](skia_rs_canvas::Canvas) for each
-// call, so a layer cannot yet live across calls; the parameters are part of
-// the ABI so it will not change when layer support lands.
 int32_t sk_canvas_save_layer(struct sk_canvas_t *canvas,
-                             const struct sk_rect_t *_bounds,
-                             const sk_paint_t *_paint);
+                             const struct sk_rect_t *bounds,
+                             const sk_paint_t *paint);
 
 // Restore the most recently saved matrix and clip.
 void sk_canvas_restore(struct sk_canvas_t *canvas);
