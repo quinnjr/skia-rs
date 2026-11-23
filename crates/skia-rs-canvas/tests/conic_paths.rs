@@ -2107,27 +2107,47 @@ fn layer_hints_under_perspective_are_clipped_to_the_w_plane() {
 
 #[test]
 fn pictures_collapsed_by_their_matrix_draw_nothing() {
-    // SkCanvas::onDrawPicture quick-rejects the mapped cull: under
-    // scale(0, 1) the picture draws nothing, with or without a paint.
+    // SkCanvas::drawPicture: a one-op picture is played directly; a larger
+    // one is quick-rejected when its cull, mapped through the matrix and the
+    // CTM, misses the clip (scale(0, 1) collapses it).
     use skia_rs_canvas::Picture;
     use skia_rs_core::Matrix;
 
-    // draw_paint fills the clip whatever the matrix, so it shows whether
-    // the picture was rejected.
-    let mut cmds = Vec::new();
-    Canvas::new_recording(&mut cmds, SIZE, SIZE).draw_paint(&white(Style::Fill));
-    let picture = Picture::from_parts(cmds, Rect::from_xywh(0.0, 0.0, 50.0, 50.0));
-
-    for paint in [None, Some(Paint::new())] {
-        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    let picture = |ops: usize| {
+        let mut cmds = Vec::new();
         {
-            let mut canvas = Canvas::new_raster(&mut buffer);
-            canvas.draw_picture(&picture, Some(&Matrix::scale(0.0, 1.0)), paint.as_ref());
+            let mut rec = Canvas::new_recording(&mut cmds, SIZE, SIZE);
+            for _ in 0..ops {
+                rec.draw_paint(&white(Style::Fill));
+            }
         }
+        Picture::from_parts(cmds, Rect::from_xywh(0.0, 0.0, 50.0, 50.0))
+    };
+    let draw =
+        |pic: &Picture, matrix: Option<&Matrix>, ctm: Option<&Matrix>, paint: Option<&Paint>| {
+            let mut buffer = PixelBuffer::new(SIZE, SIZE);
+            {
+                let mut canvas = Canvas::new_raster(&mut buffer);
+                if let Some(ctm) = ctm {
+                    canvas.set_matrix(ctm);
+                }
+                canvas.draw_picture(pic, matrix, paint);
+            }
+            lit(&buffer, 100, 100)
+        };
+    let collapse = Matrix::scale(0.0, 1.0);
+    for paint in [None, Some(Paint::new())] {
         assert!(
-            !lit(&buffer, 100, 100),
-            "nothing drawn (paint: {})",
-            paint.is_some()
+            draw(&picture(1), Some(&collapse), None, paint.as_ref()),
+            "one op: played"
+        );
+        assert!(
+            !draw(&picture(2), Some(&collapse), None, paint.as_ref()),
+            "two ops: rejected"
+        );
+        assert!(
+            !draw(&picture(2), None, Some(&collapse), paint.as_ref()),
+            "CTM collapse"
         );
     }
 }

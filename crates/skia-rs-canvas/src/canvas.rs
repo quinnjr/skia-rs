@@ -396,8 +396,9 @@ impl<'a> Canvas<'a> {
             return;
         }
 
-        // If the top layer was pushed at this save count, composite it
-        // back onto its parent before popping save state.
+        // If the top layer was pushed at this save count, take it; it is
+        // composited after the save state is popped (below), through the
+        // clip that was active at save_layer.
         let should_pop_layer = self
             .layer_stack
             .last()
@@ -1481,11 +1482,13 @@ impl<'a> Canvas<'a> {
         // before the matrix is concatenated); otherwise a plain save.
         let cull = picture.cull_rect();
         let bounds = matrix.map_or(cull, |m| m.map_rect(&cull));
-        // onDrawPicture quick-rejects the mapped cull: a known cull that the
-        // matrix collapses (e.g. a zero scale) draws nothing. An empty cull
-        // means "unknown" here (the C API records one when no bounds are
-        // given), so it is drawn.
-        if !cull.is_empty() && bounds.is_empty() {
+        // SkCanvas::drawPicture plays pictures of at most one op directly
+        // (kMaxPictureOpsToUnrollInsteadOfRef); for larger ones
+        // onDrawPicture quick-rejects the cull mapped through `matrix` and
+        // the CTM against the clip (a matrix that collapses it, e.g. a zero
+        // scale, draws nothing). An empty cull means "unknown" here (the C
+        // API records one when no bounds are given), so it is not rejected.
+        if picture.approximate_op_count() > 1 && !cull.is_empty() && self.quick_reject(&bounds) {
             return;
         }
         let restore_count = if let Some(p) = paint {
