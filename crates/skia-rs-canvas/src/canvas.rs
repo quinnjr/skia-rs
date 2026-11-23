@@ -875,6 +875,15 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// The resolution scale path effects flatten for: the CTM's maximum
+    /// scale (Skia's `SkStrokeRec::getResScale`), or 1 when degenerate.
+    fn res_scale(&self) -> Scalar {
+        self.total_matrix()
+            .max_scale()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(1.0)
+    }
+
     /// The clip bounds mapped into local space, outset for the paint's
     /// stroke, as the cull rect for path effects (`SkCanvas` passes the
     /// local clip bounds as `cullRect`). `None` (no culling) when the matrix
@@ -921,13 +930,7 @@ impl<'a> Canvas<'a> {
         };
         let mut rec = stroke_rec_from_paint(paint);
         let cull = self.local_cull(paint);
-        // Skia's SkStrokeRec::getResScale: the CTM's maximum scale.
-        let res_scale = self
-            .total_matrix()
-            .max_scale()
-            .filter(|s| s.is_finite() && *s > 0.0)
-            .unwrap_or(1.0);
-        let filtered = effect.filter_path_culled(path, &mut rec, cull.as_ref(), res_scale);
+        let filtered = effect.filter_path_culled(path, &mut rec, cull.as_ref(), self.res_scale());
         let final_path = filtered.as_ref().unwrap_or(path);
         let styled = paint_with_stroke_rec(paint, rec);
         let styled = styled.as_ref().unwrap_or(paint);
@@ -1610,7 +1613,10 @@ impl<'a> Canvas<'a> {
                     StrokeRec::StrokeAndFill(w) => StrokeRec::StrokeAndFill(w + extra),
                 };
             }
-            let filtered = effect.filter_path(outline, &mut rec);
+            // Same resolution scale as rasterize_path, so dashed glyph
+            // curves stay smooth when zoomed; the outline is in glyph space,
+            // so no cull is passed.
+            let filtered = effect.filter_path_culled(outline, &mut rec, None, self.res_scale());
             let glyph = filtered.as_ref().unwrap_or(outline);
             // Draw with the record's style, and drop the effect so draw_path
             // does not apply it a second time.
