@@ -1960,10 +1960,18 @@ impl PathEffect for Line2DEffect {
 
     /// The hatch as fillable geometry: each centerline from
     /// [`filter_path`](PathEffect::filter_path) outlined as a butt-ended band
-    /// of the effect's width (empty for a zero width, which is a hairline
-    /// hatch that only `filter_path`'s stroke record can express).
+    /// of the effect's width. A zero-width (hairline) hatch has no area, so
+    /// it returns the open centerlines themselves: they draw only when
+    /// stroked as hairlines, which `filter_path`'s stroke record does.
     fn apply(&self, src_path: &Path) -> Option<Path> {
         let lines = self.hatch_lines(src_path, None)?;
+        if self.width == 0.0 {
+            let mut builder = PathBuilder::new();
+            for (p0, p1) in lines {
+                builder.move_to(p0.x, p0.y).line_to(p1.x, p1.y);
+            }
+            return Some(builder.build());
+        }
         let half_width = self.width / 2.0;
         // Bands cost four points each (hatch_lines budgets two per line):
         // sample evenly to stay within MAX_LATTICE_POINTS.
@@ -2562,6 +2570,13 @@ mod tests {
             "{}",
             out.points().len()
         );
+    }
+
+    #[test]
+    fn zero_width_line2d_apply_returns_its_centerlines() {
+        let hatch = Line2DEffect::new(0.0, skia_rs_core::Matrix::scale(4.0, 4.0)).unwrap();
+        let lines = hatch.apply(&square(40.0)).expect("applies");
+        assert!(!lines.is_empty(), "the hairline hatch is not lost");
     }
 
     #[test]
