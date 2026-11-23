@@ -2056,3 +2056,27 @@ fn layer_color_filters_that_add_alpha_fill_the_clip() {
         "the clip is flooded: {c:?}"
     );
 }
+
+#[test]
+fn malformed_layer_buffers_are_not_composited() {
+    // A buffer too short for its rows is skipped rather than composited
+    // without its filter (or read out of range).
+    use skia_rs_paint::{BlurImageFilter, TileMode};
+    use std::sync::Arc;
+
+    let mut layer_paint = Paint::new();
+    layer_paint.set_image_filter(Some(Arc::new(BlurImageFilter::new(
+        1.0,
+        1.0,
+        TileMode::Decal,
+    ))));
+    let short = PixelBuffer {
+        width: 2,
+        height: 2,
+        stride: 16,
+        pixels: vec![255; 8],
+    };
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).composite_layer_pixels(short, (0, 0), Some(&layer_paint));
+    assert_eq!(buffer.get_pixel(0, 0).map_or(0, |c| c.alpha()), 0);
+}

@@ -637,6 +637,18 @@ impl<'a> Canvas<'a> {
         paint: Option<Paint>,
     ) {
         let paint = paint.unwrap_or_default();
+        // A buffer too short for its rows cannot be filtered or read: skip it
+        // rather than composite a partly processed (or out-of-range) layer.
+        {
+            let to_usize = |v: i32| usize::try_from(v).unwrap_or(0);
+            let (w, h) = (to_usize(src_pixels.width), to_usize(src_pixels.height));
+            let needed = h.checked_sub(1).map_or(Some(0), |rows| {
+                rows.checked_mul(src_pixels.stride)?.checked_add(w * 4)
+            });
+            if src_pixels.stride < w * 4 || needed.is_none_or(|n| src_pixels.pixels.len() < n) {
+                return;
+            }
+        }
         if let Some(filter) = paint.image_filter() {
             let to_usize = |v: i32| usize::try_from(v).unwrap_or(0);
             let (w, h) = (to_usize(src_pixels.width), to_usize(src_pixels.height));
@@ -741,6 +753,12 @@ impl<'a> Canvas<'a> {
                 target.blend_pixel_coverage(dx - tox, dy - toy, src, clip_cov, blend_mode);
             }
         }
+    }
+
+    /// Whether this canvas records commands instead of drawing pixels.
+    #[must_use]
+    pub const fn is_recording(&self) -> bool {
+        matches!(self.backing, Backing::Recording(_))
     }
 
     /// Restore to a specific save count.
