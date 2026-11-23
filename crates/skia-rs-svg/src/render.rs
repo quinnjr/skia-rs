@@ -592,7 +592,13 @@ fn render_node(
 /// `None` when dashing is disabled.
 fn build_dash_effect(state: &PresentationState) -> Option<PathEffectRef> {
     let intervals = state.dash_array.as_ref()?;
-    let dash = DashEffect::new(intervals.clone(), state.dash_offset)?;
+    // SVG repeats an odd stroke-dasharray to make it even (as SkSVG does
+    // before SkDashPathEffect::Make, which rejects odd counts).
+    let mut intervals = intervals.clone();
+    if intervals.len() % 2 == 1 {
+        intervals.extend_from_within(..);
+    }
+    let dash = DashEffect::new(intervals, state.dash_offset)?;
     Some(Arc::new(dash) as PathEffectRef)
 }
 
@@ -1016,6 +1022,21 @@ mod tests {
             pixels[off + 1],
             pixels[off + 2],
         ))
+    }
+
+    #[test]
+    fn odd_stroke_dasharray_repeats_like_svg() {
+        // stroke-dasharray="10" is [10, 10] in SVG: dash 0..10, gap 10..20.
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <line x1="0" y1="50" x2="100" y2="50" stroke="red" stroke-width="4"
+                  stroke-dasharray="10"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        // The background is white: a red dash has no green, a gap keeps it.
+        let green = |x: i32| pixel_at(&surface, x, 50).map_or(0, |c| c.green());
+        assert!(green(5) < 50, "dash at x = 5");
+        assert!(green(15) > 200, "gap at x = 15");
+        assert!(green(25) < 50, "dash at x = 25");
     }
 
     #[test]

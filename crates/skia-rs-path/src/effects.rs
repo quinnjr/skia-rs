@@ -204,22 +204,15 @@ pub struct DashEffect {
 impl DashEffect {
     /// Create a new dash effect.
     ///
-    /// `intervals` must have an even number of entries (on/off pairs).
-    /// If odd, the pattern is duplicated to make it even.
+    /// `intervals` must have an even number (at least two) of entries:
+    /// on/off pairs. Like `SkDashPathEffect::Make` (`ValidDashPath`), an
+    /// odd count gives `None`; callers with SVG semantics, where an odd
+    /// `stroke-dasharray` repeats, duplicate it first.
     #[must_use]
     pub fn new(intervals: Vec<Scalar>, phase: Scalar) -> Option<Self> {
-        if intervals.is_empty() {
+        if intervals.len() < 2 || !intervals.len().is_multiple_of(2) {
             return None;
         }
-
-        // Ensure even number of intervals
-        let intervals = if intervals.len().is_multiple_of(2) {
-            intervals
-        } else {
-            let mut doubled = intervals.clone();
-            doubled.extend(intervals.iter().copied());
-            doubled
-        };
 
         // Validate intervals are positive
         for &interval in &intervals {
@@ -654,12 +647,20 @@ impl DashEffect {
             return None;
         }
 
-        // Pre-flatten curves to lines so dash logic can transition mid-curve.
-        let flattened = flatten_path_to_lines(path, tolerance);
-        let path = &flattened;
-        if !self.dash_count_is_bounded(path) {
+        // Check the dash-count bound on a coarse flattening first, so a path
+        // that fails it is not first flattened at a fine (zoomed) tolerance.
+        let coarse_tolerance = DASH_FLATTEN_TOLERANCE.max(tolerance);
+        let coarse = flatten_path_to_lines(path, coarse_tolerance);
+        if !self.dash_count_is_bounded(&coarse) {
             return None;
         }
+        // Pre-flatten curves to lines so dash logic can transition mid-curve.
+        let flattened = if tolerance < coarse_tolerance {
+            flatten_path_to_lines(path, tolerance)
+        } else {
+            coarse
+        };
+        let path = &flattened;
 
         let mut builder = PathBuilder::new();
         let mut current_pos = Point::zero();
@@ -3207,9 +3208,9 @@ mod tests {
 
     #[test]
     fn test_dash_odd_intervals() {
-        let dash = DashEffect::new(vec![10.0, 5.0, 3.0], 0.0).unwrap();
-        // Should be doubled to make even
-        assert_eq!(dash.intervals().len(), 6);
+        // SkDashPathEffect::Make rejects an odd interval count.
+        assert!(DashEffect::new(vec![10.0, 5.0, 3.0], 0.0).is_none());
+        assert!(DashEffect::new(vec![10.0], 0.0).is_none());
     }
 
     #[test]

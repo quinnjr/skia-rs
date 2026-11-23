@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MSRV-aware `resolver = "3"`.
 - **Breaking**: the C API's `sk_canvas_save_layer` returns `int32_t`
   (was `uint32_t`), the same type and value as `sk_canvas_save`.
+- **Breaking**: `DashEffect::new` (and the C API's dash constructor)
+  returns `None` for an odd number of intervals, like
+  `SkDashPathEffect::Make`, instead of repeating the pattern. The SVG
+  renderer still repeats an odd `stroke-dasharray`, as SVG specifies.
 - **Breaking**: `skia-rs-core`'s `libm` feature is a deprecated no-op
   (it only forwarded to the unused, now removed, `glam` dependency).
 - Unused dependencies were removed across the workspace; `skia-rs-gpu`
