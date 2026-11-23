@@ -517,8 +517,9 @@ pub fn parse_length(s: &str) -> Scalar {
     parse_length_inner(s)
 }
 
-/// Whether `s` is a length [`parse_length`] understands (a number with an
-/// optional unit or `%`), as opposed to a keyword such as `auto` or junk
+/// Whether `s` is a length as `LengthContext::resolve` reads it (a number
+/// with an optional unit directly after it, or a percentage, which may have
+/// space before the `%`), as opposed to a keyword such as `auto` or junk
 /// that would read as 0.
 fn is_length(s: &str) -> bool {
     const UNITS: &[&str] = &[
