@@ -306,6 +306,73 @@ impl DashEffect {
         dash_count.is_finite() && dash_count <= MAX_DASH_COUNT
     }
 
+    /// `SkDashPath::InternalFilter`'s initial join for culled rects: when
+    /// `source` is a closed rect, the dash starts "on", and it ends inside an
+    /// "on" interval (or at the start of an "off" one), append a tiny right
+    /// angle at the first corner to `culled`, so the first and last dashes
+    /// are stroked with a join instead of two butt ends.
+    fn add_rect_start_join(&self, source: &Path, culled: Path) -> Path {
+        const TINY_OFFSET: Scalar = 1.0 / 4096.0; // SK_ScalarNearlyZero
+        if source.is_rect().is_none() || !source.is_closed() {
+            return culled;
+        }
+        let mut start_phase = self.phase % self.interval_sum;
+        if start_phase < 0.0 {
+            start_phase += self.interval_sum;
+        }
+        // The initial dash index (SkDashPath::CalcDashParameters).
+        let mut index = 0;
+        let mut remaining = start_phase;
+        while index < self.intervals.len() && remaining >= self.intervals[index] {
+            remaining -= self.intervals[index];
+            index += 1;
+        }
+        if !index.is_multiple_of(2) {
+            return culled;
+        }
+        let points = source.points();
+        let n = points.len();
+        let perimeter: Scalar = (0..n)
+            .map(|i| points[i].distance(&points[(i + 1) % n]))
+            .sum();
+        let mut end_phase = (perimeter + start_phase) % self.interval_sum;
+        let mut end_index = 0;
+        loop {
+            if end_phase <= self.intervals[end_index] {
+                break;
+            }
+            end_phase -= self.intervals[end_index];
+            end_index += 1;
+            if end_index == self.intervals.len() {
+                end_phase = 0.0;
+                break;
+            }
+        }
+        if end_index.is_multiple_of(2) != (end_phase > 0.0) {
+            return culled;
+        }
+        let mid = points[0];
+        let Some(&last) = points.iter().rev().find(|p| **p != mid) else {
+            return culled;
+        };
+        let Some(&next) = points.iter().find(|p| **p != mid) else {
+            return culled;
+        };
+        let mut b = PathBuilder::new();
+        b.add_path(&culled);
+        let (vx, vy) = (
+            (mid.x - last.x) * TINY_OFFSET,
+            (mid.y - last.y) * TINY_OFFSET,
+        );
+        b.move_to(mid.x - vx, mid.y - vy).line_to(mid.x, mid.y);
+        let (wx, wy) = (
+            (mid.x - next.x) * TINY_OFFSET,
+            (mid.y - next.y) * TINY_OFFSET,
+        );
+        b.line_to(mid.x - wx, mid.y - wy);
+        b.build()
+    }
+
     fn dash_line(
         &self,
         builder: &mut PathBuilder,
@@ -385,6 +452,10 @@ impl PathEffect for DashEffect {
             // Entirely outside the cull: nothing visible to dash.
             return Some(Path::new());
         }
+        // A culled closed rect is dashed as open edges; if the pattern is
+        // "on" both where it starts and where it ends, SkDashPath adds a
+        // tiny right angle at the start corner so the stroke joins there.
+        let culled = culled.map(|c| self.add_rect_start_join(path, c));
         let path = culled.as_ref().unwrap_or(path);
         let scale = if res_scale.is_finite() && res_scale > 0.0 {
             res_scale

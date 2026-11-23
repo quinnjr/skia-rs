@@ -528,3 +528,28 @@ fn dashed_regions_stroke_their_boundary_not_each_rect() {
     let outline = (0..32).any(|x| buffer.get_pixel(x, 4).is_some_and(|c| c.red() > 0));
     assert!(outline, "the outer outline is dashed");
 }
+
+#[test]
+fn dashed_rects_join_at_the_start_corner_when_the_pattern_wraps_on() {
+    // 100 x 110 rect, perimeter 420, dashes [30, 10]: the last dash ends 20
+    // units into an "on" interval at the start corner, so SkDashPath joins it
+    // to the first dash there (a mitered corner, not two butt ends).
+    use skia_rs_core::Rect;
+    use skia_rs_paint::StrokeJoin;
+
+    let mut paint = Paint::new();
+    paint.set_color32(Color::WHITE);
+    paint.set_style(Style::Stroke);
+    paint.set_stroke_width(8.0);
+    paint.set_stroke_join(StrokeJoin::Miter);
+    paint.set_path_effect(Some(Arc::new(
+        DashEffect::new(vec![30.0, 10.0], 0.0).unwrap(),
+    )));
+    let mut buffer = PixelBuffer::new(160, 160);
+    Canvas::new_raster(&mut buffer).draw_rect(&Rect::new(20.0, 20.0, 120.0, 130.0), &paint);
+    // The outer miter corner covers (17, 17); butt ends leave it empty.
+    assert!(
+        buffer.get_pixel(17, 17).is_some_and(|c| c.red() > 0),
+        "mitered start corner"
+    );
+}
