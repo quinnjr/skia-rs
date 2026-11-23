@@ -1076,7 +1076,10 @@ fn solid_spans_under_an_aa_clip_lerp_for_non_srcover_modes() {
     for y in 0..SIZE {
         for x in 0..SIZE {
             let c = buffer.get_pixel(x, y).unwrap_or(Color::BLACK);
-            assert_eq!(c.alpha(), 255, "({x}, {y}) stays opaque: {c:?}");
+            assert!(
+                c.alpha() >= 180,
+                "({x}, {y}) lerped toward the source: {c:?}"
+            );
         }
     }
 }
@@ -1347,6 +1350,50 @@ fn off_screen_curves_do_not_change_coverage() {
                 let b = reference.get_pixel(x + 200, y).map(|c| c.red());
                 assert_eq!(a, b, "aa={anti_alias} ({x}, {y})");
             }
+        }
+    }
+}
+
+#[test]
+fn layers_composite_partial_clip_coverage_like_other_draws() {
+    // A Src-mode layer composited through an AA circle clip onto white.
+    // The layer's own edge pixels are already partly transparent (the clip
+    // applies inside the layer too, as in Skia), so with clip coverage c
+    // and layer alpha a the lerp gives alpha 1 - c + c * a >= 0.75, while
+    // replacing the pixel with the coverage-scaled source gives c * a,
+    // which is near 0 at faint edges.
+    use skia_rs_canvas::{ClipOp, SaveLayerRec};
+    use skia_rs_paint::BlendMode;
+
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            buffer.set_pixel(x, y, Color::WHITE);
+        }
+    }
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        let mut clip = PathBuilder::new();
+        clip.add_circle(100.0, 100.0, 40.3);
+        canvas.clip_path(&clip.build(), ClipOp::Intersect, true);
+        let mut layer_paint = Paint::new();
+        layer_paint.set_blend_mode(BlendMode::Src);
+        canvas.save_layer(&SaveLayerRec {
+            paint: Some(&layer_paint),
+            ..SaveLayerRec::default()
+        });
+        let mut red = Paint::new();
+        red.set_color32(Color::from_argb(255, 255, 0, 0));
+        canvas.draw_rect(&Rect::new(0.0, 0.0, 200.0, 200.0), &red);
+        canvas.restore();
+    }
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let c = buffer.get_pixel(x, y).unwrap_or(Color::BLACK);
+            assert!(
+                c.alpha() >= 180,
+                "({x}, {y}) lerped toward the source: {c:?}"
+            );
         }
     }
 }

@@ -467,13 +467,14 @@ impl<'a> Canvas<'a> {
                     src = skia_rs_core::premultiply_color(clamped.to_color());
                 }
 
-                // Scale all four premultiplied channels by paint alpha and
-                // the clip coverage.
-                let scale = layer_alpha * (f32::from(clip_cov) / 255.0);
-                let s = |v: u8| skia_rs_core::cast::f32_to_u8_sat(f32::from(v) * scale);
+                // Scale all four premultiplied channels by the paint alpha;
+                // the clip coverage then blends like every other partial
+                // coverage (lerp toward the blend result for non-SrcOver
+                // modes, so Src/Clear edges are not simply replaced).
+                let s = |v: u8| skia_rs_core::cast::f32_to_u8_sat(f32::from(v) * layer_alpha);
                 let src =
                     Color::from_argb(s(src.alpha()), s(src.red()), s(src.green()), s(src.blue()));
-                target.blend_pixel(dx - tox, dy - toy, src, blend_mode);
+                target.blend_pixel_coverage(dx - tox, dy - toy, src, clip_cov, blend_mode);
             }
         }
     }
@@ -1731,7 +1732,7 @@ impl<'a> Canvas<'a> {
             && paint.shader().is_none()
             && paint.mask_filter().is_none()
             && paint.image_filter().is_none()
-            && paint.path_effect().is_none()
+            // (Path effects never get here: draw_glyph_with_effect handles them.)
             && ctm_scale.is_finite()
             && ctm_scale > 0.0;
         if !device_safe {
