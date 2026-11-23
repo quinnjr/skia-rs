@@ -1513,3 +1513,40 @@ fn arcs_with_non_finite_or_huge_sweeps_finish() {
         "the huge sweep still draws the oval"
     );
 }
+
+#[test]
+fn layers_apply_an_outer_aa_clip_once() {
+    // An AA clip set before save_layer: Skia's layer device starts wide open
+    // and the clip applies once at composite, so the layered draw matches
+    // drawing directly through the clip.
+    use skia_rs_canvas::{ClipOp, SaveLayerRec};
+
+    let render = |layered: bool| {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            let mut clip = PathBuilder::new();
+            clip.add_circle(100.0, 100.0, 40.3);
+            canvas.clip_path(&clip.build(), ClipOp::Intersect, true);
+            if layered {
+                canvas.save_layer(&SaveLayerRec::default());
+            }
+            canvas.draw_rect(&Rect::new(0.0, 0.0, 200.0, 200.0), &white(Style::Fill));
+            if layered {
+                canvas.restore();
+            }
+        }
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).map_or(0, |c| c.alpha()))
+            .collect::<Vec<_>>()
+    };
+    let (direct, layered) = (render(false), render(true));
+    let worst = direct
+        .iter()
+        .zip(&layered)
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(worst <= 2, "layered edges differ by up to {worst}");
+}

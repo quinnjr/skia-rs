@@ -512,6 +512,14 @@ impl ClipStack {
         }
     }
 
+    /// Replace the current clip with a plain rectangle (non-anti-aliased),
+    /// discarding any mask. Used for a new layer, whose device starts with a
+    /// wide-open clip in Skia (`SkCanvas::internalSaveLayer`); the saved
+    /// state comes back on [`restore`](Self::restore).
+    pub fn reset_to_rect(&mut self, rect: &Rect) {
+        self.current = ClipState::Rect(*rect);
+    }
+
     /// Get the current save count.
     #[must_use]
     pub const fn save_count(&self) -> usize {

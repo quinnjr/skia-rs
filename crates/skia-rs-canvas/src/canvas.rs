@@ -333,6 +333,16 @@ impl<'a> Canvas<'a> {
 
             let (w, h) = (device_rect.width().max(0), device_rect.height().max(0));
             let buffer = PixelBuffer::new(w, h);
+            // Skia's layer device starts wide open (clipped only to its
+            // bounds): the prior clip, AA mask included, applies once, when
+            // restore() composites the layer through it. Keeping it here
+            // too would square partial edge coverage.
+            self.clip_stack.reset_to_rect(&Rect::new(
+                scalar_from_i32(device_rect.left),
+                scalar_from_i32(device_rect.top),
+                scalar_from_i32(device_rect.left + w),
+                scalar_from_i32(device_rect.top + h),
+            ));
             // INIT_WITH_PREVIOUS is left unimplemented here — the buffer is
             // left fully transparent. Pre-seeding from the parent is left
             // as a follow-up because it requires reading back and mapping
@@ -2898,8 +2908,12 @@ fn build_arc_path(
     }
     // Skia peels off whole turns by repeated subtraction; here they are
     // counted up front (and capped, so a huge sweep, where subtracting 360
-    // no longer changes the value, cannot spin or build millions of pieces),
-    // and the remainder is the same as the subtraction's.
+    // no longer changes the value, cannot spin or build millions of pieces).
+    // The remainder matches the subtraction's while its steps are exact
+    // (|sweep| below 2^24 / 360 turns or so). Skia then always calls
+    // arcTo(start, rest), which for rest == 0 appends a zero-length lineTo
+    // to the point the contour already ends at; the stroker and dasher skip
+    // that, so it is not emitted here.
     let half = 180.0_f32.copysign(sweep_angle);
     let turns = (sweep_angle.abs() / 360.0).floor().min(MAX_ARC_TURNS);
     let mut start = start_angle;
