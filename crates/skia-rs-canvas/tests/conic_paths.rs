@@ -1033,3 +1033,50 @@ fn partial_coverage_blends_toward_the_result_for_non_srcover_modes() {
         assert_eq!(c.red(), 255, "({x}, {y}) red channel: {c:?}");
     }
 }
+
+#[test]
+fn negative_radius_aa_circles_draw_nothing() {
+    // Clamped to 0, the AA circle must not paint a half-coverage dot.
+    use skia_rs_core::Point;
+
+    let mut paint = white(Style::Fill);
+    paint.set_anti_alias(true);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_circle(Point::new(10.5, 10.5), -5.0, &paint);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            assert!(
+                buffer.get_pixel(x, y).is_none_or(|c| c.alpha() == 0),
+                "({x}, {y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn solid_spans_under_an_aa_clip_lerp_for_non_srcover_modes() {
+    // Same rule as for shaded spans: Src on opaque white stays opaque at
+    // partially clipped pixels.
+    use skia_rs_paint::BlendMode;
+
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            buffer.set_pixel(x, y, Color::WHITE);
+        }
+    }
+    let mut paint = Paint::new();
+    paint.set_color32(Color::from_argb(255, 255, 0, 0));
+    paint.set_blend_mode(BlendMode::Src);
+    let mut canvas = Canvas::new_raster(&mut buffer);
+    let mut clip = PathBuilder::new();
+    clip.add_circle(100.0, 100.0, 40.3);
+    canvas.clip_path(&clip.build(), skia_rs_canvas::ClipOp::Intersect, true);
+    canvas.draw_rect(&Rect::new(0.0, 0.0, 200.0, 200.0), &paint);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let c = buffer.get_pixel(x, y).unwrap_or(Color::BLACK);
+            assert_eq!(c.alpha(), 255, "({x}, {y}) stays opaque: {c:?}");
+        }
+    }
+}

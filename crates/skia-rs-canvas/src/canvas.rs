@@ -2609,6 +2609,12 @@ fn build_round_rect_path(rect: &Rect, rx: Scalar, ry: Scalar) -> Path {
     let round_rect = builder.build();
     // add_round_rect emits a plain rect contour for rect-type rrects and a
     // four-conic contour for oval-type ones.
+    // An empty rect is a kEmpty rrect, not a rect-type one: onDrawRRect does
+    // not hand it to drawRect, and addRRect keeps its own start corner.
+    let sorted = sorted_rect(rect);
+    if !(sorted.width() > 0.0 && sorted.height() > 0.0) {
+        return round_rect;
+    }
     let mut delegated = skia_rs_path::PathBuilder::new();
     match round_rect.verbs() {
         [Verb::Move, Verb::Line, Verb::Line, Verb::Line, Verb::Close] => {

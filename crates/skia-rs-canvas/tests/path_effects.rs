@@ -433,3 +433,36 @@ fn perspective_does_not_cull_visible_hatching() {
         .count();
     assert!(lit > 10, "hatching reaches the far side: {lit} pixels");
 }
+
+#[test]
+fn empty_round_rects_keep_add_rrect_start_point() {
+    // An empty rect with positive radii is a kEmpty rrect: drawn through
+    // addRRect (start index 3, bottom-left), not drawRect (top-left), so a
+    // dash starts at the bottom of a zero-width rect.
+    use skia_rs_core::Rect;
+
+    let render = |as_round_rect: bool| {
+        let mut paint = Paint::new();
+        paint.set_color32(Color::WHITE);
+        paint.set_style(Style::Stroke);
+        paint.set_stroke_width(2.0);
+        paint.set_path_effect(Some(Arc::new(
+            DashEffect::new(vec![7.0, 5.0], 0.0).unwrap(),
+        )));
+        let rect = Rect::new(20.0, 5.0, 20.0, 58.0);
+        let mut buffer = PixelBuffer::new(64, 64);
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        if as_round_rect {
+            canvas.draw_round_rect(&rect, 4.0, 4.0, &paint);
+        } else {
+            let mut b = PathBuilder::new();
+            b.add_round_rect(&rect, 4.0, 4.0);
+            canvas.draw_path(&b.build(), &paint);
+        }
+        (0..64)
+            .flat_map(|y| (0..64).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).map_or(0, |c| c.red()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(render(true), render(false));
+}

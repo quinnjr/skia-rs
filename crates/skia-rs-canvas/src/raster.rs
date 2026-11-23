@@ -907,16 +907,12 @@ impl<'a> Rasterizer<'a> {
 
         // For advanced clips (region-based or AA), use per-pixel with coverage
         if self.use_advanced_clip {
+            // Partial clip coverage blends like every other blit path
+            // (lerp toward the blend result for non-SrcOver modes).
             for x in start..=end {
                 let coverage = self.get_clip_coverage(x, y);
-                if coverage > 0 {
-                    if coverage == 255 {
-                        self.buffer.blend_pixel(x, y, color, blend_mode);
-                    } else {
-                        let adjusted = apply_coverage(color, coverage);
-                        self.buffer.blend_pixel(x, y, adjusted, blend_mode);
-                    }
-                }
+                self.buffer
+                    .blend_pixel_coverage(x, y, color, coverage, blend_mode);
             }
             return;
         }
@@ -1166,6 +1162,10 @@ impl<'a> Rasterizer<'a> {
         let cx = tc.x;
         let cy = tc.y;
         let r = radius * self.matrix.scale_x().abs();
+        // An empty circle draws nothing (Skia draws the empty oval).
+        if r.is_nan() || r <= 0.0 {
+            return;
+        }
 
         let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
