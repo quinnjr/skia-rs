@@ -338,6 +338,9 @@ impl<'a> Canvas<'a> {
                 scalar_from_i32(device_rect.left + w),
                 scalar_from_i32(device_rect.top + h),
             ));
+            // The filter runs on the layer's pixels: map its parameters
+            // from local space into them (Skia's layer-space mapping).
+            let paint = self.layer_paint(paint.as_ref(), &device_rect);
             self.layer_stack.push(Layer {
                 buffer,
                 device_origin: (device_rect.left, device_rect.top),
@@ -409,21 +412,38 @@ impl<'a> Canvas<'a> {
     pub fn layer_bounds(&self, rec: &SaveLayerRec<'_>) -> IRect {
         use skia_rs_core::cast::scalar_from_i32;
 
-        let ctm = *self.total_matrix();
-        let device_full = Rect::from_xywh(
+        let device = Rect::from_xywh(
             0.0,
             0.0,
             scalar_from_i32(self.width),
             scalar_from_i32(self.height),
         );
+        self.layer_bounds_within(rec, &device)
+    }
+
+    /// [`layer_bounds`](Self::layer_bounds) for a canvas whose pixels are
+    /// part of a larger device: `device` is that device's rect in this
+    /// canvas's coordinates (the C API's canvas draws into one layer at a
+    /// time). A filtered layer extends at most the filter's reach (itself
+    /// at most the device size) past `device`, so nested filtered layers
+    /// stay bounded.
+    #[must_use]
+    pub fn layer_bounds_within(&self, rec: &SaveLayerRec<'_>, device: &Rect) -> IRect {
+        let ctm = *self.total_matrix();
+        let device_full = *device;
         let mut clip_bounds = self.clip_stack.bounds();
-        let filter = rec.paint.and_then(Paint::image_filter);
-        if let Some(filter) = filter {
+        // The filter's parameters in device space, as it will run.
+        let filter = rec
+            .paint
+            .and_then(Paint::image_filter)
+            .map(|f| skia_rs_paint::map_image_filter(f, &ctm));
+        let mut reach = 0.0;
+        if let Some(filter) = &filter {
             // The input a filter needs mirrors how far it spreads its
             // output (a blur's radius, a shadow's offset): outset by the
             // largest spread on any side, at most the device size.
             let out = filter.filter_bounds(&clip_bounds);
-            let reach = [
+            reach = [
                 clip_bounds.left - out.left,
                 clip_bounds.top - out.top,
                 out.right - clip_bounds.right,
@@ -437,12 +457,45 @@ impl<'a> Canvas<'a> {
         let hinted = rec.bounds.map_or(Some(clip_bounds), |b| {
             ctm.map_rect(b).intersect(&clip_bounds)
         });
-        let limited = if filter.is_some() {
-            hinted
-        } else {
-            hinted.and_then(|r| r.intersect(&device_full))
-        };
-        limited.map_or_else(|| IRect::new(0, 0, 0, 0), |r| r.round_out())
+        hinted
+            .and_then(|r| r.intersect(&device_full.inset(-reach, -reach)))
+            .map_or_else(|| IRect::new(0, 0, 0, 0), |r| r.round_out())
+    }
+
+    /// The paint a layer at device rect `layer` composites with: `paint`
+    /// with its image filter's parameters mapped from local space (the
+    /// current matrix) into the layer's pixels, as Skia maps a layer's
+    /// filter into layer space (sigmas and offsets scale and rotate with
+    /// the matrix).
+    #[must_use]
+    pub fn layer_paint(&self, paint: Option<&Paint>, layer: &IRect) -> Option<Paint> {
+        use skia_rs_core::cast::scalar_from_i32;
+
+        let mut paint = paint.cloned()?;
+        if let Some(filter) = paint.image_filter() {
+            let to_layer =
+                Matrix::translate(-scalar_from_i32(layer.left), -scalar_from_i32(layer.top))
+                    .concat(self.total_matrix());
+            let mapped = skia_rs_paint::map_image_filter(filter, &to_layer);
+            paint.set_image_filter(Some(mapped));
+        }
+        Some(paint)
+    }
+
+    /// The device area clip masks cover: the device, extended by the top
+    /// layer (a filtered layer may reach past the device, and clips set
+    /// inside it must keep that content for the filter).
+    fn clip_mask_bounds(&self) -> IRect {
+        let device = IRect::new(0, 0, self.width, self.height);
+        self.layer_stack.last().map_or(device, |layer| {
+            let (lx, ly) = layer.device_origin;
+            IRect::new(
+                device.left.min(lx),
+                device.top.min(ly),
+                device.right.max(lx + layer.buffer.width),
+                device.bottom.max(ly + layer.buffer.height),
+            )
+        })
     }
 
     /// Copies the pixels under a new layer (the top layer, or the base
@@ -485,8 +538,9 @@ impl<'a> Canvas<'a> {
     /// `device_origin` (in this canvas's device space) onto the current
     /// target (the top layer, or the base raster), through the current clip,
     /// as [`restore`](Self::restore) composites a layer: the paint's image
-    /// filter runs on the pixels first, then its color filter, alpha and
-    /// blend mode apply. For callers that keep a layer's pixels across
+    /// filter runs on the pixels first (its parameters taken as given, in
+    /// the layer's pixels: see [`layer_paint`](Self::layer_paint)), then its
+    /// color filter, alpha and blend mode apply. For callers that keep a layer's pixels across
     /// canvases (the C API's canvas). A no-op for non-raster canvases.
     pub fn composite_layer_pixels(
         &mut self,
@@ -688,7 +742,7 @@ impl<'a> Canvas<'a> {
     /// bounding box) is only used for axis-aligned CTMs.
     pub fn clip_rect(&mut self, rect: &Rect, op: ClipOp, do_anti_alias: bool) {
         let matrix = *self.total_matrix();
-        let device_bounds = IRect::new(0, 0, self.width, self.height);
+        let device_bounds = self.clip_mask_bounds();
 
         if matrix.skew_x() == 0.0 && matrix.skew_y() == 0.0 && !matrix.has_perspective() {
             let transformed = matrix.map_rect(rect);
@@ -717,7 +771,7 @@ impl<'a> Canvas<'a> {
     pub fn clip_path(&mut self, path: &Path, op: ClipOp, do_anti_alias: bool) {
         let transformed_path = device_clip_path(path, self.total_matrix());
 
-        let device_bounds = IRect::new(0, 0, self.width, self.height);
+        let device_bounds = self.clip_mask_bounds();
         self.clip_stack
             .clip_path_with_op(&transformed_path, &device_bounds, op, do_anti_alias);
 

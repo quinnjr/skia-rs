@@ -24,8 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   set under, as in Skia; a later transform no longer moves them.
 - Layers implement `SaveLayerFlags::INIT_WITH_PREVIOUS` and apply the
   layer paint's image filter on restore (the layer is sized to include the
-  filter's reach past the clip). New `Canvas::layer_bounds` and
-  `Canvas::composite_layer_pixels`.
+  filter's reach past the clip, at most the device size past the device).
+  As in Skia, the filter's parameters are mapped from local space into the
+  layer (sigmas, offsets and radii scale and rotate with the matrix) via the
+  new `ImageFilter::map_params` / `map_image_filter`. New
+  `Canvas::layer_bounds`, `layer_bounds_within`, `layer_paint` and
+  `composite_layer_pixels`.
 - **Breaking**: `DrawCommand::SaveLayer` has a `flags` field, so recorded
   layers keep `INIT_WITH_PREVIOUS` on playback.
 - The `serde` feature (core, path, paint, and `skia-rs-safe`/`skia-rs`)

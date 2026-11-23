@@ -1706,3 +1706,103 @@ fn layer_image_filters_apply_on_restore() {
     );
     assert_eq!(alpha(100, 101), 0, "the result is still clipped");
 }
+
+#[test]
+fn layer_image_filters_scale_with_the_matrix() {
+    // Skia maps a layer's image filter into layer space: a blur of sigma 1
+    // under scale(4) blurs like sigma 4 in device pixels.
+    use skia_rs_canvas::SaveLayerRec;
+    use skia_rs_paint::{BlurImageFilter, TileMode};
+    use std::sync::Arc;
+
+    let render = |scaled: bool| {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            let sigma = if scaled { 1.0 } else { 4.0 };
+            let mut layer_paint = Paint::new();
+            layer_paint.set_image_filter(Some(Arc::new(BlurImageFilter::new(
+                sigma,
+                sigma,
+                TileMode::Decal,
+            ))));
+            if scaled {
+                canvas.scale(4.0, 4.0);
+            }
+            canvas.save_layer(&SaveLayerRec {
+                paint: Some(&layer_paint),
+                ..SaveLayerRec::default()
+            });
+            let r = if scaled {
+                Rect::new(10.0, 10.0, 30.0, 30.0)
+            } else {
+                Rect::new(40.0, 40.0, 120.0, 120.0)
+            };
+            canvas.draw_rect(&r, &white(Style::Fill));
+            canvas.restore();
+        }
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).map_or(0, |c| c.alpha()))
+            .collect::<Vec<_>>()
+    };
+    let (scaled, device) = (render(true), render(false));
+    let worst = scaled
+        .iter()
+        .zip(&device)
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(worst <= 2, "scaled blur differs by up to {worst}");
+}
+
+#[test]
+fn clips_inside_an_off_device_layer_keep_its_content() {
+    // A blurred layer reaches past the device edge; an AA clip set inside it
+    // covering everything must keep the off-device content the blur pulls
+    // in, so the result matches the same layer without the inner clip.
+    use skia_rs_canvas::{ClipOp, SaveLayerRec};
+    use skia_rs_paint::{BlurImageFilter, TileMode};
+    use std::sync::Arc;
+
+    let render = |inner_clip: bool| {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            let mut layer_paint = Paint::new();
+            layer_paint.set_image_filter(Some(Arc::new(BlurImageFilter::new(
+                6.0,
+                6.0,
+                TileMode::Decal,
+            ))));
+            canvas.save_layer(&SaveLayerRec {
+                paint: Some(&layer_paint),
+                ..SaveLayerRec::default()
+            });
+            if inner_clip {
+                canvas.clip_rect(
+                    &Rect::new(-100.0, -100.0, 300.0, 300.0),
+                    ClipOp::Intersect,
+                    true,
+                );
+            }
+            canvas.draw_rect(&Rect::new(150.0, 50.0, 260.0, 150.0), &white(Style::Fill));
+            canvas.restore();
+        }
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).map_or(0, |c| c.alpha()))
+            .collect::<Vec<_>>()
+    };
+    let (clipped, plain) = (render(true), render(false));
+    let worst = clipped
+        .iter()
+        .zip(&plain)
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        worst <= 2,
+        "the inner clip changed the blurred edge by up to {worst}"
+    );
+}

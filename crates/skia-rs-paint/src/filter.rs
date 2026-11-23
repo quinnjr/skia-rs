@@ -6,7 +6,7 @@
 )]
 
 use skia_rs_core::cast::{f32_to_u8_sat, round_to_i32, saturate_to_i32, scalar_from_i32};
-use skia_rs_core::{Color4f, Rect, Scalar, mul_div_255_round};
+use skia_rs_core::{Color4f, Matrix, Rect, Scalar, mul_div_255_round};
 use std::sync::Arc;
 
 /// Truncating (non-rounding), saturating `f32` -> `u8` cast.
@@ -396,6 +396,46 @@ pub trait ImageFilter: Send + Sync + std::fmt::Debug {
     fn serialize(&self) -> Option<Vec<u8>> {
         None
     }
+
+    /// This filter with its geometric parameters (blur sigmas, offsets,
+    /// radii, rects, and those of its inputs) mapped through `matrix`, as
+    /// `SkCanvas` maps a layer's image filter from local space into layer
+    /// space (`skif::Mapping::paramToLayer`). `None` when nothing changes
+    /// (the default, for filters without geometric parameters).
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        let _ = matrix;
+        None
+    }
+}
+
+/// `filter` with its parameters mapped through `matrix` (see
+/// [`ImageFilter::map_params`]); `filter` itself when nothing changes.
+#[must_use]
+pub fn map_image_filter(filter: &ImageFilterRef, matrix: &Matrix) -> ImageFilterRef {
+    filter
+        .map_params(matrix)
+        .unwrap_or_else(|| Arc::clone(filter))
+}
+
+/// Maps an optional input filter.
+fn map_input(input: Option<&ImageFilterRef>, matrix: &Matrix) -> Option<ImageFilterRef> {
+    input.map(|f| map_image_filter(f, matrix))
+}
+
+/// Maps a vector (an offset) through the linear part of `matrix`.
+fn map_vector(matrix: &Matrix, dx: Scalar, dy: Scalar) -> (Scalar, Scalar) {
+    let v = &matrix.values;
+    (
+        v[Matrix::SCALE_X] * dx + v[Matrix::SKEW_X] * dy,
+        v[Matrix::SKEW_Y] * dx + v[Matrix::SCALE_Y] * dy,
+    )
+}
+
+/// Maps a size (sigmas, radii) as the lengths of its mapped axis vectors.
+fn map_size(matrix: &Matrix, w: Scalar, h: Scalar) -> (Scalar, Scalar) {
+    let (x0, y0) = map_vector(matrix, w, 0.0);
+    let (x1, y1) = map_vector(matrix, 0.0, h);
+    (x0.hypot(y0), x1.hypot(y1))
 }
 
 /// A blur image filter.
@@ -419,6 +459,15 @@ impl BlurImageFilter {
 }
 
 impl ImageFilter for BlurImageFilter {
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        let (sigma_x, sigma_y) = map_size(matrix, self.sigma_x, self.sigma_y);
+        Some(Arc::new(Self {
+            sigma_x,
+            sigma_y,
+            tile_mode: self.tile_mode,
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         // Blur expands bounds by ~3 sigma
         let dx = self.sigma_x * 3.0;
@@ -490,6 +539,18 @@ impl DropShadowImageFilter {
 }
 
 impl ImageFilter for DropShadowImageFilter {
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        let (dx, dy) = map_vector(matrix, self.dx, self.dy);
+        let (sigma_x, sigma_y) = map_size(matrix, self.sigma_x, self.sigma_y);
+        Some(Arc::new(Self {
+            dx,
+            dy,
+            sigma_x,
+            sigma_y,
+            ..self.clone()
+        }))
+    }
+
     #[allow(
         clippy::similar_names,
         reason = "blur_dx/blur_dy are the conventional x/y-axis pair for this offset+blur computation"
@@ -771,6 +832,16 @@ impl MorphologyImageFilter {
 }
 
 impl ImageFilter for MorphologyImageFilter {
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        let (radius_x, radius_y) = map_size(matrix, self.radius_x, self.radius_y);
+        Some(Arc::new(Self {
+            morph_type: self.morph_type,
+            radius_x,
+            radius_y,
+            input: map_input(self.input.as_ref(), matrix),
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         Rect::new(
             src.left - self.radius_x,
@@ -895,6 +966,14 @@ impl ColorFilterImageFilter {
 }
 
 impl ImageFilter for ColorFilterImageFilter {
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        let input = self.input.as_ref()?;
+        Some(Arc::new(Self {
+            color_filter: Arc::clone(&self.color_filter),
+            input: Some(map_image_filter(input, matrix)),
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         // Color filters don't change bounds
         *src
@@ -1007,6 +1086,19 @@ impl DisplacementMapImageFilter {
 }
 
 impl ImageFilter for DisplacementMapImageFilter {
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        // Skia maps the scale as a size; this filter has one scale for
+        // both axes, so take the mean of the two mapped lengths.
+        let (sx, sy) = map_size(matrix, self.scale, self.scale);
+        Some(Arc::new(Self {
+            x_channel: self.x_channel,
+            y_channel: self.y_channel,
+            scale: f32::midpoint(sx, sy),
+            displacement: map_image_filter(&self.displacement, matrix),
+            color: map_input(self.color.as_ref(), matrix),
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         // Displacement can move pixels by up to scale/2 in each direction
         let offset = self.scale / 2.0;
@@ -1291,6 +1383,13 @@ impl ComposeImageFilter {
 }
 
 impl ImageFilter for ComposeImageFilter {
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        Some(Arc::new(Self {
+            outer: map_image_filter(&self.outer, matrix),
+            inner: map_image_filter(&self.inner, matrix),
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         let inner_bounds = self.inner.filter_bounds(src);
         self.outer.filter_bounds(&inner_bounds)
@@ -1333,6 +1432,16 @@ impl MergeImageFilter {
 }
 
 impl ImageFilter for MergeImageFilter {
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        Some(Arc::new(Self {
+            inputs: self
+                .inputs
+                .iter()
+                .map(|i| map_input(i.as_ref(), matrix))
+                .collect(),
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         let mut result = *src;
         for filter in self.inputs.iter().flatten() {
@@ -1390,6 +1499,15 @@ impl OffsetImageFilter {
 }
 
 impl ImageFilter for OffsetImageFilter {
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        let (dx, dy) = map_vector(matrix, self.dx, self.dy);
+        Some(Arc::new(Self {
+            dx,
+            dy,
+            input: map_input(self.input.as_ref(), matrix),
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         Rect::new(
             src.left + self.dx,
@@ -1654,6 +1772,14 @@ impl TileImageFilter {
 }
 
 impl ImageFilter for TileImageFilter {
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        Some(Arc::new(Self {
+            src_rect: matrix.map_rect(&self.src_rect),
+            dst_rect: matrix.map_rect(&self.dst_rect),
+            input: map_input(self.input.as_ref(), matrix),
+        }))
+    }
+
     fn filter_bounds(&self, _src: &Rect) -> Rect {
         self.dst_rect
     }
@@ -1746,6 +1872,14 @@ impl BlendImageFilter {
 }
 
 impl ImageFilter for BlendImageFilter {
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        Some(Arc::new(Self {
+            mode: self.mode,
+            background: map_input(self.background.as_ref(), matrix),
+            foreground: map_input(self.foreground.as_ref(), matrix),
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         let bg = self
             .background
@@ -1833,6 +1967,18 @@ impl ArithmeticImageFilter {
 }
 
 impl ImageFilter for ArithmeticImageFilter {
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        Some(Arc::new(Self {
+            k1: self.k1,
+            k2: self.k2,
+            k3: self.k3,
+            k4: self.k4,
+            enforce_pm_color: self.enforce_pm_color,
+            background: map_input(self.background.as_ref(), matrix),
+            foreground: map_input(self.foreground.as_ref(), matrix),
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         let bg = self
             .background
