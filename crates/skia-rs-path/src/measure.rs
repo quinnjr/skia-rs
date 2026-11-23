@@ -90,6 +90,26 @@ impl PathMeasure {
     /// Position and unit tangent at `distance` along contour `index` alone
     /// (pinned to `[0, contour length]`), like `SkContourMeasure::getPosTan`
     /// on that contour. `None` for a NaN distance or a missing contour.
+    ///
+    /// # Examples
+    /// ```
+    /// use skia_rs_path::{PathBuilder, PathMeasure};
+    ///
+    /// let mut b = PathBuilder::new();
+    /// b.move_to(0.0, 0.0).line_to(10.0, 0.0); // contour 0
+    /// b.move_to(0.0, 5.0).line_to(0.0, 25.0); // contour 1
+    /// let measure = PathMeasure::new(&b.build());
+    ///
+    /// // Distances are measured within the contour, from its start.
+    /// let (pos, tangent) = measure.get_pos_tan_in_contour(1, 5.0).unwrap();
+    /// assert_eq!((pos.x, pos.y), (0.0, 10.0));
+    /// assert_eq!((tangent.x, tangent.y), (0.0, 1.0));
+    ///
+    /// // Past the end is pinned to it; a missing contour is `None`.
+    /// let (end, _) = measure.get_pos_tan_in_contour(0, 99.0).unwrap();
+    /// assert_eq!((end.x, end.y), (10.0, 0.0));
+    /// assert!(measure.get_pos_tan_in_contour(2, 0.0).is_none());
+    /// ```
     #[must_use]
     pub fn get_pos_tan_in_contour(&self, index: usize, distance: Scalar) -> Option<(Point, Point)> {
         let contour = self.contours.get(index)?;
