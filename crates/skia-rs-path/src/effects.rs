@@ -1594,13 +1594,14 @@ impl PathEffect for Path2DEffect {
     ) -> Option<Path> {
         // The stamps are drawn with whatever stroke the record holds, which
         // an earlier effect (a Sum's first child, a Compose's inner effect)
-        // may have set: widen the cull by it (with room for miter joins at
-        // Skia's default limit of 4).
-        let stroke = match *rec {
-            StrokeRec::Stroke(w) | StrokeRec::StrokeAndFill(w) => w * 4.0,
-            StrokeRec::Fill | StrokeRec::Hairline => 1.0,
+        // may have set. Its miter joins reach width/2 * the paint's miter
+        // limit, which this effect cannot see, so a stroked record is not
+        // culled (the point budget still bounds the output). Fills and
+        // hairlines reach at most a pixel past the stamp.
+        let cull = match *rec {
+            StrokeRec::Stroke(_) | StrokeRec::StrokeAndFill(_) => None,
+            StrokeRec::Fill | StrokeRec::Hairline => cull.map(|c| c.inset(-1.0, -1.0)),
         };
-        let cull = cull.map(|c| c.inset(-stroke, -stroke));
         self.tile(path, cull.as_ref())
     }
 
@@ -2512,14 +2513,16 @@ mod tests {
     #[test]
     fn path2d_cull_accounts_for_a_stroke_set_by_an_earlier_effect() {
         // In a Sum, Line2D sets the record to Stroke(20) before Path2D runs:
-        // a stamp just outside the cull still shows its stroke inside it.
+        // a stamp outside the cull can still show its stroke (and miter
+        // spikes, at the paint's unknown limit) inside it, so nothing is
+        // culled. A stamp 200 units right of the cull survives.
         let line: PathEffectRef =
             Arc::new(Line2DEffect::new(20.0, skia_rs_core::Matrix::scale(50.0, 50.0)).unwrap());
         let tile: PathEffectRef = Arc::new(
             Path2DEffect::new(skia_rs_core::Matrix::scale(4.0, 4.0), square(1.0)).unwrap(),
         );
         let sum = SumEffect::new(line, tile.clone());
-        let source = square(200.0);
+        let source = square(400.0);
         let cull = skia_rs_core::Rect::new(0.0, 0.0, 100.0, 100.0);
         let mut rec = StrokeRec::Fill;
         let culled = sum
@@ -2528,6 +2531,9 @@ mod tests {
         // 4-unit cells: the cull's one-cell margin ends near x = 102, but a
         // stamp at x = 106..110 still shows its 20-wide stroke inside.
         assert!(culled.points().iter().any(|p| p.x > 105.0 && p.x < 111.0));
+        // x = 302 is a 4-unit cell center, where only stamps (never the
+        // Line2D hatch, whose ends sit at odd multiples of 25) have points.
+        assert!(culled.points().iter().any(|p| (p.x - 302.0).abs() < 0.01));
     }
 
     #[test]
