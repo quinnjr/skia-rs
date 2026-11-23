@@ -1274,6 +1274,66 @@ const MAX_PATH1D_POINTS: usize = 4_194_304;
 /// exceeding it fails the effect.
 const MAX_REASONABLE_ITERATIONS: u32 = 100_000;
 
+/// `SkPath1DPathEffect`'s `morphpath`: bend `stamp` along contour `contour`
+/// starting at `start_distance`. Each point `(sx, sy)` moves to the contour
+/// point at `start_distance + sx`, offset by `sy` along the normal there (`morphpoints`); lines
+/// become quads through their midpoint so they can bend.
+fn morph_stamp(
+    dst: &mut PathBuilder,
+    stamp: &Path,
+    measure: &crate::PathMeasure,
+    contour: usize,
+    start_distance: Scalar,
+) {
+    let morph = |p: Point| {
+        let (pos, tangent) = measure.get_pos_tan_in_contour(contour, start_distance + p.x)?;
+        // The normal offset: tangent rotated a quarter turn, scaled by y.
+        let (nx, ny) = (-tangent.y * p.y, tangent.x * p.y);
+        Some(Point::new(pos.x + nx, pos.y + ny))
+    };
+    let mut current = Point::zero();
+    let mut start = Point::zero();
+    for element in stamp {
+        match element {
+            PathElement::Move(p) => {
+                if let Some(q) = morph(p) {
+                    dst.move_to(q.x, q.y);
+                }
+                (current, start) = (p, p);
+            }
+            PathElement::Line(p) => {
+                let mid = Point::new(f32::midpoint(current.x, p.x), f32::midpoint(current.y, p.y));
+                if let (Some(c), Some(e)) = (morph(mid), morph(p)) {
+                    dst.quad_to(c.x, c.y, e.x, e.y);
+                }
+                current = p;
+            }
+            PathElement::Quad(c, p) => {
+                if let (Some(c), Some(e)) = (morph(c), morph(p)) {
+                    dst.quad_to(c.x, c.y, e.x, e.y);
+                }
+                current = p;
+            }
+            PathElement::Conic(c, p, w) => {
+                if let (Some(c), Some(e)) = (morph(c), morph(p)) {
+                    dst.conic_to(c.x, c.y, e.x, e.y, w);
+                }
+                current = p;
+            }
+            PathElement::Cubic(c1, c2, p) => {
+                if let (Some(a), Some(b), Some(e)) = (morph(c1), morph(c2), morph(p)) {
+                    dst.cubic_to(a.x, a.y, b.x, b.y, e.x, e.y);
+                }
+                current = p;
+            }
+            PathElement::Close => {
+                dst.close();
+                current = start;
+            }
+        }
+    }
+}
+
 impl PathEffect for Path1DEffect {
     fn filter_path(&self, path: &Path, rec: &mut StrokeRec) -> Option<Path> {
         // SkPath1DPathEffect::onFilterPath: rec->setFillStyle(), then filter.
@@ -1327,7 +1387,9 @@ impl PathEffect for Path1DEffect {
                 }
                 governor -= 1;
                 stamps_left -= 1;
-                if let Some((pos, tangent)) = measure.get_pos_tan_in_contour(i, distance) {
+                if self.style == Path1DStyle::Morph {
+                    morph_stamp(&mut builder, &self.path, &measure, i, distance);
+                } else if let Some((pos, tangent)) = measure.get_pos_tan_in_contour(i, distance) {
                     let transform = match self.style {
                         Path1DStyle::Translate => skia_rs_core::Matrix::translate(pos.x, pos.y),
                         Path1DStyle::Rotate | Path1DStyle::Morph => {
@@ -1470,8 +1532,16 @@ impl PathEffect for Path2DEffect {
         rec: &mut StrokeRec,
         cull: Option<&skia_rs_core::Rect>,
     ) -> Option<Path> {
-        let _ = rec;
-        self.tile(path, cull)
+        // The stamps are drawn with whatever stroke the record holds, which
+        // an earlier effect (a Sum's first child, a Compose's inner effect)
+        // may have set: widen the cull by it (with room for miter joins at
+        // Skia's default limit of 4).
+        let stroke = match *rec {
+            StrokeRec::Stroke(w) | StrokeRec::StrokeAndFill(w) => w * 4.0,
+            StrokeRec::Fill | StrokeRec::Hairline => 1.0,
+        };
+        let cull = cull.map(|c| c.inset(-stroke, -stroke));
+        self.tile(path, cull.as_ref())
     }
 
     fn effect_kind(&self) -> PathEffectKind {
@@ -1753,8 +1823,11 @@ impl Line2DEffect {
     /// - `width`: The width of the lines.
     /// - `matrix`: The matrix defining the line pattern orientation and spacing.
     #[must_use]
+    ///
+    /// Like `SkLine2DPathEffect::Make`, a width of 0 is a hairline hatch and
+    /// a negative or NaN width gives `None`.
     pub fn new(width: Scalar, matrix: skia_rs_core::Matrix) -> Option<Self> {
-        if width <= 0.0 {
+        if width.is_nan() || width < 0.0 {
             return None;
         }
         Some(Self { width, matrix })
@@ -2315,6 +2388,63 @@ mod tests {
         let lines = hatch.filter_path(&b.build(), &mut rec).expect("applies");
         let max_y = lines.points().iter().map(|p| p.y).fold(0.0, Scalar::max);
         assert!(max_y > 990.0, "hatch reaches y = {max_y}");
+    }
+
+    #[test]
+    fn path1d_morph_bends_stamps_along_the_path() {
+        // A straight 10-unit bar morphed along a circle of radius 50 must
+        // follow the circle: its far end lies on the circle (distance 50
+        // from the center), not on the tangent line (sqrt(50^2 + 10^2)).
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0).line_to(10.0, 0.0);
+        let bar = b.build();
+        let mut b = PathBuilder::new();
+        b.add_circle(0.0, 0.0, 50.0);
+        let circle = b.build();
+        let effect = Path1DEffect::new(bar, 1000.0, 0.0, Path1DStyle::Morph).unwrap();
+        let out = effect.apply(&circle).expect("applies");
+        let end = *out.points().last().expect("a stamp");
+        let r = end.x.hypot(end.y);
+        assert!((r - 50.0).abs() < 0.5, "end at radius {r}");
+        assert!(
+            out.iter().any(|e| matches!(e, PathElement::Quad(..))),
+            "lines become quads"
+        );
+    }
+
+    #[test]
+    fn line2d_width_validation_matches_skia() {
+        let m = skia_rs_core::Matrix::scale(4.0, 4.0);
+        assert!(Line2DEffect::new(Scalar::NAN, m).is_none());
+        assert!(Line2DEffect::new(-1.0, m).is_none());
+        // Width 0 is a hairline hatch.
+        let hairline = Line2DEffect::new(0.0, m).expect("hairline hatch");
+        let mut rec = StrokeRec::Fill;
+        hairline
+            .filter_path(&square(40.0), &mut rec)
+            .expect("applies");
+        assert_eq!(rec, StrokeRec::Hairline);
+    }
+
+    #[test]
+    fn path2d_cull_accounts_for_a_stroke_set_by_an_earlier_effect() {
+        // In a Sum, Line2D sets the record to Stroke(20) before Path2D runs:
+        // a stamp just outside the cull still shows its stroke inside it.
+        let line: PathEffectRef =
+            Arc::new(Line2DEffect::new(20.0, skia_rs_core::Matrix::scale(50.0, 50.0)).unwrap());
+        let tile: PathEffectRef = Arc::new(
+            Path2DEffect::new(skia_rs_core::Matrix::scale(4.0, 4.0), square(1.0)).unwrap(),
+        );
+        let sum = SumEffect::new(line, tile.clone());
+        let source = square(200.0);
+        let cull = skia_rs_core::Rect::new(0.0, 0.0, 100.0, 100.0);
+        let mut rec = StrokeRec::Fill;
+        let culled = sum
+            .filter_path_culled(&source, &mut rec, Some(&cull))
+            .expect("applies");
+        // 4-unit cells: the cull's one-cell margin ends near x = 102, but a
+        // stamp at x = 106..110 still shows its 20-wide stroke inside.
+        assert!(culled.points().iter().any(|p| p.x > 105.0 && p.x < 111.0));
     }
 
     #[test]
