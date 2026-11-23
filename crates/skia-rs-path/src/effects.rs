@@ -307,40 +307,42 @@ impl DashEffect {
         remaining_in_interval: &mut Scalar,
     ) {
         let segment_length = from.distance(&to);
-        // A non-finite length would never advance `t` (apply rejects such
-        // paths first; this keeps the loop safe on its own).
+        // A non-finite length would never finish the walk (apply rejects
+        // such paths first; this keeps the loop safe on its own).
         if !(segment_length.is_finite() && segment_length > 0.0) {
             return;
         }
-        let mut t = 0.0;
+        // Walk by distance along the segment, as SkDashPath does. (Stepping
+        // a parametric t by interval / length loses tiny intervals once t is
+        // near 1.) apply bounds the dash count, so each full interval cycle
+        // still moves `pos` forward in f32.
+        let point_at = |d: Scalar| {
+            let t = d / segment_length;
+            Point::new(
+                (to.x - from.x).mul_add(t, from.x),
+                (to.y - from.y).mul_add(t, from.y),
+            )
+        };
+        let mut pos: Scalar = 0.0;
         loop {
-            if t >= 1.0 {
-                break;
-            }
-            let remaining_segment = segment_length * (1.0 - t);
-
+            let remaining_segment = segment_length - pos;
             if *remaining_in_interval >= remaining_segment {
                 if *is_on {
                     builder.line_to(to.x, to.y);
                 }
                 *remaining_in_interval -= remaining_segment;
-                t = 1.0;
-            } else {
-                let dt = *remaining_in_interval / segment_length;
-                let mid = Point::new(
-                    (to.x - from.x).mul_add(t + dt, from.x),
-                    (to.y - from.y).mul_add(t + dt, from.y),
-                );
-                if *is_on {
-                    builder.line_to(mid.x, mid.y);
-                }
-                *interval_idx = (*interval_idx + 1) % self.intervals.len();
-                *is_on = (*interval_idx).is_multiple_of(2);
-                *remaining_in_interval = self.intervals[*interval_idx];
-                if *is_on {
-                    builder.move_to(mid.x, mid.y);
-                }
-                t += dt;
+                return;
+            }
+            pos += *remaining_in_interval;
+            let mid = point_at(pos);
+            if *is_on {
+                builder.line_to(mid.x, mid.y);
+            }
+            *interval_idx = (*interval_idx + 1) % self.intervals.len();
+            *is_on = (*interval_idx).is_multiple_of(2);
+            *remaining_in_interval = self.intervals[*interval_idx];
+            if *is_on {
+                builder.move_to(mid.x, mid.y);
             }
         }
     }
@@ -1399,7 +1401,16 @@ impl PathEffect for Path1DEffect {
                 distance += self.advance;
             }
         }
-        let stamp_points = self.path.points().len().max(1);
+        // Morph turns each stamp line into a quad (one extra control point).
+        let morph_extra = if self.style == Path1DStyle::Morph {
+            self.path
+                .iter()
+                .filter(|e| matches!(e, PathElement::Line(_)))
+                .count()
+        } else {
+            0
+        };
+        let stamp_points = (self.path.points().len() + morph_extra).max(1);
         let mut stamps_left = (MAX_PATH1D_POINTS / stamp_points).max(1);
 
         // Sk1DPathEffect::onFilterPath: each contour restarts at the phase,
@@ -2525,6 +2536,32 @@ mod tests {
             .expect("applies");
         let full = hatch.filter_path(&source, &mut b).expect("applies");
         assert_eq!(culled.points(), full.points());
+    }
+
+    #[test]
+    fn morph_stamps_respect_the_point_budget() {
+        // A 4-line square morphed costs 9 points per stamp, not 5.
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0)
+            .line_to(0.1, 0.0)
+            .line_to(0.1, 0.1)
+            .line_to(0.0, 0.1)
+            .line_to(0.0, 0.0);
+        let effect = Path1DEffect::new(b.build(), 0.12, 0.0, Path1DStyle::Morph).unwrap();
+        // Six contours of ~91,700 stamps each (under Skia's 100,000 per
+        // contour): ~550k stamps, over the budget at 9 points per stamp
+        // (~466k) but not at the 5 the budget used to assume (~839k).
+        let mut b = PathBuilder::new();
+        for i in 0..6 {
+            let y = scalar_from_i32(i) * 10.0;
+            b.move_to(0.0, y).line_to(11_000.0, y);
+        }
+        let out = effect.apply(&b.build()).expect("applies");
+        assert!(
+            out.points().len() <= MAX_PATH1D_POINTS + 9,
+            "{}",
+            out.points().len()
+        );
     }
 
     #[test]
