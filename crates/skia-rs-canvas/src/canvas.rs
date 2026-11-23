@@ -1479,9 +1479,16 @@ impl<'a> Canvas<'a> {
         // paint wraps the playback in an implicit saveLayer(bounds, paint),
         // with the cull rect mapped through `matrix` (the layer is made
         // before the matrix is concatenated); otherwise a plain save.
+        let cull = picture.cull_rect();
+        let bounds = matrix.map_or(cull, |m| m.map_rect(&cull));
+        // onDrawPicture quick-rejects the mapped cull: a known cull that the
+        // matrix collapses (e.g. a zero scale) draws nothing. An empty cull
+        // means "unknown" here (the C API records one when no bounds are
+        // given), so it is drawn.
+        if !cull.is_empty() && bounds.is_empty() {
+            return;
+        }
         let restore_count = if let Some(p) = paint {
-            let cull = picture.cull_rect();
-            let bounds = matrix.map_or(cull, |m| m.map_rect(&cull));
             let rec = SaveLayerRec {
                 bounds: if bounds.is_empty() {
                     None

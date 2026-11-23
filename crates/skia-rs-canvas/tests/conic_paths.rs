@@ -2104,3 +2104,30 @@ fn layer_hints_under_perspective_are_clipped_to_the_w_plane() {
     }
     assert!(lit(&buffer, 100, 100), "the layer content is drawn");
 }
+
+#[test]
+fn pictures_collapsed_by_their_matrix_draw_nothing() {
+    // SkCanvas::onDrawPicture quick-rejects the mapped cull: under
+    // scale(0, 1) the picture draws nothing, with or without a paint.
+    use skia_rs_canvas::Picture;
+    use skia_rs_core::Matrix;
+
+    // draw_paint fills the clip whatever the matrix, so it shows whether
+    // the picture was rejected.
+    let mut cmds = Vec::new();
+    Canvas::new_recording(&mut cmds, SIZE, SIZE).draw_paint(&white(Style::Fill));
+    let picture = Picture::from_parts(cmds, Rect::from_xywh(0.0, 0.0, 50.0, 50.0));
+
+    for paint in [None, Some(Paint::new())] {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            canvas.draw_picture(&picture, Some(&Matrix::scale(0.0, 1.0)), paint.as_ref());
+        }
+        assert!(
+            !lit(&buffer, 100, 100),
+            "nothing drawn (paint: {})",
+            paint.is_some()
+        );
+    }
+}
