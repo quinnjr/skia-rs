@@ -1096,6 +1096,7 @@ impl<'a> Rasterizer<'a> {
             && m.skew_y() == 0.0
             && (m.scale_x().abs() - m.scale_y().abs()).abs() <= 1e-6;
         let needs_path = !uniform
+            || m.has_perspective()
             || (paint.style() != Style::Fill && paint.stroke_width() > 0.0)
             || paint.style() == Style::StrokeAndFill;
         if needs_path {

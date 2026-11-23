@@ -962,3 +962,31 @@ fn hairline_draw_line_ignores_caps_like_skia_draw_points() {
     assert!(lit(&buffer, 10, 10) && lit(&buffer, 19, 10));
     assert!(!lit(&buffer, 20, 10), "no cap extension for draw_line");
 }
+
+#[test]
+fn circles_under_perspective_match_their_path() {
+    // A circle under a perspective CTM is a projected ellipse: draw_circle
+    // must agree with drawing the same circle as a path.
+    use skia_rs_core::{Matrix, Point};
+
+    let perspective = Matrix {
+        values: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.004, 0.0, 1.0],
+    };
+    let render = |as_path: bool| {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.concat(&perspective);
+        if as_path {
+            let mut b = PathBuilder::new();
+            b.add_circle(100.0, 100.0, 40.0);
+            canvas.draw_path(&b.build(), &white(Style::Fill));
+        } else {
+            canvas.draw_circle(Point::new(100.0, 100.0), 40.0, &white(Style::Fill));
+        }
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .filter(|&(x, y)| lit(&buffer, x, y))
+            .count()
+    };
+    assert_eq!(render(false), render(true));
+}
