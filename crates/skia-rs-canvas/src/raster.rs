@@ -1494,6 +1494,11 @@ impl<'a> Rasterizer<'a> {
     /// Fill a path, routing anti-aliased paints through [`fill_path_aa`]
     /// (`paint.isAntiAlias()` selects the AA blitter in `SkDraw::drawPath`).
     fn fill_path(&mut self, path: &Path, paint: &Paint) {
+        // SkPathPriv::PerspectiveClip: under perspective, geometry at or
+        // behind the w = 0 plane maps to flipped or non-finite points, so the
+        // path is first clipped to w > kW0PlaneDistance in local space.
+        let clipped = perspective_clip(path, &self.matrix);
+        let path = clipped.as_ref().unwrap_or(path);
         if paint.is_anti_alias() {
             self.fill_path_aa(path, paint);
         } else {
@@ -2106,6 +2111,187 @@ fn flatten_curve_device_error(
             stack[len + 1] = (t0, tm, depth + 1);
             len += 2;
         }
+    }
+}
+
+/// Skia's `SkPathPriv::kW0PlaneDistance`: perspective geometry is clipped
+/// to `w > 1/16384`.
+const W0_PLANE_DISTANCE: Scalar = 1.0 / 16384.0;
+
+/// Segments a curve crossing the w plane is split into before clipping.
+const PERSPECTIVE_CLIP_STEPS: u16 = 32;
+
+/// Port of `SkPathPriv::PerspectiveClip` for fills: `None` when `matrix` has
+/// no perspective or the whole path is in front of the `w = 1/16384` plane;
+/// otherwise the path clipped to that half-plane in local space (empty when
+/// it lies entirely behind). Every contour is treated as closed (a fill) and
+/// clipped Sutherland-Hodgman style; curves wholly in front of the plane
+/// are kept exactly, and curves that cross it are flattened first (Skia's
+/// edge clipper chops them exactly).
+fn perspective_clip(path: &Path, matrix: &Matrix) -> Option<Path> {
+    if !matrix.has_perspective() {
+        return None;
+    }
+    let [.., persp_x, persp_y, persp_w] = matrix.values;
+    let plane_offset = persp_w - W0_PLANE_DISTANCE;
+    let w = |p: Point| persp_x * p.x + persp_y * p.y + plane_offset;
+    let bounds = path.bounds();
+    let corners = [
+        Point::new(bounds.left, bounds.top),
+        Point::new(bounds.right, bounds.top),
+        Point::new(bounds.left, bounds.bottom),
+        Point::new(bounds.right, bounds.bottom),
+    ];
+    let in_front = corners.iter().filter(|p| w(**p) > 0.0).count();
+    if in_front == corners.len() {
+        return None;
+    }
+    let mut out = PathBuilder::new();
+    out.fill_type(path.fill_type());
+    if in_front == 0 {
+        return Some(out.build());
+    }
+
+    let mut clipper = PlaneClipper {
+        out: &mut out,
+        w: &w,
+        started: false,
+    };
+    let (mut start, mut current) = (Point::zero(), Point::zero());
+    for element in path {
+        match element {
+            PathElement::Move(p) => {
+                clipper.close_contour(current, start);
+                (start, current) = (p, p);
+                clipper.begin(p);
+            }
+            PathElement::Line(p) => {
+                clipper.line(current, p);
+                current = p;
+            }
+            PathElement::Quad(c1, p) => {
+                let s0 = current;
+                clipper.curve(
+                    &[s0, c1, p],
+                    |t| quad_point(t, 1.0 - t, s0, c1, p),
+                    |o| {
+                        o.quad_to(c1.x, c1.y, p.x, p.y);
+                    },
+                );
+                current = p;
+            }
+            PathElement::Conic(c1, p, weight) => {
+                let s0 = current;
+                clipper.curve(
+                    &[s0, c1, p],
+                    |t| conic_point(s0, c1, p, weight, t),
+                    |o| {
+                        o.conic_to(c1.x, c1.y, p.x, p.y, weight);
+                    },
+                );
+                current = p;
+            }
+            PathElement::Cubic(c1, c2, p) => {
+                let s0 = current;
+                clipper.curve(
+                    &[s0, c1, c2, p],
+                    |t| cubic_point(t, 1.0 - t, s0, c1, c2, p),
+                    |o| {
+                        o.cubic_to(c1.x, c1.y, c2.x, c2.y, p.x, p.y);
+                    },
+                );
+                current = p;
+            }
+            PathElement::Close => {
+                clipper.close_contour(current, start);
+                current = start;
+                clipper.begin(start);
+            }
+        }
+    }
+    clipper.close_contour(current, start);
+    Some(out.build())
+}
+
+/// Sutherland-Hodgman clipping of closed contours against `w(p) > 0`.
+struct PlaneClipper<'a, W: Fn(Point) -> Scalar> {
+    out: &'a mut PathBuilder,
+    w: &'a W,
+    /// Whether the current output contour has its `move_to` yet.
+    started: bool,
+}
+
+impl<W: Fn(Point) -> Scalar> PlaneClipper<'_, W> {
+    fn begin(&mut self, p: Point) {
+        self.started = false;
+        if (self.w)(p) > 0.0 {
+            self.emit(p);
+        }
+    }
+
+    fn emit(&mut self, p: Point) {
+        if self.started {
+            self.out.line_to(p.x, p.y);
+        } else {
+            self.out.move_to(p.x, p.y);
+            self.started = true;
+        }
+    }
+
+    /// The point on `a`-`b` where `w` crosses zero.
+    fn crossing(&self, a: Point, b: Point) -> Point {
+        let (wa, wb) = ((self.w)(a), (self.w)(b));
+        let t = wa / (wa - wb);
+        Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+    }
+
+    fn line(&mut self, a: Point, b: Point) {
+        let (ia, ib) = ((self.w)(a) > 0.0, (self.w)(b) > 0.0);
+        match (ia, ib) {
+            (true, true) => self.emit(b),
+            (true, false) => {
+                let i = self.crossing(a, b);
+                self.emit(i);
+            }
+            (false, true) => {
+                let i = self.crossing(a, b);
+                self.emit(i);
+                self.emit(b);
+            }
+            (false, false) => {}
+        }
+    }
+
+    /// A curve with control polygon `points` (first = current point): kept
+    /// verbatim (via `keep`) when every control point is in front of the
+    /// plane (the curve lies in their hull), else flattened and clipped.
+    fn curve(
+        &mut self,
+        points: &[Point],
+        eval: impl Fn(Scalar) -> Point,
+        keep: impl FnOnce(&mut PathBuilder),
+    ) {
+        if self.started && points.iter().all(|p| (self.w)(*p) > 0.0) {
+            keep(self.out);
+            return;
+        }
+        let mut prev = points[0];
+        for i in 1..=PERSPECTIVE_CLIP_STEPS {
+            let t = Scalar::from(i) / Scalar::from(PERSPECTIVE_CLIP_STEPS);
+            let next = eval(t);
+            self.line(prev, next);
+            prev = next;
+        }
+    }
+
+    fn close_contour(&mut self, current: Point, start: Point) {
+        if current != start {
+            self.line(current, start);
+        }
+        if self.started {
+            self.out.close();
+        }
+        self.started = false;
     }
 }
 

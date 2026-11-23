@@ -1159,3 +1159,33 @@ fn reversed_oval_rects_are_sorted_for_every_draw() {
     assert!(sorted.iter().any(|&v| v > 0));
     assert_eq!(render(Rect::new(40.0, 40.0, 0.0, 0.0)), sorted);
 }
+
+#[test]
+fn fills_crossing_the_perspective_horizon_are_clipped_to_it() {
+    // w = 1 - x/100: the horizon is at local x = 100. A circle at x 50..150
+    // is half behind it. The visible half maps to device x >= 100; the part
+    // behind must not smear a flipped wedge into device x < 100.
+    use skia_rs_core::{Matrix, Point};
+
+    let perspective = Matrix {
+        values: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, -0.01, 0.0, 1.0],
+    };
+    for anti_alias in [false, true] {
+        let mut paint = white(Style::Fill);
+        paint.set_anti_alias(anti_alias);
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.concat(&perspective);
+        canvas.draw_circle(Point::new(100.0, 100.0), 50.0, &paint);
+        for y in 0..SIZE {
+            for x in 0..95 {
+                assert!(
+                    !lit(&buffer, x, y),
+                    "aa={anti_alias}: no wedge at ({x}, {y})"
+                );
+            }
+        }
+        let visible = (0..SIZE).any(|y| (105..SIZE).any(|x| lit(&buffer, x, y)));
+        assert!(visible, "aa={anti_alias}: the front half is drawn");
+    }
+}
