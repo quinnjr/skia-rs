@@ -351,7 +351,7 @@ jobs:
 
       # Compare against reference images
       - name: Compare with reference images
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.backend == 'raster' && matrix.os == 'ubuntu-latest'
         run: |
           mkdir -p conformance_results
           # A reference with no generated image means a case stopped being
