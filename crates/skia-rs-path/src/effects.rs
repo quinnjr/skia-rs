@@ -1593,9 +1593,19 @@ impl PathEffect for Path1DEffect {
         // Decide that first, so the point budget below never turns Skia's
         // failure into a truncated success.
         // Count by stepping `distance` exactly as the walk below (and Skia)
-        // does, so rounding cannot make the two disagree at the limit.
+        // does, so rounding cannot make the two disagree at the limit; a
+        // direct estimate settles every contour that is clearly under or
+        // over it without stepping.
+        let limit = scalar_from_i32(i32::try_from(MAX_REASONABLE_ITERATIONS).unwrap_or(i32::MAX));
         for i in 0..measure.contour_count() {
             let length = measure.contour_length(i).unwrap_or(0.0);
+            let estimate = ((length - self.initial_offset) / self.advance).ceil();
+            if !estimate.is_finite() || estimate > limit + 2.0 {
+                return None;
+            }
+            if estimate < limit - 2.0 {
+                continue;
+            }
             let mut distance = self.initial_offset;
             let mut stamps = 0_u32;
             loop {
