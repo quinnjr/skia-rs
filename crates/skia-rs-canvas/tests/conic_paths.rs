@@ -2247,3 +2247,22 @@ fn pictures_under_a_perspective_matrix_are_not_wrongly_rejected() {
     let drawn = (0..SIZE).any(|y| (0..SIZE).any(|x| lit(&buffer, x, y)));
     assert!(drawn, "the picture's in-front part is drawn");
 }
+
+#[test]
+fn closed_two_point_contours_stroke_as_a_line() {
+    // M L Z folds back on itself: Skia strokes it as a thick line (joins at
+    // both ends); the offset rings must not cancel.
+    use skia_rs_paint::StrokeJoin;
+
+    for join in [StrokeJoin::Miter, StrokeJoin::Bevel, StrokeJoin::Round] {
+        let mut b = PathBuilder::new();
+        b.move_to(10.0, 10.0).line_to(90.0, 90.0).close();
+        let mut paint = white(Style::Stroke);
+        paint.set_stroke_width(6.0);
+        paint.set_stroke_join(join);
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        Canvas::new_raster(&mut buffer).draw_path(&b.build(), &paint);
+        assert!(lit(&buffer, 50, 50), "{join:?}: the line is stroked");
+        assert!(!lit(&buffer, 50, 80), "{join:?}: only along the line");
+    }
+}
