@@ -1306,7 +1306,9 @@ const MAX_REASONABLE_ITERATIONS: u32 = 100_000;
 /// `SkPath1DPathEffect`'s `morphpath`: bend `stamp` along contour `contour`
 /// starting at `start_distance`. Each point `(sx, sy)` moves to the contour
 /// point at `start_distance + sx`, offset by `sy` along the normal there (`morphpoints`); lines
-/// become quads through their midpoint so they can bend.
+/// become quads through their midpoint so they can bend. A point whose
+/// position lookup fails (a NaN distance) drops its verb, as in Skia, where
+/// `morphpoints` returns false and `morphpath` skips the verb.
 fn morph_stamp(
     dst: &mut PathBuilder,
     stamp: &Path,
