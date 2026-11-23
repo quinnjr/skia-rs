@@ -1270,3 +1270,27 @@ fn perspective_clip_paths_follow_the_projected_curve_like_fills() {
         "clip and fill outlines differ at {differing} pixels"
     );
 }
+
+#[test]
+fn points_behind_the_perspective_horizon_draw_nothing() {
+    // w = 1 + y/100: a point at local (-100, -300) has w = -2 and would map
+    // to a mirrored position inside the device, (50, 150).
+    use skia_rs_core::{Matrix, Point};
+
+    let perspective = Matrix {
+        values: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.01, 1.0],
+    };
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.concat(&perspective);
+        canvas.draw_point(Point::new(-100.0, -300.0), &paint);
+    }
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            assert!(!lit(&buffer, x, y), "({x}, {y})");
+        }
+    }
+}

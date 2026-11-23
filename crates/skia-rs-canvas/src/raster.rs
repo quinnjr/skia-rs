@@ -620,6 +620,11 @@ impl<'a> Rasterizer<'a> {
     )]
     pub fn draw_point(&mut self, point: Point, paint: &Paint) {
         use skia_rs_core::cast::floor_to_i32;
+        // Under perspective, a point at or behind the w plane maps to a
+        // flipped position: draw nothing, as for lines (clip_to_w_plane).
+        if clip_to_w_plane(&self.matrix, point, point).is_none() {
+            return;
+        }
         let device = self.matrix.map_point(point);
         // Points off the device (beyond the 1-px AA square) draw nothing,
         // and must not reach the pixel indexing with saturated values.
@@ -2238,6 +2243,7 @@ pub(crate) fn perspective_clip(path: &Path, matrix: &Matrix) -> Option<Path> {
         out: &mut out,
         w: &w,
         started: false,
+        pending: None,
     };
     let (mut start, mut current) = (Point::zero(), Point::zero());
     for element in path {
@@ -2324,17 +2330,30 @@ struct PlaneClipper<'a, W: Fn(Point) -> Scalar> {
     w: &'a W,
     /// Whether the current output contour has its `move_to` yet.
     started: bool,
+    /// The contour's start point, when in front of the plane, emitted with
+    /// the first segment (so a bare move, e.g. after a `Close`, adds no
+    /// empty contour).
+    pending: Option<Point>,
 }
 
 impl<W: Fn(Point) -> Scalar> PlaneClipper<'_, W> {
     fn begin(&mut self, p: Point) {
         self.started = false;
-        if (self.w)(p) > 0.0 {
-            self.emit(p);
+        self.pending = ((self.w)(p) > 0.0).then_some(p);
+    }
+
+    /// Open the output contour at the pending start point, if any.
+    fn flush(&mut self) {
+        if !self.started
+            && let Some(start) = self.pending.take()
+        {
+            self.out.move_to(start.x, start.y);
+            self.started = true;
         }
     }
 
     fn emit(&mut self, p: Point) {
+        self.flush();
         if self.started {
             self.out.line_to(p.x, p.y);
         } else {
@@ -2376,9 +2395,12 @@ impl<W: Fn(Point) -> Scalar> PlaneClipper<'_, W> {
         eval: impl Fn(Scalar) -> Point,
         keep: impl FnOnce(&mut PathBuilder),
     ) {
-        if self.started && points.iter().all(|p| (self.w)(*p) > 0.0) {
-            keep(self.out);
-            return;
+        if points.iter().all(|p| (self.w)(*p) > 0.0) {
+            self.flush();
+            if self.started {
+                keep(self.out);
+                return;
+            }
         }
         let mut prev = points[0];
         for i in 1..=PERSPECTIVE_CLIP_STEPS {
@@ -2397,6 +2419,7 @@ impl<W: Fn(Point) -> Scalar> PlaneClipper<'_, W> {
             self.out.close();
         }
         self.started = false;
+        self.pending = None;
     }
 }
 
@@ -2624,6 +2647,30 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perspective_clip_adds_no_empty_contours() {
+        // Three closed rects straddling the w plane: every output contour
+        // must have segments (no bare move+close left after each Close).
+        let mut b = PathBuilder::new();
+        for i in 0..3_u8 {
+            let x = f32::from(i) * 60.0;
+            b.add_rect(&Rect::new(x, 0.0, x + 50.0, 150.0));
+        }
+        let matrix = Matrix {
+            values: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -0.01, 1.0],
+        };
+        let clipped = perspective_clip(&b.build(), &matrix).expect("straddles the plane");
+        let verbs = clipped.verbs();
+        for pair in verbs.windows(2) {
+            assert!(
+                !(pair[0] == Verb::Move && pair[1] == Verb::Close),
+                "empty contour in {verbs:?}"
+            );
+        }
+        let contours = verbs.iter().filter(|v| **v == Verb::Move).count();
+        assert_eq!(contours, 3);
+    }
 
     #[test]
     fn test_pixel_buffer_new() {
