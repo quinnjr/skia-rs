@@ -239,6 +239,10 @@ jobs:
   conformance:
     name: Conformance (${{ matrix.backend }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # The scripts are POSIX sh; Windows runners default to PowerShell.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
