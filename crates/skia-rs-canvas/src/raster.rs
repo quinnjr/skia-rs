@@ -771,7 +771,9 @@ impl<'a> Rasterizer<'a> {
 
         let dx = x1 - x0;
         let dy = y1 - y0;
-        let gradient = if dx.abs() < 0.0001 { 1.0 } else { dy / dx };
+        // dx >= 0 after the swap; a zero extent is handled by the
+        // single-column branch below.
+        let gradient = if dx > 0.0 { dy / dx } else { 0.0 };
 
         // A segment inside one column along the major axis covers it once,
         // by its length (as Skia's anti-hairline does for sub-pixel

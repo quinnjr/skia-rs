@@ -751,8 +751,13 @@ impl<'a> Canvas<'a> {
     pub fn draw_point(&mut self, pt: Point, paint: &Paint) {
         match &mut self.backing {
             // SkCanvas::drawPoint is drawPoints(kPoints, 1): a positive
-            // stroke width draws a width-sized square or circle.
-            Backing::Raster(_) if paint.stroke_width() > 0.0 => {
+            // stroke width, a path effect or a mask filter draws a
+            // width-sized square or circle.
+            Backing::Raster(_)
+                if paint.stroke_width() > 0.0
+                    || paint.path_effect().is_some()
+                    || paint.mask_filter().is_some() =>
+            {
                 self.draw_points(PointMode::Points, &[pt], paint);
             }
             Backing::Raster(_) => {
@@ -781,8 +786,12 @@ impl<'a> Canvas<'a> {
                 // SkDraw::drawPoints: with a positive stroke width, each
                 // point is a width-sized square (butt/square cap) or circle
                 // (round cap). Width 0 stays a hairline point.
+                // The hairline fast path (PtProcRec) only applies without a
+                // path effect or mask filter; otherwise Skia fills a
+                // width-sized square or circle per point, which is empty
+                // (draws nothing) at width 0.
                 let width = paint.stroke_width();
-                if width <= 0.0 {
+                if width <= 0.0 && paint.path_effect().is_none() && paint.mask_filter().is_none() {
                     for &p in points {
                         self.draw_point(p, paint);
                     }

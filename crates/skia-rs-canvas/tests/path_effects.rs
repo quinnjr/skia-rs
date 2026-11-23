@@ -466,3 +466,34 @@ fn empty_round_rects_keep_add_rrect_start_point() {
     };
     assert_eq!(render(true), render(false));
 }
+
+#[test]
+fn hairline_points_with_a_path_effect_draw_nothing_like_skia() {
+    // SkDraw::drawPoints skips the hairline fast path with a path effect
+    // and fills a width-sized square per point: empty at width 0.
+    use skia_rs_canvas::PointMode;
+
+    let mut paint = Paint::new();
+    paint.set_color32(Color::WHITE);
+    paint.set_style(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    paint.set_path_effect(Some(Arc::new(
+        DashEffect::new(vec![2.0, 2.0], 0.0).unwrap(),
+    )));
+    let mut buffer = PixelBuffer::new(32, 32);
+    let mut canvas = Canvas::new_raster(&mut buffer);
+    canvas.draw_points(
+        PointMode::Points,
+        &[Point::new(5.5, 5.5), Point::new(20.5, 20.5)],
+        &paint,
+    );
+    canvas.draw_point(Point::new(10.5, 10.5), &paint);
+    for y in 0..32 {
+        for x in 0..32 {
+            assert!(
+                buffer.get_pixel(x, y).is_none_or(|c| c.red() == 0),
+                "({x}, {y})"
+            );
+        }
+    }
+}
