@@ -338,19 +338,34 @@ impl Typeface {
     /// [`from_data`](Self::from_data)). Like Skia's default typeface (set
     /// up once with `SkOnce`), the lookup runs once per process whether it
     /// finds a font or not, so a font-less environment does not re-probe the
-    /// candidate paths on every call.
+    /// candidate paths on every call. A miss is remembered only when every
+    /// candidate is missing or not a font; after any other read error (too
+    /// many open files, a permission race, a slow mount) the next call tries
+    /// again.
     #[must_use]
     pub fn system_default() -> Option<Self> {
-        // The lookup (hit or miss) runs once; every call shares the result.
+        // A hit, or a definite miss, is cached; every call shares it.
         static TYPEFACE: OnceLock<Option<Typeface>> = OnceLock::new();
 
-        TYPEFACE
-            .get_or_init(|| {
-                system_default_font_candidates()
-                    .into_iter()
-                    .find_map(|path| Self::from_data(std::fs::read(path).ok()?))
-            })
-            .clone()
+        if let Some(cached) = TYPEFACE.get() {
+            return cached.clone();
+        }
+        let mut transient_error = false;
+        let found =
+            system_default_font_candidates()
+                .into_iter()
+                .find_map(|path| match std::fs::read(path) {
+                    Ok(data) => Self::from_data(data),
+                    Err(e) => {
+                        transient_error |= e.kind() != std::io::ErrorKind::NotFound;
+                        None
+                    }
+                });
+        if found.is_none() && transient_error {
+            return None;
+        }
+        // If two threads look up concurrently, the first result is kept.
+        TYPEFACE.get_or_init(|| found).clone()
     }
 
     /// Create a typeface from font data.

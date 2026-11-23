@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Typeface::system_default()` looks for a system font once per process,
   like Skia's default typeface, and also remembers a miss: if no font was
   found on the first call, later calls return `None` without re-probing,
-  even if fonts are installed afterwards.
+  even if fonts are installed afterwards. (A read error other than a
+  missing file is not remembered: the next call tries again.)
 - `StrokeRec::set_stroke_style` maps a NaN or infinite width to `Fill`
   (Skia keeps an infinite width as a stroke), so a `Stroke` width is
   always finite and positive.
