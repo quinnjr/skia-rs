@@ -3019,6 +3019,11 @@ impl Canvas<'_> {
             let raw = |a: Point, b: Point| (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x);
             if first(a, b) { raw(a, b) } else { -raw(b, a) }
         };
+        // Every weight shares this one divisor, so a pixel passes only where
+        // all three edge values have its sign: the triangle if the sign is
+        // right, and nowhere if rounding flipped it (the three opposite
+        // half-planes of a triangle never overlap). So a sliver cannot leak
+        // pixels outside itself.
         let denom = edge(p1, p2, p0.x, p0.y);
         // Degenerate, or non-finite (NaN weights would pass every inside
         // test and fill the whole box; Skia draws nothing).
