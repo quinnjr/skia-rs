@@ -502,6 +502,19 @@ impl<'a> Canvas<'a> {
         });
         let content = hinted.and_then(|r| r.intersect(&limit));
         let round = |r: Option<Rect>| r.map_or_else(|| IRect::new(0, 0, 0, 0), |r| r.round_out());
+        // A filter (or the paint's color filter) that makes transparent black
+        // visible covers the whole clip, as Skia's drawDeviceMustFillClip /
+        // affectsTransparentBlack: the buffer must cover it.
+        let fills_clip = filter
+            .as_ref()
+            .is_some_and(|f| f.affects_transparent_black())
+            || rec.paint.and_then(Paint::color_filter).is_some_and(|cf| {
+                skia_rs_paint::color_filter_affects_transparent_black(cf.as_ref())
+            });
+        if fills_clip {
+            let buffer = content.map_or(output_clip, |c| c.union(&output_clip));
+            return (round(Some(buffer)), round(content));
+        }
         // The filtered result of the content may reach past the hint, up to
         // the clip; the in-place filter needs room for it.
         let buffer = match (content, &filter) {
@@ -3225,6 +3238,10 @@ fn filtered_layer_area(
     device: &Rect,
     device_full: &Rect,
 ) -> Rect {
+    // Nothing is visible through an empty clip: no layer area.
+    if clip.is_empty() {
+        return clip;
+    }
     let needed = clip.union(&filter.input_bounds(&clip));
     let area = needed.width() * needed.height();
     let budget = 9.0 * device.width().max(1.0) * device.height().max(1.0);
@@ -3547,6 +3564,16 @@ mod tests {
                 .any(|c| matches!(c, DrawCommand::DrawRect { .. })),
             "{cmds:?}"
         );
+    }
+
+    #[test]
+    fn filtered_layers_under_an_empty_clip_have_no_area() {
+        let empty = super::Rect::new(0.0, 0.0, 0.0, 0.0);
+        let device = super::Rect::new(0.0, 0.0, 100.0, 100.0);
+        let blur =
+            skia_rs_paint::BlurImageFilter::new(100.0, 100.0, skia_rs_paint::TileMode::Decal);
+        let area = super::filtered_layer_area(&blur, empty, &device, &device);
+        assert!(area.is_empty(), "{area:?}");
     }
 
     #[test]

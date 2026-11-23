@@ -2021,3 +2021,38 @@ fn draw_picture_maps_its_layer_bounds_through_the_matrix() {
         "half-alpha picture at its new place, got {a}"
     );
 }
+
+#[test]
+fn layer_color_filters_that_add_alpha_fill_the_clip() {
+    // A layer paint whose color filter makes transparent black visible
+    // floods the whole clip on restore (Skia's drawDeviceMustFillClip), even
+    // with a small bounds hint and nothing drawn.
+    use skia_rs_canvas::SaveLayerRec;
+    use skia_rs_paint::ColorMatrixFilter;
+    use std::sync::Arc;
+
+    let mut matrix = [0.0; 20];
+    for i in 0..4 {
+        matrix[i * 5 + i] = 1.0;
+    }
+    matrix[4] = 1.0; // red bias
+    matrix[19] = 1.0; // alpha bias
+    let mut layer_paint = Paint::new();
+    layer_paint.set_color_filter(Some(Arc::new(ColorMatrixFilter::new(matrix))));
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.save_layer(&SaveLayerRec {
+            bounds: Some(&Rect::new(10.0, 10.0, 20.0, 20.0)),
+            paint: Some(&layer_paint),
+            ..SaveLayerRec::default()
+        });
+        canvas.restore();
+    }
+    let c = buffer.get_pixel(100, 100).unwrap_or(Color::BLACK);
+    assert_eq!(
+        (c.alpha(), c.red()),
+        (255, 255),
+        "the clip is flooded: {c:?}"
+    );
+}
