@@ -319,6 +319,9 @@ impl DashEffect {
         if source.is_rect().is_none() || !source.is_closed() {
             return culled;
         }
+        // `startPhase` in InternalFilter is SkDashImpl::fPhase: the adjusted
+        // phase CalcDashParameters returns (not fInitialDashLength), as
+        // SkDashImpl::onFilterPath passes it.
         let (start_phase, index, _) = self.dash_parameters();
         if !index.is_multiple_of(2) {
             return culled;

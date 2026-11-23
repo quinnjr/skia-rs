@@ -332,7 +332,9 @@ jobs:
       - name: Build (${{ matrix.backend }})
         run: cargo build --workspace --features "${{ matrix.features }}"
 
-      # Run conformance tests for this backend
+      # Run conformance tests for this backend. This is the gate: the raster
+      # conformance test fails the job when any case exceeds MAX_RMSE
+      # (0.01), on every OS (the tolerance is meant to hold across platforms).
       - name: Run conformance tests (${{ matrix.backend }})
         run: cargo test --workspace --features "${{ matrix.features }}" -- --test-threads=1 conformance
         env:
@@ -349,7 +351,8 @@ jobs:
         if: matrix.backend == 'raster'
         run: cargo run -p skia-rs-safe --example conformance_gen -- --backend raster --output-dir conformance_output
 
-      # Compare against reference images
+      # Compare against reference images with ImageMagick, for the summary
+      # report only (informational: the conformance test above gates).
       - name: Compare with reference images
         if: matrix.backend == 'raster' && matrix.os == 'ubuntu-latest'
         run: |
