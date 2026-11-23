@@ -2564,10 +2564,20 @@ impl Canvas<'_> {
 
                 // Map the device pixel center back to local space and check
                 // quad membership there (exact under rotation).
-                let local = inverse.map_point(Point::new(
-                    scalar_from_i32(dst_x) + 0.5,
-                    scalar_from_i32(dst_y) + 0.5,
-                ));
+                let center = Point::new(scalar_from_i32(dst_x) + 0.5, scalar_from_i32(dst_y) + 0.5);
+                // A center on the horizon (inverse w of 0) has no local point;
+                // map_point would report (0, 0).
+                if has_perspective {
+                    let inverse_w = inverse.values[Matrix::PERSP_0].mul_add(
+                        center.x,
+                        inverse.values[Matrix::PERSP_1]
+                            .mul_add(center.y, inverse.values[Matrix::PERSP_2]),
+                    );
+                    if inverse_w == 0.0 || !inverse_w.is_finite() {
+                        continue;
+                    }
+                }
+                let local = inverse.map_point(center);
                 if local.x < dst.left
                     || local.x >= dst.right
                     || local.y < dst.top
@@ -5322,6 +5332,38 @@ mod tests {
             0,
             "vertices must be clipped per pixel"
         );
+    }
+
+    #[cfg(feature = "codec")]
+    #[test]
+    fn image_pixels_on_the_horizon_are_not_drawn() {
+        // w = 2x + 1: device column 0's centers (x = 0.5) lie exactly on the
+        // horizon, which no local point maps to; nothing on screen is a
+        // real image pixel here.
+        let info = skia_rs_codec::ImageInfo::new(
+            4,
+            4,
+            skia_rs_core::ColorType::Rgba8888,
+            skia_rs_core::AlphaType::Premul,
+        );
+        let image =
+            skia_rs_codec::Image::from_raster_data_owned(info, vec![255u8; 64], 16).unwrap();
+        let mut matrix = Matrix::IDENTITY;
+        matrix.values[Matrix::PERSP_0] = 2.0;
+        let mut buffer = PixelBuffer::new(20, 20);
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.set_matrix(&matrix);
+        canvas.draw_image_rect(&image, None, &Rect::new(-1.0, -1.0, 100.0, 100.0), None);
+        drop(canvas);
+        for y in 0..20 {
+            for x in 0..20 {
+                assert_eq!(
+                    buffer.get_pixel(x, y).map_or(0, |c| c.alpha()),
+                    0,
+                    "({x}, {y})"
+                );
+            }
+        }
     }
 
     #[test]
