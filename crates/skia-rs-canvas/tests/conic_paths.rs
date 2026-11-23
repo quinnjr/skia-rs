@@ -2280,3 +2280,58 @@ fn negative_size_buffers_draw_nothing_instead_of_panicking() {
     paint.set_anti_alias(false);
     Canvas::new_raster(&mut bogus).draw_rect(&Rect::new(1.0, 1.0, 4.0, 4.0), &paint);
 }
+
+#[test]
+fn far_off_triangles_finish_and_vertices_blend_coverage_like_other_draws() {
+    use skia_rs_canvas::{ClipOp, VertexMode};
+    use skia_rs_core::Point;
+    use skia_rs_paint::BlendMode;
+
+    // A vertex at 1e9 must not make the draw walk its whole bounding box.
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_vertices(
+        VertexMode::Triangles,
+        &[
+            Point::new(0.0, 0.0),
+            Point::new(1.0e9, 1.0e9),
+            Point::new(0.0, 100.0),
+        ],
+        None,
+        &white(Style::Fill),
+    );
+
+    // A Src-mode triangle through an AA circle clip onto white: edge pixels
+    // lerp toward the source (staying opaque) instead of being replaced by
+    // a coverage-scaled, partly transparent source.
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            buffer.set_pixel(x, y, Color::WHITE);
+        }
+    }
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        let mut clip = PathBuilder::new();
+        clip.add_circle(100.0, 100.0, 40.3);
+        canvas.clip_path(&clip.build(), ClipOp::Intersect, true);
+        let mut red = Paint::new();
+        red.set_color32(Color::from_argb(255, 255, 0, 0));
+        red.set_blend_mode(BlendMode::Src);
+        canvas.draw_vertices(
+            VertexMode::Triangles,
+            &[
+                Point::new(0.0, 0.0),
+                Point::new(400.0, 0.0),
+                Point::new(0.0, 400.0),
+            ],
+            None,
+            &red,
+        );
+    }
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let a = buffer.get_pixel(x, y).map_or(0, |c| c.alpha());
+            assert!(a >= 250, "({x}, {y}) stays opaque: alpha {a}");
+        }
+    }
+}

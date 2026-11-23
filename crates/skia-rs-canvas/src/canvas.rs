@@ -566,7 +566,13 @@ impl<'a> Canvas<'a> {
     /// other clips need all of it. Inside a large filtered layer that keeps
     /// a small clip from allocating and sampling a layer-sized mask.
     fn clip_mask_area(&self, shape: &Rect, op: ClipOp, inverse: bool) -> IRect {
-        let all = self.clip_mask_bounds();
+        // A new clip never reaches outside the current one, so no mask needs
+        // to cover more than the current clip's bounds.
+        let bounds = self.clip_mask_bounds();
+        let current = self.clip_stack.bounds().round_out();
+        let all = bounds
+            .intersect(&current)
+            .unwrap_or_else(|| IRect::new(bounds.left, bounds.top, bounds.left, bounds.top));
         let shape_finite = shape.left.is_finite()
             && shape.top.is_finite()
             && shape.right.is_finite()
@@ -2508,7 +2514,9 @@ impl Canvas<'_> {
         // The mapped dst under rotation is a quad; iterate its device AABB
         // and test membership by mapping each pixel center back to local
         // space, so rotation and complex clips both work.
-        let transformed_dst = matrix.map_rect(dst);
+        // Clipped to the w plane under perspective (map_rect would flip
+        // corners behind the camera and miss visible pixels).
+        let transformed_dst = matrix.map_rect_clipped(dst);
         let Some(visible_dst) = transformed_dst.intersect(&clip) else {
             return;
         };
@@ -2590,10 +2598,10 @@ impl Canvas<'_> {
                     } else {
                         src_color.premul()
                     };
-                    // Apply paint alpha once and the clip coverage, both on
-                    // the premultiplied color.
-                    let scale = alpha * (f32::from(clip_cov) / 255.0);
-                    let to_byte = |v: f32| skia_rs_core::cast::f32_to_u8_sat(v * scale * 255.0);
+                    // Apply paint alpha once to the premultiplied color; the
+                    // clip coverage then blends like every other partial
+                    // coverage (lerp toward the blend result).
+                    let to_byte = |v: f32| skia_rs_core::cast::f32_to_u8_sat(v * alpha * 255.0);
                     let color = Color::from_argb(
                         to_byte(premul4.a),
                         to_byte(premul4.r),
@@ -2601,10 +2609,11 @@ impl Canvas<'_> {
                         to_byte(premul4.b),
                     );
 
-                    buffer.blend_pixel(
+                    buffer.blend_pixel_coverage(
                         dst_x - buf_offset_x,
                         dst_y - buf_offset_y,
                         color,
+                        clip_cov,
                         blend_mode,
                     );
                 }
@@ -2900,7 +2909,6 @@ impl Canvas<'_> {
         paint: &Paint,
     ) {
         use skia_rs_core::cast::{ceil_to_i32, floor_to_i32, scalar_from_i32};
-        use skia_rs_core::mul_div_255_round;
 
         // The clip stack lives in a disjoint field; query it while holding
         // the mutable buffer borrow below.
@@ -2941,6 +2949,12 @@ impl Canvas<'_> {
             return; // degenerate triangle
         }
 
+        // Only pixels inside the clip can change: clamp the box to its
+        // bounds, so a far-off vertex cannot loop over billions of pixels.
+        let clip = clip_stack.bounds().round_out();
+        let (min_x, max_x) = (min_x.max(clip.left), max_x.min(clip.right));
+        let (min_y, max_y) = (min_y.max(clip.top), max_y.min(clip.bottom));
+
         for y in min_y..max_y {
             for x in min_x..max_x {
                 let px = scalar_from_i32(x) + 0.5;
@@ -2960,7 +2974,7 @@ impl Canvas<'_> {
                     continue;
                 }
 
-                let mut color = if uniform {
+                let color = if uniform {
                     uniform_color
                 } else {
                     let r = col0.r.mul_add(w0, col1.r.mul_add(w1, col2.r * w2));
@@ -2978,17 +2992,15 @@ impl Canvas<'_> {
                     )
                 };
 
-                if clip_cov < 255 {
-                    let s = |v: u8| mul_div_255_round(u32::from(v), u32::from(clip_cov));
-                    color = Color::from_argb(
-                        s(color.alpha()),
-                        s(color.red()),
-                        s(color.green()),
-                        s(color.blue()),
-                    );
-                }
-
-                buffer.blend_pixel(x - buf_offset_x, y - buf_offset_y, color, blend_mode);
+                // Partial coverage lerps toward the blend result, as for
+                // every other draw.
+                buffer.blend_pixel_coverage(
+                    x - buf_offset_x,
+                    y - buf_offset_y,
+                    color,
+                    clip_cov,
+                    blend_mode,
+                );
             }
         }
     }
