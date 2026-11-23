@@ -2490,6 +2490,10 @@ impl Canvas<'_> {
         clippy::similar_names,
         reason = "dst_x_start/dst_y_start/dst_x_end/dst_y_end and src_x/src_y are the natural names for a 2D pixel-rect blit loop"
     )]
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "perspective w computed unfused, as Matrix::map_point and the w-plane clip compute it"
+    )]
     pub fn draw_image_rect(
         &mut self,
         image: &skia_rs_codec::Image,
@@ -2565,19 +2569,24 @@ impl Canvas<'_> {
                 // Map the device pixel center back to local space and check
                 // quad membership there (exact under rotation).
                 let center = Point::new(scalar_from_i32(dst_x) + 0.5, scalar_from_i32(dst_y) + 0.5);
-                // A center on the horizon (inverse w of 0) has no local point;
-                // map_point would report (0, 0).
-                if has_perspective {
-                    let inverse_w = inverse.values[Matrix::PERSP_0].mul_add(
-                        center.x,
-                        inverse.values[Matrix::PERSP_1]
-                            .mul_add(center.y, inverse.values[Matrix::PERSP_2]),
-                    );
+                // Under perspective, map back by hand: one homogeneous w is
+                // both tested and divided by, so a center on the horizon
+                // (w of 0, no local point) is skipped rather than reported
+                // as (0, 0) by map_point.
+                let local = if has_perspective {
+                    let m = &inverse.values;
+                    let inverse_w = m[6] * center.x + m[7] * center.y + m[8];
                     if inverse_w == 0.0 || !inverse_w.is_finite() {
                         continue;
                     }
-                }
-                let local = inverse.map_point(center);
+                    let w_inv = 1.0 / inverse_w;
+                    Point::new(
+                        (m[0] * center.x + m[1] * center.y + m[2]) * w_inv,
+                        (m[3] * center.x + m[4] * center.y + m[5]) * w_inv,
+                    )
+                } else {
+                    inverse.map_point(center)
+                };
                 if local.x < dst.left
                     || local.x >= dst.right
                     || local.y < dst.top
@@ -2589,11 +2598,10 @@ impl Canvas<'_> {
                 // behind the camera; drawing it would show a mirrored copy
                 // of the hidden part (Skia clips at w = 1/16384).
                 if has_perspective
-                    && matrix.values[Matrix::PERSP_0].mul_add(
-                        local.x,
-                        matrix.values[Matrix::PERSP_1]
-                            .mul_add(local.y, matrix.values[Matrix::PERSP_2]),
-                    ) < 1.0 / 16384.0
+                    && matrix.values[Matrix::PERSP_0] * local.x
+                        + matrix.values[Matrix::PERSP_1] * local.y
+                        + matrix.values[Matrix::PERSP_2]
+                        < 1.0 / 16384.0
                 {
                     continue;
                 }
