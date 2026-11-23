@@ -83,6 +83,12 @@ pub trait PathEffect: Send + Sync + std::fmt::Debug {
     /// CTM's maximum scale, Skia's `SkStrokeRec::getResScale`): effects that
     /// flatten curves do so finely enough for that scale. Effects may skip
     /// output entirely outside `cull`; the default ignores both.
+    ///
+    /// Callers must outset `cull` for whatever the result will be drawn
+    /// with: the stroke's half-width times the miter limit for miter joins,
+    /// plus any anti-aliasing fringe (the canvas does this). Effects only
+    /// add margins for geometry they create themselves, and assume Skia's
+    /// default miter limit (4) where they need one.
     fn filter_path_culled(
         &self,
         path: &Path,
