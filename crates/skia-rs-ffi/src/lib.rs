@@ -2007,10 +2007,12 @@ pub unsafe extern "C" fn sk_surface_lock_canvas(surface: *mut sk_surface_t) -> *
 pub unsafe extern "C" fn sk_canvas_release(canvas: *mut sk_canvas_t) {
     catch_panic_void(|| {
         if !canvas.is_null() {
-            let mut c = Box::from_raw(canvas);
             // Unlocks the surface and drops the canvas's reference to it
-            // even if compositing below panics.
-            let _unlock = SurfaceUnlock(c.locked_surface);
+            // even if compositing below panics. Declared before the canvas
+            // so the canvas (which points into the surface's pixels) drops
+            // first.
+            let _unlock = SurfaceUnlock((*canvas).locked_surface);
+            let mut c = Box::from_raw(canvas);
             // Like ~SkCanvas: unwind open saves, compositing open layers.
             while !c.state.stack.is_empty() {
                 c.restore_one();
