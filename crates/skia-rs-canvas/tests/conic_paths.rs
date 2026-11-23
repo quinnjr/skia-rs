@@ -1294,3 +1294,25 @@ fn points_behind_the_perspective_horizon_draw_nothing() {
         }
     }
 }
+
+#[test]
+fn huge_and_far_off_circles_and_rects_finish_promptly() {
+    // Only the buffer's rows and columns are visited, so these return at
+    // once instead of looping over ~1e10 empty pixels.
+    use skia_rs_core::Point;
+
+    for anti_alias in [false, true] {
+        let mut paint = white(Style::Fill);
+        paint.set_anti_alias(anti_alias);
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.draw_circle(Point::new(50.0, 50.0), 1.0e5, &paint);
+        canvas.draw_circle(Point::new(1.0e7, 1.0e7), 10.0, &paint);
+        canvas.draw_rect(&Rect::new(-1.0e9, -1.0e9, 1.0e9, 1.0e9), &paint);
+        drop(canvas);
+        assert!(
+            lit(&buffer, 100, 100),
+            "aa={anti_alias}: the huge shapes cover the device"
+        );
+    }
+}

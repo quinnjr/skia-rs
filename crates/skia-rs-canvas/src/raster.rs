@@ -1000,9 +1000,11 @@ impl<'a> Rasterizer<'a> {
         let transformed = self.matrix.map_rect(rect);
 
         let x0 = round_to_i32(transformed.left);
-        let y0 = round_to_i32(transformed.top);
         let x1 = round_to_i32(transformed.right);
-        let y1 = round_to_i32(transformed.bottom);
+        // Rows outside the buffer draw nothing; limiting them keeps huge or
+        // far-off rects from looping over billions of empty rows.
+        let y0 = round_to_i32(transformed.top).max(0);
+        let y1 = round_to_i32(transformed.bottom).min(self.buffer.height);
 
         let blend_mode = paint.blend_mode();
         let source = self.make_source(paint);
@@ -1017,10 +1019,12 @@ impl<'a> Rasterizer<'a> {
     /// clip regardless of the matrix (`SkDraw::drawPaint`).
     pub fn fill_device_rect(&mut self, rect: &Rect, paint: &Paint) {
         use skia_rs_core::cast::round_to_i32;
-        let x0 = round_to_i32(rect.left) - self.origin.0;
-        let y0 = round_to_i32(rect.top) - self.origin.1;
-        let x1 = round_to_i32(rect.right) - self.origin.0;
-        let y1 = round_to_i32(rect.bottom) - self.origin.1;
+        let x0 = round_to_i32(rect.left).saturating_sub(self.origin.0);
+        let x1 = round_to_i32(rect.right).saturating_sub(self.origin.0);
+        let y0 = round_to_i32(rect.top).saturating_sub(self.origin.1).max(0);
+        let y1 = round_to_i32(rect.bottom)
+            .saturating_sub(self.origin.1)
+            .min(self.buffer.height);
 
         let blend_mode = paint.blend_mode();
         let source = self.make_source(paint);
@@ -1132,8 +1136,10 @@ impl<'a> Rasterizer<'a> {
         let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
 
-        let y0 = floor_to_i32(tc.y - r);
-        let y1 = ceil_to_i32(tc.y + r);
+        // Only rows inside the buffer (huge or far-off circles would
+        // otherwise loop over billions of empty rows).
+        let y0 = floor_to_i32(tc.y - r).max(0);
+        let y1 = ceil_to_i32(tc.y + r).min(self.buffer.height);
         for y in y0..y1 {
             let dy = scalar_from_i32(y) + 0.5 - tc.y;
             if dy.abs() > r {
@@ -1215,11 +1221,12 @@ impl<'a> Rasterizer<'a> {
         let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
 
-        // Calculate bounding box
-        let min_x = floor_to_i32(cx - r - 1.0);
-        let max_x = ceil_to_i32(cx + r + 1.0);
-        let min_y = floor_to_i32(cy - r - 1.0);
-        let max_y = ceil_to_i32(cy + r + 1.0);
+        // Bounding box, limited to the buffer: pixels outside it draw
+        // nothing, and a huge or far-off circle must not loop over them.
+        let min_x = floor_to_i32(cx - r - 1.0).max(0);
+        let max_x = ceil_to_i32(cx + r + 1.0).min(self.buffer.width - 1);
+        let min_y = floor_to_i32(cy - r - 1.0).max(0);
+        let max_y = ceil_to_i32(cy + r + 1.0).min(self.buffer.height - 1);
 
         match paint.style() {
             Style::Fill => {
