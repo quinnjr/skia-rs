@@ -585,15 +585,16 @@ impl<'a> Canvas<'a> {
         let matrix = *self.total_matrix();
         let device_bounds = IRect::new(0, 0, self.width, self.height);
 
-        if matrix.skew_x() == 0.0 && matrix.skew_y() == 0.0 {
+        if matrix.skew_x() == 0.0 && matrix.skew_y() == 0.0 && !matrix.has_perspective() {
             let transformed = matrix.map_rect(rect);
             self.clip_stack
                 .clip_rect_with_op(&transformed, op, &device_bounds, do_anti_alias);
         } else {
+            // Rotated, skewed or perspective: the rect maps to a general
+            // quad (clipped to the w plane under perspective, as clip_path).
             let mut b = skia_rs_path::PathBuilder::new();
             b.add_rect(rect);
-            let mut quad = b.build();
-            quad.transform(&matrix);
+            let quad = device_clip_path(&b.build(), &matrix);
             self.clip_stack
                 .clip_path_with_op(&quad, &device_bounds, op, do_anti_alias);
         }
@@ -609,21 +610,7 @@ impl<'a> Canvas<'a> {
 
     /// Clip to a path.
     pub fn clip_path(&mut self, path: &Path, op: ClipOp, do_anti_alias: bool) {
-        // Transform the path to device coordinates
-        let matrix = self.total_matrix();
-        // Under perspective, clip to the w plane first (PerspectiveClip):
-        // geometry behind it would map to flipped coordinates.
-        let in_front = crate::raster::perspective_clip(path, matrix);
-        let in_front = in_front.as_ref().unwrap_or(path);
-        // Path::transform maps control points only, which is wrong for
-        // curves under perspective: flatten them in local space against the
-        // device-error bound first, as fills do.
-        let mut transformed_path = if matrix.has_perspective() {
-            crate::raster::flatten_for_matrix(in_front, matrix)
-        } else {
-            in_front.clone()
-        };
-        transformed_path.transform(matrix);
+        let transformed_path = device_clip_path(path, self.total_matrix());
 
         let device_bounds = IRect::new(0, 0, self.width, self.height);
         self.clip_stack
@@ -2759,6 +2746,11 @@ impl skia_rs_path::PathEffect for UnculledEffect {
     fn effect_kind(&self) -> skia_rs_path::PathEffectKind {
         self.0.effect_kind()
     }
+
+    fn cull_is_exact(&self) -> bool {
+        // The cull is ignored, so the culled result is the unculled one.
+        true
+    }
 }
 
 /// `paint` with fake bold folded into its stroke the way the stroke record
@@ -2949,6 +2941,23 @@ fn build_arc_path(
 fn nearly_equal_points(a: Point, b: Point) -> bool {
     const TOL: Scalar = 1.0 / 4096.0;
     (a.x - b.x).abs() <= TOL && (a.y - b.y).abs() <= TOL
+}
+
+/// A clip path mapped to device space. Under perspective it is first clipped
+/// to the w plane (`SkPathPriv::PerspectiveClip`: geometry behind it would
+/// map to flipped coordinates) and its curves flattened in local space
+/// against the device-error bound (`Path::transform` maps control points
+/// only), as fills do.
+fn device_clip_path(path: &Path, matrix: &Matrix) -> Path {
+    let in_front = crate::raster::perspective_clip(path, matrix);
+    let in_front = in_front.as_ref().unwrap_or(path);
+    let mut out = if matrix.has_perspective() {
+        crate::raster::flatten_for_matrix(in_front, matrix)
+    } else {
+        in_front.clone()
+    };
+    out.transform(matrix);
+    out
 }
 
 /// The most whole turns `build_arc_path` draws for one arc.

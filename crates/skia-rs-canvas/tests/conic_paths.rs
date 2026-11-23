@@ -1605,3 +1605,36 @@ fn fractional_layer_bounds_round_out() {
     assert!(lit(&buffer, 10, 30), "the partial left column is kept");
     assert!(lit(&buffer, 50, 30), "the partial right column is kept");
 }
+
+#[test]
+fn clip_rect_under_perspective_clips_to_the_projected_quad() {
+    // A rect clip under perspective is a trapezoid, not its bounding box:
+    // it must match clipping to the same rect as a path.
+    use skia_rs_canvas::ClipOp;
+    use skia_rs_core::Matrix;
+
+    let mut persp = Matrix::translate(100.0, 40.0);
+    persp.values[Matrix::PERSP_1] = 0.004;
+    let clip = Rect::new(-60.0, 0.0, 60.0, 120.0);
+    let render = |as_path: bool| {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            canvas.set_matrix(&persp);
+            if as_path {
+                let mut b = PathBuilder::new();
+                b.add_rect(&clip);
+                canvas.clip_path(&b.build(), ClipOp::Intersect, false);
+            } else {
+                canvas.clip_rect(&clip, ClipOp::Intersect, false);
+            }
+            canvas.reset_matrix();
+            canvas.draw_rect(&Rect::new(0.0, 0.0, 200.0, 200.0), &white(Style::Fill));
+        }
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .filter(|&(x, y)| lit(&buffer, x, y))
+            .count()
+    };
+    assert_eq!(render(false), render(true));
+}
