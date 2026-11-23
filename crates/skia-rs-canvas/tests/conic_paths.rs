@@ -2335,3 +2335,70 @@ fn far_off_triangles_finish_and_vertices_blend_coverage_like_other_draws() {
         }
     }
 }
+
+#[test]
+fn vertices_skip_non_finite_triangles_clip_to_the_camera_and_record() {
+    use skia_rs_canvas::{Picture, VertexMode};
+    use skia_rs_core::{Matrix, Point};
+
+    let lit_count = |buffer: &PixelBuffer| {
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .filter(|&(x, y)| lit(buffer, x, y))
+            .count()
+    };
+
+    // A non-finite vertex draws nothing (NaN weights would flood the box).
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_vertices(
+        VertexMode::Triangles,
+        &[
+            Point::new(f32::INFINITY, 0.0),
+            Point::new(0.0, 0.0),
+            Point::new(0.0, 10.0),
+        ],
+        None,
+        &white(Style::Fill),
+    );
+    assert_eq!(lit_count(&buffer), 0, "non-finite triangle");
+
+    // Under perspective, the part behind the camera (local x > 100 here) is
+    // cut off; drawn unclipped it lands mirrored across the left half (e.g.
+    // device (10, 100)). The in-front part maps near device (100..110, 160+).
+    let mut persp = Matrix::translate(0.0, 100.0);
+    persp.values[Matrix::PERSP_0] = -0.01;
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.set_matrix(&persp);
+        canvas.draw_vertices(
+            VertexMode::Triangles,
+            &[
+                Point::new(50.0, -20.0),
+                Point::new(200.0, 0.0),
+                Point::new(50.0, 20.0),
+            ],
+            None,
+            &white(Style::Fill),
+        );
+    }
+    assert!(lit(&buffer, 103, 175), "the in-front part is drawn");
+    assert!(!lit(&buffer, 10, 100), "no mirrored copy on the left");
+
+    // Recorded vertices play back.
+    let mut cmds = Vec::new();
+    Canvas::new_recording(&mut cmds, SIZE, SIZE).draw_vertices(
+        VertexMode::Triangles,
+        &[
+            Point::new(0.0, 0.0),
+            Point::new(100.0, 0.0),
+            Point::new(0.0, 100.0),
+        ],
+        None,
+        &white(Style::Fill),
+    );
+    let picture = Picture::from_parts(cmds, Rect::from_xywh(0.0, 0.0, 200.0, 200.0));
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_picture(&picture, None, None);
+    assert!(lit(&buffer, 20, 20), "the recorded triangle is played back");
+}

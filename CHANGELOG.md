@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `composite_layer_pixels`.
 - **Breaking**: `DrawCommand::SaveLayer` has a `flags` field, so recorded
   layers keep `INIT_WITH_PREVIOUS` on playback.
+- **Breaking**: new `DrawCommand::DrawVertices` variant, so recorded
+  `draw_vertices` calls are kept (they were dropped).
 - **Breaking**: new `DrawCommand::DrawRegion` variant. Recorded regions
   stay regions, so playback draws them rect by rect or as one outline
   depending on its own matrix and paint.

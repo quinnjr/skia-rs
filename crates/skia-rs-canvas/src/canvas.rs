@@ -2813,6 +2813,16 @@ impl Canvas<'_> {
         if positions.len() < 3 {
             return;
         }
+        // Recorded as vertices, so playback draws them (with its matrix).
+        if let Backing::Recording(commands) = &mut self.backing {
+            commands.push(DrawCommand::DrawVertices {
+                mode,
+                positions: positions.to_vec(),
+                colors: colors.map(<[Color]>::to_vec),
+                paint: paint.clone(),
+            });
+            return;
+        }
 
         let matrix = *self.total_matrix();
 
@@ -2824,13 +2834,10 @@ impl Canvas<'_> {
                         let c0 = colors.and_then(|c| c.get(base_idx).copied());
                         let c1 = colors.and_then(|c| c.get(base_idx + 1).copied());
                         let c2 = colors.and_then(|c| c.get(base_idx + 2).copied());
-                        self.draw_triangle(
-                            matrix.map_point(chunk[0]),
-                            matrix.map_point(chunk[1]),
-                            matrix.map_point(chunk[2]),
-                            c0,
-                            c1,
-                            c2,
+                        self.draw_local_triangle(
+                            &matrix,
+                            [chunk[0], chunk[1], chunk[2]],
+                            [c0, c1, c2],
                             paint,
                         );
                     }
@@ -2857,15 +2864,7 @@ impl Canvas<'_> {
                             colors.and_then(|c| c.get(i + 2).copied()),
                         )
                     };
-                    self.draw_triangle(
-                        matrix.map_point(p0),
-                        matrix.map_point(p1),
-                        matrix.map_point(p2),
-                        c0,
-                        c1,
-                        c2,
-                        paint,
-                    );
+                    self.draw_local_triangle(&matrix, [p0, p1, p2], [c0, c1, c2], paint);
                 }
             }
             VertexMode::TriangleFan => {
@@ -2874,13 +2873,10 @@ impl Canvas<'_> {
                     let c0 = colors.and_then(|c| c.first().copied());
                     let c1 = colors.and_then(|c| c.get(i).copied());
                     let c2 = colors.and_then(|c| c.get(i + 1).copied());
-                    self.draw_triangle(
-                        matrix.map_point(center),
-                        matrix.map_point(positions[i]),
-                        matrix.map_point(positions[i + 1]),
-                        c0,
-                        c1,
-                        c2,
+                    self.draw_local_triangle(
+                        &matrix,
+                        [center, positions[i], positions[i + 1]],
+                        [c0, c1, c2],
                         paint,
                     );
                 }
@@ -2888,6 +2884,70 @@ impl Canvas<'_> {
         }
     }
 
+    /// Maps a local triangle and draws it. Under perspective it is first
+    /// clipped to the w > 0 side of the camera (as every other draw is):
+    /// vertices behind it would project mirrored. The clipped polygon (up to
+    /// four vertices, colors interpolated along the cut edges) is fanned
+    /// into triangles.
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "unfused like Skia's perspective clip; mul_add rounds differently"
+    )]
+    fn draw_local_triangle(
+        &mut self,
+        matrix: &Matrix,
+        points: [Point; 3],
+        colors: [Option<Color>; 3],
+        paint: &Paint,
+    ) {
+        // SkPathPriv's kW0PlaneDistance.
+        const W_MIN: Scalar = 1.0 / 16384.0;
+        if !matrix.has_perspective() {
+            let [first, second, third] = points.map(|pt| matrix.map_point(pt));
+            self.draw_triangle(first, second, third, colors[0], colors[1], colors[2], paint);
+            return;
+        }
+        let values = &matrix.values;
+        let weight = |pt: Point| {
+            values[Matrix::PERSP_0] * pt.x
+                + values[Matrix::PERSP_1] * pt.y
+                + values[Matrix::PERSP_2]
+        };
+        let mut kept: Vec<(Point, Option<Color>)> = Vec::with_capacity(4);
+        for edge in 0..3 {
+            let from = (points[edge], colors[edge]);
+            let to = (points[(edge + 1) % 3], colors[(edge + 1) % 3]);
+            let (w_from, w_to) = (weight(from.0), weight(to.0));
+            if w_from >= W_MIN {
+                kept.push(from);
+            }
+            if (w_from >= W_MIN) != (w_to >= W_MIN) {
+                // w is affine in local coordinates: cut where it is W_MIN.
+                let along = (W_MIN - w_from) / (w_to - w_from);
+                let cut = Point::new(
+                    (to.0.x - from.0.x) * along + from.0.x,
+                    (to.0.y - from.0.y) * along + from.0.y,
+                );
+                let color = match (from.1, to.1) {
+                    (Some(start), Some(end)) => Some(lerp_color(start, end, along)),
+                    (start, end) => start.or(end),
+                };
+                kept.push((cut, color));
+            }
+        }
+        for fan in 1..kept.len().saturating_sub(1) {
+            let (first, second, third) = (kept[0], kept[fan], kept[fan + 1]);
+            self.draw_triangle(
+                matrix.map_point(first.0),
+                matrix.map_point(second.0),
+                matrix.map_point(third.0),
+                first.1,
+                second.1,
+                third.1,
+                paint,
+            );
+        }
+    }
     /// Draw a single filled triangle with per-vertex color interpolation.
     ///
     /// Both flat and interpolated triangles use the same coverage rule
@@ -2945,8 +3005,13 @@ impl Canvas<'_> {
         let max_y = ceil_to_i32(p0.y.max(p1.y).max(p2.y));
 
         let denom = (p1.y - p2.y).mul_add(p0.x - p2.x, (p2.x - p1.x) * (p0.y - p2.y));
-        if denom.abs() < 1e-7 {
-            return; // degenerate triangle
+        // Degenerate, or non-finite (NaN weights would pass every inside
+        // test and fill the whole box; Skia draws nothing).
+        let finite = [p0, p1, p2]
+            .iter()
+            .all(|p| p.x.is_finite() && p.y.is_finite());
+        if !finite || !denom.is_finite() || denom.abs() < 1e-7 {
+            return;
         }
 
         // Only pixels inside the clip can change: clamp the box to its
@@ -3356,6 +3421,20 @@ fn layer_buffer_is_valid(buffer: &PixelBuffer) -> bool {
     });
     buffer.stride >= row && needed.is_some_and(|n| buffer.pixels.len() >= n)
 }
+/// `a + (b - a) * t` per ARGB channel.
+#[allow(clippy::suboptimal_flops, reason = "unfused interpolation")]
+fn lerp_color(a: Color, b: Color, t: Scalar) -> Color {
+    let mix = |x: u8, y: u8| {
+        skia_rs_core::cast::f32_to_u8_sat((f32::from(y) - f32::from(x)) * t + f32::from(x))
+    };
+    Color::from_argb(
+        mix(a.alpha(), b.alpha()),
+        mix(a.red(), b.red()),
+        mix(a.green(), b.green()),
+        mix(a.blue(), b.blue()),
+    )
+}
+
 /// The layer pixel ranges (x, y) that can change anything when compositing
 /// a `layer` (origin and size) onto a `target` (origin and size) through a
 /// clip with integer bounds `clip`: elsewhere the clip coverage is 0 or the

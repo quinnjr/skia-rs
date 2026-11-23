@@ -209,6 +209,17 @@ pub enum DrawCommand {
         /// The paint to use.
         paint: Paint,
     },
+    /// Draw vertices (`SkCanvas::drawVertices`).
+    DrawVertices {
+        /// How the positions form triangles.
+        mode: crate::VertexMode,
+        /// The vertex positions (local coordinates).
+        positions: Vec<Point>,
+        /// Optional per-vertex colors.
+        colors: Option<Vec<Color>>,
+        /// The paint to use.
+        paint: Paint,
+    },
     /// Draw an oval.
     DrawOval {
         /// The bounding rectangle of the oval.
@@ -357,6 +368,14 @@ impl DrawCommand {
             }
             Self::DrawRegion { region, paint } => {
                 canvas.draw_region(region, paint);
+            }
+            Self::DrawVertices {
+                mode,
+                positions,
+                colors,
+                paint,
+            } => {
+                canvas.draw_vertices(*mode, positions, colors.as_deref(), paint);
             }
             Self::DrawOval { rect, paint } => {
                 canvas.draw_oval(rect, paint);
