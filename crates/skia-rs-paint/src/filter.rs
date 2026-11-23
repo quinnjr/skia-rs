@@ -422,8 +422,8 @@ pub trait ImageFilter: Send + Sync + std::fmt::Debug {
     /// - matrix convolution: under translate and axis-permuting matrices
     ///   (quarter turns, mirrors) at unit scale (the kernel is re-oriented,
     ///   not resampled);
-    /// - lighting: under translate and quarter turns at unit scale (under
-    ///   scale, normals come from device pixels rather than resampled ones);
+    /// - lighting: lights map under translate, scale and quarter turns
+    ///   (`apply` here shades with a uniform factor, not per-pixel normals);
     /// - displacement map: under translate and positive uniform scale (one
     ///   signed scale for both axes cannot express rotations or mirrors).
     ///
@@ -1334,14 +1334,17 @@ pub enum LightType {
 
 impl LightType {
     /// The light mapped into layer space, like `SkLight::transform`: light
-    /// positions map as points with z the average of the mapped (z, z)
-    /// vector. A distant light's direction turns with the matrix but keeps
-    /// its x/y length and z, so its elevation does not change.
+    /// positions map as points with z scaled by the matrix's uniform scale
+    /// (`SkLight` averages the mapped (z, z) magnitudes). A distant light's
+    /// direction turns with the matrix but keeps its x/y length and z, so
+    /// its elevation does not change.
     fn mapped(&self, matrix: &Matrix) -> Self {
+        // Heights scale by the uniform scale only: mapping (z, z) through the
+        // signed linear part would flip or zero them under rotations.
+        let z_scale = linear_scale(matrix);
         let map_point3 = |(x, y, z): (Scalar, Scalar, Scalar)| {
             let p = matrix.map_point(skia_rs_core::Point::new(x, y));
-            let (zx, zy) = map_vector(matrix, z, z);
-            (p.x, p.y, f32::midpoint(zx, zy))
+            (p.x, p.y, z * z_scale)
         };
         match *self {
             Self::Distant { direction } => {
@@ -1435,10 +1438,10 @@ impl ImageFilter for LightingImageFilter {
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         Some(Arc::new(Self {
             light: self.light.mapped(matrix),
-            // Normals come from device-resolution pixels: a local slope is
-            // spread over `scale` device pixels, so scale the heights to
-            // keep it.
-            surface_scale: self.surface_scale * linear_scale(matrix),
+            // apply uses surface_scale as a brightness factor (it does not
+            // build normals from a height field), so it is not mapped: the
+            // result must not depend on the zoom.
+            surface_scale: self.surface_scale,
             diffuse_constant: self.diffuse_constant,
             specular_constant: self.specular_constant,
             specular_exponent: self.specular_exponent,
@@ -2837,7 +2840,21 @@ mod tests {
             "{:?}",
             map_image_filter(&lighting, &Matrix::scale(2.0, 2.0))
         );
-        assert!(debug.contains("surface_scale: 3.0"), "{debug}");
+        assert!(
+            debug.contains("surface_scale: 1.5"),
+            "zoom must not change it: {debug}"
+        );
+        // Point lights keep their height (scaled, never flipped) under turns.
+        let point = LightType::Point {
+            location: (10.0, 20.0, 5.0),
+        };
+        for turn in [90.0_f32, 180.0] {
+            let mapped = point.mapped(&Matrix::rotate(turn.to_radians()));
+            assert!(
+                matches!(mapped, LightType::Point { location } if (location.2 - 5.0).abs() < 1e-4),
+                "{turn}: {mapped:?}"
+            );
+        }
         let turned = light.mapped(&Matrix::rotate(90.0_f32.to_radians()));
         assert!(matches!(turned, LightType::Distant { direction } if direction == (0.0, 1.0, 1.0)));
     }
