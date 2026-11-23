@@ -650,18 +650,12 @@ fn trim_path(path: &Path, start: Scalar, stop: Scalar, inverted: bool) -> Path {
     }
 
     if inverted {
-        let mut builder = skia_rs_path::PathBuilder::new();
-        if start > 0.0
-            && let Some(seg) = measure.get_segment(0.0, start * len)
-        {
-            builder.add_path(&seg);
-        }
-        if stop < 1.0
-            && let Some(seg) = measure.get_segment(stop * len, len)
-        {
-            builder.add_path(&seg);
-        }
-        builder.build()
+        // SkTrimPathEffect's inverted mode (tail first, closed contours kept
+        // continuous), as Skottie uses it.
+        use skia_rs_path::PathEffect;
+        skia_rs_path::TrimEffect::new(start, stop, skia_rs_path::TrimMode::Inverted)
+            .and_then(|trim| trim.apply(path))
+            .unwrap_or_else(|| path.clone())
     } else {
         measure
             .get_segment(start * len, stop * len)

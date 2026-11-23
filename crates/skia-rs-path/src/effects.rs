@@ -1312,58 +1312,22 @@ impl PathEffect for TrimEffect {
                 if start_dist >= end_dist {
                     return Some(path.clone());
                 }
+                // SkTrimPE: the tail span first, then the head; for a single
+                // closed contour the head continues the tail without a
+                // moveTo, so the stroke joins across the start point.
                 let mut builder = PathBuilder::new();
+                let requires_move = if end_dist < total
+                    && let Some(tail) = measure.get_segment(end_dist, total)
+                {
+                    append_trim_segment(&mut builder, &tail, true);
+                    !is_single_closed_contour(path)
+                } else {
+                    true
+                };
                 if start_dist > 0.0
-                    && let Some(before) = measure.get_segment(0.0, start_dist)
+                    && let Some(head) = measure.get_segment(0.0, start_dist)
                 {
-                    for elem in &before {
-                        match elem {
-                            PathElement::Move(p) => {
-                                builder.move_to(p.x, p.y);
-                            }
-                            PathElement::Line(p) => {
-                                builder.line_to(p.x, p.y);
-                            }
-                            PathElement::Quad(p1, p2) => {
-                                builder.quad_to(p1.x, p1.y, p2.x, p2.y);
-                            }
-                            PathElement::Cubic(p1, p2, p3) => {
-                                builder.cubic_to(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y);
-                            }
-                            PathElement::Conic(p1, p2, w) => {
-                                builder.conic_to(p1.x, p1.y, p2.x, p2.y, w);
-                            }
-                            PathElement::Close => {
-                                builder.close();
-                            }
-                        }
-                    }
-                }
-                if end_dist < total
-                    && let Some(after) = measure.get_segment(end_dist, total)
-                {
-                    for elem in &after {
-                        match elem {
-                            PathElement::Move(p) => {
-                                builder.move_to(p.x, p.y);
-                            }
-                            PathElement::Line(p) => {
-                                builder.line_to(p.x, p.y);
-                            }
-                            PathElement::Quad(p1, p2) => {
-                                builder.quad_to(p1.x, p1.y, p2.x, p2.y);
-                            }
-                            PathElement::Cubic(p1, p2, p3) => {
-                                builder.cubic_to(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y);
-                            }
-                            PathElement::Conic(p1, p2, w) => {
-                                builder.conic_to(p1.x, p1.y, p2.x, p2.y, w);
-                            }
-                            PathElement::Close => {
-                                builder.close();
-                            }
-                        }
-                    }
+                    append_trim_segment(&mut builder, &head, requires_move);
                 }
                 Some(builder.build())
             }
@@ -1373,6 +1337,51 @@ impl PathEffect for TrimEffect {
     fn effect_kind(&self) -> PathEffectKind {
         PathEffectKind::Trim
     }
+}
+
+/// Appends a trimmed segment; without `requires_move` its first moveTo is
+/// dropped so it continues from the builder's current point (`getSegment`
+/// with `startWithMoveTo = false`).
+fn append_trim_segment(builder: &mut PathBuilder, segment: &Path, requires_move: bool) {
+    let mut skip_move = !requires_move;
+    for elem in segment {
+        match elem {
+            PathElement::Move(p) => {
+                if !std::mem::take(&mut skip_move) {
+                    builder.move_to(p.x, p.y);
+                }
+            }
+            PathElement::Line(p) => {
+                builder.line_to(p.x, p.y);
+            }
+            PathElement::Quad(p1, p2) => {
+                builder.quad_to(p1.x, p1.y, p2.x, p2.y);
+            }
+            PathElement::Cubic(p1, p2, p3) => {
+                builder.cubic_to(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y);
+            }
+            PathElement::Conic(p1, p2, w) => {
+                builder.conic_to(p1.x, p1.y, p2.x, p2.y, w);
+            }
+            PathElement::Close => {
+                builder.close();
+            }
+        }
+    }
+}
+
+/// One contour, closed (`SkTrimPE`'s `contour_count == 1 &&
+/// isLastContourClosed()`).
+fn is_single_closed_contour(path: &Path) -> bool {
+    let mut moves = 0;
+    let mut last_closed = false;
+    for elem in path {
+        if matches!(elem, PathElement::Move(_)) {
+            moves += 1;
+        }
+        last_closed = matches!(elem, PathElement::Close);
+    }
+    moves == 1 && last_closed
 }
 
 // =============================================================================
@@ -1822,9 +1831,14 @@ impl PathEffect for Path1DEffect {
                     let transform = match self.style {
                         Path1DStyle::Translate => skia_rs_core::Matrix::translate(pos.x, pos.y),
                         Path1DStyle::Rotate | Path1DStyle::Morph => {
-                            let angle = tangent.y.atan2(tangent.x);
-                            // First rotate, then translate
-                            let rotation = skia_rs_core::Matrix::rotate(angle);
+                            // SkPath1DPathEffect: setSinCos straight from the
+                            // unit tangent (no snapping of tiny angles, unlike
+                            // Matrix::rotate). First rotate, then translate.
+                            let mut rotation = skia_rs_core::Matrix::identity();
+                            rotation.values = [
+                                tangent.x, -tangent.y, 0.0, tangent.y, tangent.x, 0.0, 0.0, 0.0,
+                                1.0,
+                            ];
                             let translation = skia_rs_core::Matrix::translate(pos.x, pos.y);
                             translation.concat(&rotation)
                         }
@@ -3285,6 +3299,54 @@ mod tests {
             .filter_path_culled(&b.build(), &mut rec, None, 1.0)
             .expect("dashes");
         assert!(!out.is_empty(), "a zero-length line dashes to a dot");
+    }
+
+    #[test]
+    fn inverted_trims_of_closed_contours_stay_continuous() {
+        // SkTrimPE adds the tail first and joins the head to it without a
+        // moveTo for a single closed contour: one continuous piece.
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0)
+            .line_to(100.0, 0.0)
+            .line_to(100.0, 100.0)
+            .line_to(0.0, 100.0)
+            .close();
+        let trim = TrimEffect::new(0.1, 0.9, TrimMode::Inverted).unwrap();
+        let out = trim.apply(&b.build()).expect("trims");
+        let moves: Vec<Point> = out
+            .iter()
+            .filter_map(|e| match e {
+                PathElement::Move(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(moves.len(), 1, "one piece");
+        // It starts with the tail (at 90% of the perimeter: (0, 40)).
+        assert!(
+            (moves[0].x - 0.0).abs() < 1e-3 && (moves[0].y - 40.0).abs() < 1e-3,
+            "{moves:?}"
+        );
+    }
+
+    #[test]
+    fn path1d_rotation_keeps_tiny_slopes() {
+        // SkPath1DPathEffect rotates stamps by the tangent itself; a slope of
+        // 1e-4 must not snap to no rotation. A stamp point 1000 above the
+        // stamp origin moves left by about 1000 * 1e-4 = 0.1.
+        let mut stamp = PathBuilder::new();
+        stamp.move_to(0.0, -1000.0).line_to(0.0, -999.0);
+        let effect = Path1DEffect::new(stamp.build(), 50.0, 0.0, Path1DStyle::Rotate).unwrap();
+        let mut line = PathBuilder::new();
+        line.move_to(0.0, 0.0).line_to(100.0, 0.01);
+        let out = effect.apply(&line.build()).expect("stamps");
+        let first = out
+            .iter()
+            .find_map(|e| match e {
+                PathElement::Move(p) => Some(p),
+                _ => None,
+            })
+            .expect("a stamp");
+        assert!((first.x - 0.1).abs() < 0.02, "rotated stamp at {first:?}");
     }
 
     #[test]
