@@ -390,3 +390,29 @@ fn fake_bold_ignores_the_paint_stroke_join() {
         render(skia_rs_paint::StrokeJoin::Miter)
     );
 }
+
+#[test]
+fn fake_bold_with_a_path_effect_ignores_the_paint_stroke_join() {
+    // The glyph-space path-effect branch emboldens too; it must use the same
+    // fake-bold stroke defaults as the plain branches.
+    let render = |join: skia_rs_paint::StrokeJoin| {
+        let mut font = demo_font(120.0);
+        font.set_embolden(true);
+        let mut paint = Paint::new();
+        paint.set_color(Color::WHITE.into());
+        paint.set_stroke_join(join);
+        // Zero-deviation discrete: keeps the glyph's sharp corners (a
+        // corner effect would round them away), so the join matters.
+        paint.set_path_effect(skia_rs_path::make_discrete(1000.0, 0.0, 1));
+        let mut buffer = PixelBuffer::new(300, 300);
+        Canvas::new_raster(&mut buffer).draw_string("A", 60.0, 220.0, &font, &paint);
+        (0..300)
+            .flat_map(|y| (0..300).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).map_or(0, |c| c.red()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        render(skia_rs_paint::StrokeJoin::Round),
+        render(skia_rs_paint::StrokeJoin::Miter)
+    );
+}

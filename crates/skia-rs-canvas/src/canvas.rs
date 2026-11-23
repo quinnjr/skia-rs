@@ -951,18 +951,20 @@ impl<'a> Canvas<'a> {
     /// With a path effect, the oval is drawn as a path (starting at 3
     /// o'clock, clockwise, like `SkPath::addOval`) so the effect applies.
     pub fn draw_oval(&mut self, rect: &Rect, paint: &Paint) {
+        // SkCanvas::drawOval sorts the rect first, for every draw.
+        let rect = sorted_rect(rect);
         match &mut self.backing {
             Backing::Raster(_) if paint.path_effect().is_some() => {
                 let mut b = skia_rs_path::PathBuilder::new();
-                b.add_oval(&sorted_rect(rect));
+                b.add_oval(&rect);
                 self.rasterize_path(&b.build(), paint);
             }
             Backing::Raster(_) => {
-                self.with_rasterizer(|raster| raster.draw_oval(rect, paint));
+                self.with_rasterizer(|raster| raster.draw_oval(&rect, paint));
             }
             Backing::Recording(commands) => {
                 commands.push(DrawCommand::DrawOval {
-                    rect: *rect,
+                    rect,
                     paint: paint.clone(),
                 });
             }
@@ -1581,6 +1583,9 @@ impl<'a> Canvas<'a> {
             // bold is folded into the stroke record first
             // (useStrokeForFakeBold), then the effect filters the outline.
             let mut rec = stroke_rec_from_paint(paint);
+            // A filled glyph made bold is outlined with Skia's fake-bold
+            // stroke defaults, not the paint's join/miter/cap.
+            let bold_fill = font.is_embolden() && rec == StrokeRec::Fill;
             if font.is_embolden() {
                 let extra = fake_bold_extra(font.size());
                 rec = match rec {
@@ -1601,6 +1606,9 @@ impl<'a> Canvas<'a> {
                 StrokeRec::StrokeAndFill(w) => (Style::StrokeAndFill, w),
             };
             let mut styled = paint.clone();
+            if bold_fill {
+                use_fake_bold_stroke_params(&mut styled);
+            }
             styled.set_style(style);
             styled.set_stroke_width(width);
             styled.set_path_effect(None);

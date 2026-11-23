@@ -966,7 +966,9 @@ impl<'a> Rasterizer<'a> {
     /// `map_rect` (which would otherwise fill the quad's bounding box).
     pub fn fill_rect(&mut self, rect: &Rect, paint: &Paint) {
         use skia_rs_core::cast::round_to_i32;
-        if !self.matrix_is_axis_aligned() || paint.is_anti_alias() {
+        // Perspective maps a rect to a quadrilateral, not its bounding box.
+        if !self.matrix_is_axis_aligned() || self.matrix.has_perspective() || paint.is_anti_alias()
+        {
             let mut b = PathBuilder::new();
             b.add_rect(rect);
             self.fill_path(&b.build(), paint);

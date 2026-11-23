@@ -1115,3 +1115,47 @@ fn sub_pixel_aa_hairlines_cover_their_column_once() {
     let red = buffer.get_pixel(10, 5).unwrap_or(Color::BLACK).red();
     assert!(red > 0 && red < 128, "coverage ~0.3: {red}");
 }
+
+/// Pixel values (red channel) of a whole buffer, for exact comparisons.
+fn pixels(buffer: &PixelBuffer) -> Vec<u8> {
+    (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .map(|(x, y)| buffer.get_pixel(x, y).map_or(0, |c| c.red()))
+        .collect()
+}
+
+#[test]
+fn aliased_rects_under_perspective_fill_their_quadrilateral() {
+    use skia_rs_core::Matrix;
+
+    let perspective = Matrix {
+        values: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.004, 0.0, 1.0],
+    };
+    let render = |as_path: bool| {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.concat(&perspective);
+        let rect = Rect::new(20.0, 20.0, 150.0, 150.0);
+        if as_path {
+            let mut b = PathBuilder::new();
+            b.add_rect(&rect);
+            canvas.draw_path(&b.build(), &white(Style::Fill));
+        } else {
+            canvas.draw_rect(&rect, &white(Style::Fill));
+        }
+        pixels(&buffer)
+    };
+    assert_eq!(render(false), render(true));
+}
+
+#[test]
+fn reversed_oval_rects_are_sorted_for_every_draw() {
+    let render = |rect: Rect| {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        Canvas::new_raster(&mut buffer).draw_oval(&rect, &white(Style::Fill));
+        pixels(&buffer)
+    };
+    let sorted = render(Rect::new(0.0, 0.0, 40.0, 40.0));
+    assert!(sorted.iter().any(|&v| v > 0));
+    assert_eq!(render(Rect::new(40.0, 40.0, 0.0, 0.0)), sorted);
+}
