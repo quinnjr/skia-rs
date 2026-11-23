@@ -399,7 +399,9 @@ pub trait ImageFilter: Send + Sync + std::fmt::Debug {
 
     /// Whether the filter turns transparent black into something visible
     /// (`SkImageFilter_Base::affectsTransparentBlack`): its output then
-    /// covers the whole clip, not just the layer's content.
+    /// covers the whole clip, not just the layer's content. As in Skia, a
+    /// filter with inputs is affected when any input is; every built-in
+    /// filter with inputs overrides this to check them.
     fn affects_transparent_black(&self) -> bool {
         false
     }
@@ -946,6 +948,10 @@ impl MorphologyImageFilter {
 }
 
 impl ImageFilter for MorphologyImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        input_affects(self.input.as_ref())
+    }
+
     fn input_bounds(&self, output: &Rect) -> Rect {
         input_of(
             self.input.as_ref(),
@@ -1216,6 +1222,10 @@ impl DisplacementMapImageFilter {
 }
 
 impl ImageFilter for DisplacementMapImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        self.displacement.affects_transparent_black() || input_affects(self.color.as_ref())
+    }
+
     fn input_bounds(&self, output: &Rect) -> Rect {
         // The color input is read up to scale/2 away; the displacement map
         // at the output itself.
@@ -1459,6 +1469,10 @@ impl LightingImageFilter {
 }
 
 impl ImageFilter for LightingImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        input_affects(self.input.as_ref())
+    }
+
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         Some(Arc::new(Self {
             light: self.light.mapped(matrix),
@@ -1552,6 +1566,10 @@ impl ImageFilter for LightingImageFilter {
     fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
         if width == 0 || height == 0 {
             return;
+        }
+        // The input filter runs first, as for the other filters with inputs.
+        if let Some(ref input) = self.input {
+            input.apply(pixels, width, height);
         }
         // Baseline lighting: modulate intensity by surface_scale factor.
         // A full implementation would compute per-pixel normals from the alpha
@@ -1724,6 +1742,10 @@ impl OffsetImageFilter {
 }
 
 impl ImageFilter for OffsetImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        input_affects(self.input.as_ref())
+    }
+
     fn input_bounds(&self, output: &Rect) -> Rect {
         input_of(self.input.as_ref(), &output.offset(-self.dx, -self.dy))
     }
@@ -1908,6 +1930,12 @@ impl MatrixConvolutionImageFilter {
 }
 
 impl ImageFilter for MatrixConvolutionImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        // With convolve_alpha, a positive bias is added to transparent
+        // pixels too.
+        input_affects(self.input.as_ref()) || (self.convolve_alpha && self.bias > 0.0)
+    }
+
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         // Skia runs the kernel in a translate-only layer space and resamples.
         // Here the kernel is re-oriented for axis-permuting matrices
@@ -2084,6 +2112,10 @@ impl TileImageFilter {
 }
 
 impl ImageFilter for TileImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        input_affects(self.input.as_ref())
+    }
+
     fn input_bounds(&self, _output: &Rect) -> Rect {
         // SkTileImageFilter reads its source rect, whatever the output.
         input_of(self.input.as_ref(), &self.src_rect)
@@ -2922,6 +2954,57 @@ mod tests {
         assert!(!ColorFilterImageFilter::new(identity, None).affects_transparent_black());
         let blur = BlurImageFilter::new(2.0, 2.0, crate::shader::TileMode::Decal);
         assert!(!blur.affects_transparent_black());
+    }
+
+    #[test]
+    fn transparent_black_is_seen_through_inputs() {
+        let mut add_alpha = [0.0; 20];
+        for i in 0..4 {
+            add_alpha[i * 5 + i] = 1.0;
+        }
+        add_alpha[19] = 1.0;
+        let cf: ColorFilterRef = Arc::new(ColorMatrixFilter::new(add_alpha));
+        let wash: ImageFilterRef = Arc::new(ColorFilterImageFilter::new(cf, None));
+        assert!(
+            OffsetImageFilter::new(5.0, 5.0, Some(Arc::clone(&wash))).affects_transparent_black()
+        );
+        assert!(
+            MorphologyImageFilter::dilate(1.0, 1.0, Some(Arc::clone(&wash)))
+                .affects_transparent_black()
+        );
+        // A biased, alpha-convolving kernel lights up transparent pixels.
+        let biased = MatrixConvolutionImageFilter::new(
+            (1, 1),
+            vec![1.0],
+            1.0,
+            0.5,
+            (0, 0),
+            crate::shader::TileMode::Decal,
+            true,
+            None,
+        );
+        assert!(biased.affects_transparent_black());
+    }
+
+    #[test]
+    fn lighting_runs_its_input_filter() {
+        // An input that clears the pixels: lighting of nothing is nothing.
+        let mut clear = [0.0; 20];
+        clear[19] = 0.0;
+        let cf: ColorFilterRef = Arc::new(ColorMatrixFilter::new(clear));
+        let input: ImageFilterRef = Arc::new(ColorFilterImageFilter::new(cf, None));
+        let lighting = LightingImageFilter::diffuse(
+            LightType::Distant {
+                direction: (0.0, 0.0, 1.0),
+            },
+            1.0,
+            1.0,
+            Color4f::new(1.0, 1.0, 1.0, 1.0),
+            Some(input),
+        );
+        let mut pixels = vec![200u8, 100, 50, 255];
+        lighting.apply(&mut pixels, 1, 1);
+        assert_eq!(pixels[3], 0, "the input cleared the pixel: {pixels:?}");
     }
 
     #[test]
