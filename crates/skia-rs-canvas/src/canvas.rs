@@ -926,11 +926,14 @@ impl<'a> Canvas<'a> {
     #[inline]
     fn with_rasterizer<R>(&mut self, f: impl FnOnce(&mut Rasterizer<'_>) -> R) -> Option<R> {
         use skia_rs_core::cast::scalar_from_i32;
+        use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
         let matrix = *self.matrix_stack.last().unwrap();
         // Lend the clip stack to the rasterizer and take it back after the
         // draw (its saves balance within a draw), instead of cloning it, and
-        // every clip mask in it, per draw.
+        // every clip mask in it, per draw. A panicking draw still returns
+        // it (the panic is resumed after), so a caught panic cannot leave the
+        // canvas with an empty clip.
         let clip_stack = std::mem::replace(&mut self.clip_stack, ClipStack::new(&Rect::EMPTY));
 
         // An active layer takes priority over the base backing. The layer
@@ -949,18 +952,18 @@ impl<'a> Canvas<'a> {
             raster.set_matrix(&adjusted);
             raster.set_clip_stack(clip_stack);
             raster.set_origin(ox, oy);
-            let result = f(&mut raster);
+            let result = catch_unwind(AssertUnwindSafe(|| f(&mut raster)));
             self.clip_stack = raster.take_clip_stack();
-            return Some(result);
+            return Some(result.unwrap_or_else(|panic| resume_unwind(panic)));
         }
 
         if let Backing::Raster(buffer) = &mut self.backing {
             let mut raster = Rasterizer::new(buffer);
             raster.set_matrix(&matrix);
             raster.set_clip_stack(clip_stack);
-            let result = f(&mut raster);
+            let result = catch_unwind(AssertUnwindSafe(|| f(&mut raster)));
             self.clip_stack = raster.take_clip_stack();
-            Some(result)
+            Some(result.unwrap_or_else(|panic| resume_unwind(panic)))
         } else {
             self.clip_stack = clip_stack;
             None
@@ -3581,6 +3584,18 @@ const fn colr_composite_to_blend(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_panicking_draw_gives_the_clip_stack_back() {
+        let mut buffer = crate::PixelBuffer::new(20, 20);
+        let mut canvas = super::Canvas::new_raster(&mut buffer);
+        let before = canvas.clip_bounds();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            canvas.with_rasterizer(|_| panic!("draw failed"));
+        }));
+        assert!(caught.is_err());
+        assert_eq!(canvas.clip_bounds(), before, "the clip survives the panic");
+    }
+
     #[test]
     fn recorded_regions_are_recorded_as_regions() {
         // The playback matrix is unknown when recording, so a region is

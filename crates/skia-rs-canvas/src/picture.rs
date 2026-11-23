@@ -406,6 +406,9 @@ pub struct PictureRecorder {
     commands: Vec<DrawCommand>,
     cull_rect: Rect,
     is_recording: bool,
+    /// The recording's save count (starts at 1), kept as commands are
+    /// recorded instead of rescanning them per save.
+    save_count: usize,
 }
 
 impl Default for PictureRecorder {
@@ -422,6 +425,7 @@ impl PictureRecorder {
             commands: Vec::new(),
             cull_rect: Rect::EMPTY,
             is_recording: false,
+            save_count: 1,
         }
     }
 
@@ -430,6 +434,7 @@ impl PictureRecorder {
         self.commands.clear();
         self.cull_rect = cull_rect;
         self.is_recording = true;
+        self.save_count = 1;
         // Safety: we're returning a reference that allows recording
         unsafe { &mut *std::ptr::from_mut(self).cast::<RecordingCanvas>() }
     }
@@ -466,16 +471,8 @@ impl RecordingCanvas {
     ///
     /// Mirrors `SkCanvas::getSaveCount`: starts at 1, +1 per Save/SaveLayer,
     /// -1 per Restore (never below 1).
-    fn save_count(&self) -> usize {
-        let mut count = 1usize;
-        for cmd in &self.inner.commands {
-            match cmd {
-                DrawCommand::Save | DrawCommand::SaveLayer { .. } => count += 1,
-                DrawCommand::Restore => count = count.saturating_sub(1).max(1),
-                _ => {}
-            }
-        }
-        count
+    const fn save_count(&self) -> usize {
+        self.inner.save_count
     }
 
     /// Record a save command.
@@ -485,12 +482,14 @@ impl RecordingCanvas {
     pub fn save(&mut self) -> usize {
         let prev = self.save_count();
         self.inner.commands.push(DrawCommand::Save);
+        self.inner.save_count += 1;
         prev
     }
 
     /// Record a restore command.
     pub fn restore(&mut self) {
         self.inner.commands.push(DrawCommand::Restore);
+        self.inner.save_count = self.inner.save_count.saturating_sub(1).max(1);
     }
 
     /// Record a save layer command.
@@ -506,6 +505,7 @@ impl RecordingCanvas {
     /// `SaveLayerFlags::INIT_WITH_PREVIOUS`), like `SkCanvas::saveLayer`
     /// with a `SaveLayerRec`.
     pub fn save_layer_rec(&mut self, rec: &crate::SaveLayerRec<'_>) {
+        self.inner.save_count += 1;
         self.inner.commands.push(DrawCommand::SaveLayer {
             bounds: rec.bounds.copied(),
             paint: rec.paint.cloned(),
@@ -844,6 +844,20 @@ mod tests {
         let picture = recorder.finish_recording().unwrap();
         assert!(!recorder.is_recording());
         assert_eq!(picture.approximate_op_count(), 4); // save, translate, draw_rect, restore
+    }
+
+    #[test]
+    fn test_recording_save_count_tracks_saves_and_restores() {
+        let mut recorder = PictureRecorder::new();
+        let canvas = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, 10.0, 10.0));
+        assert_eq!(canvas.save(), 1);
+        canvas.save_layer(None, None);
+        assert_eq!(canvas.save(), 3);
+        canvas.restore();
+        canvas.restore();
+        canvas.restore();
+        canvas.restore(); // unbalanced: the count stays at 1
+        assert_eq!(canvas.save(), 1);
     }
 
     #[test]
