@@ -1812,6 +1812,78 @@ impl Matrix {
         }
     }
 
+    /// Maps `rect` and returns the bounds of the result, clipping it to the
+    /// w > 0 side of the camera first under perspective, as
+    /// `SkMatrix::mapRect` does (corners behind the camera would otherwise
+    /// project to flipped positions). Without perspective this is
+    /// [`map_rect`](Self::map_rect). Returns an empty rect when the whole
+    /// rect is behind the camera.
+    ///
+    /// # Examples
+    /// ```
+    /// use skia_rs_core::{Matrix, Rect};
+    /// let mut m = Matrix::translate(0.0, 100.0);
+    /// m.values[Matrix::PERSP_0] = -0.01; // w <= 0 for x >= 100
+    /// let r = m.map_rect_clipped(&Rect::new(0.0, 0.0, 200.0, 200.0));
+    /// assert!(r.left >= 0.0 && r.right > 100.0);
+    /// ```
+    #[must_use]
+    pub fn map_rect_clipped(&self, rect: &Rect) -> Rect {
+        // SkPathPriv's kW0PlaneDistance.
+        const W_MIN: Scalar = 1.0 / 16384.0;
+        if !self.has_perspective() {
+            return self.map_rect(rect);
+        }
+        let values = &self.values;
+        let homogeneous = |px: Scalar, py: Scalar| {
+            (
+                values[Self::SCALE_X] * px + values[Self::SKEW_X] * py + values[Self::TRANS_X],
+                values[Self::SKEW_Y] * px + values[Self::SCALE_Y] * py + values[Self::TRANS_Y],
+                values[Self::PERSP_0] * px + values[Self::PERSP_1] * py + values[Self::PERSP_2],
+            )
+        };
+        let corners = [
+            homogeneous(rect.left, rect.top),
+            homogeneous(rect.right, rect.top),
+            homogeneous(rect.right, rect.bottom),
+            homogeneous(rect.left, rect.bottom),
+        ];
+        // Sutherland-Hodgman against w >= W_MIN, in homogeneous coordinates
+        // (where the projection is linear).
+        let mut kept: [(Scalar, Scalar, Scalar); 8] = [(0.0, 0.0, 0.0); 8];
+        let mut count = 0;
+        for edge in 0..4 {
+            let from = corners[edge];
+            let to = corners[(edge + 1) % 4];
+            let (from_in, to_in) = (from.2 >= W_MIN, to.2 >= W_MIN);
+            if from_in {
+                kept[count] = from;
+                count += 1;
+            }
+            if from_in != to_in {
+                let along = (W_MIN - from.2) / (to.2 - from.2);
+                kept[count] = (
+                    (to.0 - from.0) * along + from.0,
+                    (to.1 - from.1) * along + from.1,
+                    W_MIN,
+                );
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return Rect::EMPTY;
+        }
+        let (mut min_x, mut min_y) = (Scalar::INFINITY, Scalar::INFINITY);
+        let (mut max_x, mut max_y) = (Scalar::NEG_INFINITY, Scalar::NEG_INFINITY);
+        for &(hx, hy, hw) in &kept[..count] {
+            let (px, py) = (hx / hw, hy / hw);
+            min_x = min_x.min(px);
+            min_y = min_y.min(py);
+            max_x = max_x.max(px);
+            max_y = max_y.max(py);
+        }
+        Rect::new(min_x, min_y, max_x, max_y)
+    }
     /// Transforms a rectangle by this matrix (returns bounding box of transformed corners).
     #[inline]
     #[must_use]

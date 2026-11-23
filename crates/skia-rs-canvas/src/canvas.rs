@@ -508,14 +508,7 @@ impl<'a> Canvas<'a> {
         let hinted = rec.bounds.map_or(Some(clip_bounds), |b| {
             // Under perspective, clip the hint to the w plane first (as
             // clips are): map_rect would flip corners behind the camera.
-            let mapped = if ctm.has_perspective() {
-                let mut hint = skia_rs_path::PathBuilder::new();
-                hint.add_rect(b);
-                device_clip_path(&hint.build(), &ctm).bounds()
-            } else {
-                ctm.map_rect(b)
-            };
-            mapped.intersect(&clip_bounds)
+            ctm.map_rect_clipped(b).intersect(&clip_bounds)
         });
         let content = hinted.and_then(|r| r.intersect(&limit));
         let round = |r: Option<Rect>| r.map_or_else(|| IRect::new(0, 0, 0, 0), |r| r.round_out());
@@ -1481,7 +1474,8 @@ impl<'a> Canvas<'a> {
         // with the cull rect mapped through `matrix` (the layer is made
         // before the matrix is concatenated); otherwise a plain save.
         let cull = picture.cull_rect();
-        let bounds = matrix.map_or(cull, |m| m.map_rect(&cull));
+        // Clipped to the w plane under a perspective `matrix`.
+        let bounds = matrix.map_or(cull, |m| m.map_rect_clipped(&cull));
         // SkCanvas::drawPicture plays pictures of at most one op directly
         // (kMaxPictureOpsToUnrollInsteadOfRef); for larger ones
         // onDrawPicture quick-rejects the cull mapped through `matrix` and
@@ -1539,16 +1533,9 @@ impl<'a> Canvas<'a> {
     #[must_use]
     pub fn quick_reject(&self, rect: &Rect) -> bool {
         // Under perspective, clip to the w plane before taking bounds (as
-        // SkMatrixPriv::MapRect does): map_rect would flip corners behind
-        // the camera and could reject a visible rect.
-        let matrix = self.total_matrix();
-        let transformed = if matrix.has_perspective() {
-            let mut b = skia_rs_path::PathBuilder::new();
-            b.add_rect(rect);
-            device_clip_path(&b.build(), matrix).bounds()
-        } else {
-            matrix.map_rect(rect)
-        };
+        // SkMatrix::mapRect does): map_rect would flip corners behind the
+        // camera and could reject a visible rect.
+        let transformed = self.total_matrix().map_rect_clipped(rect);
         self.clip_stack.quick_reject(&transformed)
     }
 

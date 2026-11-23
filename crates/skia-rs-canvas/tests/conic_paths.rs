@@ -2217,3 +2217,26 @@ fn quick_reject_under_perspective_never_rejects_visible_rects() {
         assert!(!(rejected && drawn), "{rect:?} was rejected but draws");
     }
 }
+
+#[test]
+fn pictures_under_a_perspective_matrix_are_not_wrongly_rejected() {
+    // The picture's own matrix flips map_rect's bounds off the device, but
+    // its in-front part draws: it must not be quick-rejected.
+    use skia_rs_canvas::Picture;
+    use skia_rs_core::Matrix;
+
+    let cull = Rect::new(-600.0, -600.0, 200.0, 200.0);
+    let mut cmds = Vec::new();
+    {
+        let mut rec = Canvas::new_recording(&mut cmds, SIZE, SIZE);
+        rec.draw_rect(&cull, &white(Style::Fill));
+        rec.draw_rect(&cull, &white(Style::Fill));
+    }
+    let picture = Picture::from_parts(cmds, cull);
+    let mut persp = Matrix::translate(0.0, 100.0);
+    persp.values[Matrix::PERSP_0] = -0.01;
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_picture(&picture, Some(&persp), None);
+    let drawn = (0..SIZE).any(|y| (0..SIZE).any(|x| lit(&buffer, x, y)));
+    assert!(drawn, "the picture's in-front part is drawn");
+}

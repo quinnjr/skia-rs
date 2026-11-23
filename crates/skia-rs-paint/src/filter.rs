@@ -2147,8 +2147,8 @@ impl ImageFilter for TileImageFilter {
 
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         Some(Arc::new(Self {
-            src_rect: matrix.map_rect(&self.src_rect),
-            dst_rect: matrix.map_rect(&self.dst_rect),
+            src_rect: matrix.map_rect_clipped(&self.src_rect),
+            dst_rect: matrix.map_rect_clipped(&self.dst_rect),
             input: map_input(self.input.as_ref(), matrix),
         }))
     }
