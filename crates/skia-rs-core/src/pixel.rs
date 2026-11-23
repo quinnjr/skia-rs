@@ -55,7 +55,11 @@ pub enum PixelError {
 ///
 /// Equivalent to Skia's `SkImageInfo`.
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "ImageInfoData")
+)]
 pub struct ImageInfo {
     /// Image dimensions.
     pub dimensions: ISize,
@@ -65,6 +69,33 @@ pub struct ImageInfo {
     pub alpha_type: AlphaType,
     /// Color space (optional).
     pub color_space: Option<ColorSpace>,
+}
+
+/// The serialized fields of an [`ImageInfo`], validated through
+/// [`ImageInfo::new`] when deserializing (negative dimensions are rejected).
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct ImageInfoData {
+    dimensions: ISize,
+    color_type: ColorType,
+    alpha_type: AlphaType,
+    color_space: Option<ColorSpace>,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<ImageInfoData> for ImageInfo {
+    type Error = PixelError;
+
+    fn try_from(data: ImageInfoData) -> Result<Self, Self::Error> {
+        let mut info = Self::new(
+            data.dimensions.width,
+            data.dimensions.height,
+            data.color_type,
+            data.alpha_type,
+        )?;
+        info.color_space = data.color_space;
+        Ok(info)
+    }
 }
 
 impl ImageInfo {

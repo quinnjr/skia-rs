@@ -2042,5 +2042,10 @@ mod serde_tests {
             serde_json::from_str::<crate::ImageInfo>(&json).unwrap(),
             info
         );
+
+        // Deserializing validates like ImageInfo::new: no negative sizes.
+        let bad = json.replacen("\"width\":4", "\"width\":-1", 1);
+        assert_ne!(bad, json);
+        assert!(serde_json::from_str::<crate::ImageInfo>(&bad).is_err());
     }
 }
