@@ -553,3 +553,18 @@ fn dashed_rects_join_at_the_start_corner_when_the_pattern_wraps_on() {
         "mitered start corner"
     );
 }
+
+#[test]
+fn no_op_trims_keep_a_zero_length_contour() {
+    use skia_rs_path::{PathEffect, TrimEffect, TrimMode};
+
+    let mut b = PathBuilder::new();
+    b.move_to(5.0, 5.0).line_to(5.0, 5.0);
+    let dot = b.build();
+    let apply = |start, end, mode| TrimEffect::new(start, end, mode).and_then(|t| t.apply(&dot));
+    // No effect (as SkTrimPathEffect::Make returns null): the dot is kept.
+    assert!(!apply(0.0, 1.0, TrimMode::Normal).unwrap().is_empty());
+    assert!(!apply(0.75, 0.25, TrimMode::Inverted).unwrap().is_empty());
+    // A real trim of a zero-length source adds nothing.
+    assert!(apply(0.25, 0.75, TrimMode::Normal).unwrap().is_empty());
+}

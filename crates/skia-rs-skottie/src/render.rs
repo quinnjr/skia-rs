@@ -636,7 +636,8 @@ fn apply_trim(paths: Vec<Path>, trim: &TrimPathShape, frame: Scalar) -> Vec<Path
 /// `inverted`, the *complement* interval (`[0,start] U [stop,1]`) is kept
 /// instead (`SkTrimPathEffect::Mode::kInverted`).
 fn trim_path(path: &Path, start: Scalar, stop: Scalar, inverted: bool) -> Path {
-    if !inverted && start <= 0.0 && stop >= 1.0 {
+    // No effect (SkTrimPathEffect::Make returns null): the source as is.
+    if (!inverted && start <= 0.0 && stop >= 1.0) || (inverted && start >= stop) {
         return path.clone();
     }
     if !inverted && start >= stop {
@@ -824,6 +825,9 @@ mod tests {
         let dot = b.build();
         assert!(super::trim_path(&dot, 0.25, 0.75, false).is_empty());
         assert!(super::trim_path(&dot, 0.25, 0.75, true).is_empty());
+        // A no-op trim keeps it (its cap still draws a dot).
+        assert!(!super::trim_path(&dot, 0.0, 1.0, false).is_empty());
+        assert!(!super::trim_path(&dot, 0.75, 0.25, true).is_empty());
     }
 
     use super::*;

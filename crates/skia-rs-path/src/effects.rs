@@ -1327,6 +1327,16 @@ impl TrimEffect {
 
 impl PathEffect for TrimEffect {
     fn apply(&self, path: &Path) -> Option<Path> {
+        // SkTrimPathEffect::Make returns no effect for a full normal trim
+        // and an empty inverted one: the source is drawn as is (a
+        // zero-length one still gets its capped dot).
+        let no_effect = match self.mode {
+            TrimMode::Normal => self.start <= 0.0 && self.end >= 1.0,
+            TrimMode::Inverted => self.start >= self.end,
+        };
+        if no_effect {
+            return Some(path.clone());
+        }
         let measure = crate::measure::PathMeasure::new(path);
         let total = measure.length();
         if total <= 0.0 {
