@@ -1517,7 +1517,19 @@ impl Path2DEffect {
                 c.bottom - b.top,
             )
         });
-        let spans = lattice_spans(src_path, &inverse, cull.as_ref());
+        let mut spans = lattice_spans(src_path, &inverse, cull.as_ref());
+        // Stamps cost per cell, so clip span columns to the cull here
+        // (lattice_spans culls rows only).
+        if let Some((cull_left, _, cull_right, _)) = lattice_cull(&inverse, cull.as_ref()) {
+            spans = spans
+                .into_iter()
+                .filter_map(|(y, first, count)| {
+                    let start = first.max(cull_left);
+                    let end = first.saturating_add(count).min(cull_right);
+                    (start < end).then(|| (y, start, end - start))
+                })
+                .collect();
+        }
 
         // Output budget: keep every stamp when the total fits. Otherwise
         // share the budget across rows by need (water-filling: rows that
@@ -1529,7 +1541,7 @@ impl Path2DEffect {
         for &(y, _, count) in &spans {
             let count = usize::try_from(count).unwrap_or(0);
             match row_need.last_mut() {
-                Some((row, need)) if *row == y => *need += count,
+                Some((row, need)) if *row == y => *need = need.saturating_add(count),
                 _ => row_need.push((y, count)),
             }
         }
@@ -1706,12 +1718,32 @@ fn row_intervals(
     intervals
 }
 
+/// The cull rect in lattice cells, `(left, top, right, bottom)` half-open,
+/// outset by a cell (a cell's output can reach past its center by up to a
+/// cell). `None` when there is no usable cull: none given, non-finite, or a
+/// perspective inverse, which can map the cull's corners across the horizon
+/// (w <= 0) where their bounding box no longer covers the visible cells.
+fn lattice_cull(
+    inverse: &skia_rs_core::Matrix,
+    cull: Option<&skia_rs_core::Rect>,
+) -> Option<(i32, i32, i32, i32)> {
+    let cull = cull.filter(|c| c.is_finite() && !inverse.has_perspective())?;
+    let c = inverse.map_rect(cull);
+    Some((
+        floor_to_i32(c.left).saturating_sub(1),
+        floor_to_i32(c.top).saturating_sub(1),
+        ceil_to_i32(c.right).saturating_add(1),
+        ceil_to_i32(c.bottom).saturating_add(1),
+    ))
+}
+
 /// The largest per-row cap `c` such that `sum(min(need, c)) <= budget`
 /// (`usize::MAX` when everything fits): rows needing less than `c` keep all
 /// of their cells and the remainder is shared equally.
 fn water_fill_cap(needs: impl Iterator<Item = usize>, budget: usize) -> usize {
     let mut needs: Vec<usize> = needs.collect();
-    if needs.iter().sum::<usize>() <= budget {
+    // Saturating: on 32-bit targets the total can exceed usize.
+    if needs.iter().fold(0_usize, |sum, &n| sum.saturating_add(n)) <= budget {
         return usize::MAX;
     }
     needs.sort_unstable();
@@ -1756,20 +1788,12 @@ fn lattice_spans(
     // Limit to the cull area in lattice space, outset by a cell (a cell's
     // output can reach past its center by up to a cell). Cells outside it
     // produce nothing visible.
-    // A perspective inverse can map the cull's corners across the horizon
-    // (w <= 0), where their bounding box no longer covers the visible
-    // cells: skip the cull then.
-    let (left, top, right, bottom) = match cull {
-        Some(cull) if cull.is_finite() && !inverse.has_perspective() => {
-            let c = inverse.map_rect(cull);
-            (
-                left.max(floor_to_i32(c.left).saturating_sub(1)),
-                top.max(floor_to_i32(c.top).saturating_sub(1)),
-                right.min(ceil_to_i32(c.right).saturating_add(1)),
-                bottom.min(ceil_to_i32(c.bottom).saturating_add(1)),
-            )
-        }
-        _ => (left, top, right, bottom),
+    // Only rows are culled here: spans keep their true extent, so callers
+    // that judge a span by its length (Line2D's `count > 1`) see the whole
+    // run, and callers that pay per cell clip columns themselves.
+    let (top, bottom) = match lattice_cull(inverse, cull) {
+        Some((_, cull_top, _, cull_bottom)) => (top.max(cull_top), bottom.min(cull_bottom)),
+        None => (top, bottom),
     };
     if left >= right || top >= bottom {
         return Vec::new();
@@ -2577,6 +2601,26 @@ mod tests {
         let hatch = Line2DEffect::new(0.0, skia_rs_core::Matrix::scale(4.0, 4.0)).unwrap();
         let lines = hatch.apply(&square(40.0)).expect("applies");
         assert!(!lines.is_empty(), "the hairline hatch is not lost");
+    }
+
+    #[test]
+    fn line2d_keeps_lines_whose_span_ends_just_inside_the_cull() {
+        // 20-unit cells; the source covers cells 0..=4 (a 5-cell span whose
+        // line runs to x = 110). The cull starts at x = 103, i.e. lattice
+        // column 4 after the one-cell outset. Clipping the span to the cull
+        // first would leave one cell and drop the line; it must stay.
+        let hatch = Line2DEffect::new(1.0, skia_rs_core::Matrix::scale(20.0, 20.0)).unwrap();
+        let mut b = PathBuilder::new();
+        b.add_rect(&skia_rs_core::Rect::new(0.0, 0.0, 110.0, 200.0));
+        let cull = skia_rs_core::Rect::new(103.0, 0.0, 300.0, 200.0);
+        let mut rec = StrokeRec::Fill;
+        let lines = hatch
+            .filter_path_culled(&b.build(), &mut rec, Some(&cull))
+            .expect("applies");
+        assert!(
+            lines.points().iter().any(|p| p.x > 105.0),
+            "hatch reaches into the cull"
+        );
     }
 
     #[test]
