@@ -1642,6 +1642,7 @@ impl<'a> Canvas<'a> {
             let mut bold = paint.clone();
             match paint.style() {
                 Style::Fill => {
+                    use_fake_bold_stroke_params(&mut bold);
                     bold.set_style(Style::StrokeAndFill);
                     bold.set_stroke_width(extra);
                 }
@@ -1681,6 +1682,7 @@ impl<'a> Canvas<'a> {
                 // path below.
                 self.draw_path(&device_path, paint);
                 let mut outset = paint.clone();
+                use_fake_bold_stroke_params(&mut outset);
                 outset.set_style(Style::Stroke);
                 outset.set_stroke_width(device_extra);
                 self.draw_path(&device_path, &outset);
@@ -1690,6 +1692,7 @@ impl<'a> Canvas<'a> {
                 // must be covered exactly once, so fill the union
                 // (StrokeAndFill).
                 let mut bold = paint.clone();
+                use_fake_bold_stroke_params(&mut bold);
                 bold.set_style(Style::StrokeAndFill);
                 bold.set_stroke_width(device_extra);
                 self.draw_path(&device_path, &bold);
@@ -2546,6 +2549,17 @@ fn paint_with_stroke_rec(paint: &Paint, rec: skia_rs_path::StrokeRec) -> Option<
     styled.set_style(style);
     styled.set_stroke_width(width);
     Some(styled)
+}
+
+/// Skia emboldens glyph outlines in the scaler context with a fresh
+/// `SkStrokeRec(kFill_InitStyle).setStrokeStyle(extra, true)`, whose join,
+/// miter limit and cap are the defaults (miter, 4, butt), never the paint's.
+#[cfg(feature = "text")]
+const fn use_fake_bold_stroke_params(paint: &mut Paint) {
+    paint
+        .set_stroke_join(skia_rs_paint::StrokeJoin::Miter)
+        .set_stroke_miter(4.0)
+        .set_stroke_cap(skia_rs_paint::StrokeCap::Butt);
 }
 
 /// Extra outline width Skia adds to emboldened ("fake bold") glyphs.

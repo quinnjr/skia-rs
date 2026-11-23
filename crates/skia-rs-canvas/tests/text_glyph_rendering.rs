@@ -367,3 +367,26 @@ fn embolden_under_an_anti_aliased_clip_blends_once() {
     }
     assert!(painted > 0, "the bold glyph must paint inside the clip");
 }
+
+#[test]
+fn fake_bold_ignores_the_paint_stroke_join() {
+    // Skia emboldens with a default SkStrokeRec (miter join, limit 4, butt
+    // cap), so the paint's join must not change emboldened fill text.
+    let render = |join: skia_rs_paint::StrokeJoin| {
+        let mut font = demo_font(120.0);
+        font.set_embolden(true);
+        let mut paint = Paint::new();
+        paint.set_color(Color::WHITE.into());
+        paint.set_stroke_join(join);
+        let mut buffer = PixelBuffer::new(300, 300);
+        Canvas::new_raster(&mut buffer).draw_string("A", 60.0, 220.0, &font, &paint);
+        (0..300)
+            .flat_map(|y| (0..300).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).map_or(0, |c| c.red()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        render(skia_rs_paint::StrokeJoin::Round),
+        render(skia_rs_paint::StrokeJoin::Miter)
+    );
+}
