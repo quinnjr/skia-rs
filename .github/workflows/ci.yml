@@ -382,6 +382,16 @@ jobs:
           done
         continue-on-error: true
 
+      # Every job uploads something, so the summary lists every row (with
+      # "Not compared" where no images are generated or compared).
+      - name: Record comparison status
+        if: always()
+        run: |
+          mkdir -p conformance_results
+          if [ ! -f conformance_results/report.txt ]; then
+            echo "not compared" > conformance_results/status.txt
+          fi
+
       # Upload conformance results
       - name: Upload conformance results
         uses: actions/upload-artifact@v4
