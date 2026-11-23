@@ -457,9 +457,15 @@ void sk_surface_ref(sk_surface_t *surface);
 void sk_surface_unref(sk_surface_t *surface);
 
 // Get the reference count of a surface.
+//
+// A canvas locked with [`sk_surface_lock_canvas`] holds one reference
+// until [`sk_canvas_release`].
 uint32_t sk_surface_get_refcnt(const sk_surface_t *surface);
 
 // Check if the surface has only one reference.
+//
+// A locked canvas holds a reference, so this is false while one is
+// locked.
 bool sk_surface_is_unique(const sk_surface_t *surface);
 
 // Get the width of a surface.

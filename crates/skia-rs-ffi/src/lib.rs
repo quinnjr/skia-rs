@@ -718,12 +718,18 @@ pub unsafe extern "C" fn sk_surface_unref(surface: *mut sk_surface_t) {
 }
 
 /// Get the reference count of a surface.
+///
+/// A canvas locked with [`sk_surface_lock_canvas`] holds one reference
+/// until [`sk_canvas_release`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_surface_get_refcnt(surface: *const sk_surface_t) -> u32 {
     catch_panic(|| RefCounted::get_count(surface))
 }
 
 /// Check if the surface has only one reference.
+///
+/// A locked canvas holds a reference, so this is false while one is
+/// locked.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_surface_is_unique(surface: *const sk_surface_t) -> bool {
     catch_panic(|| RefCounted::is_unique(surface))
@@ -2012,9 +2018,12 @@ impl Drop for SurfaceUnlock {
         if self.0 == 0 {
             return;
         }
-        if let Ok(mut locked) = locked_surfaces().lock() {
-            locked.remove(&self.0);
-        }
+        // Remove the entry even if another thread poisoned the mutex: a
+        // stale address would make a later surface there look locked.
+        locked_surfaces()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
         // SAFETY: the lock took a reference, so the surface is alive.
         unsafe { RefCounted::unref_ptr(self.0 as *mut sk_surface_t) };
     }
@@ -2074,19 +2083,36 @@ pub unsafe extern "C" fn sk_canvas_save_layer(
     paint: *const sk_paint_t,
 ) -> i32 {
     catch_panic(|| {
+        use skia_rs_core::cast::scalar_from_i32;
+
         let Some(c) = canvas.as_mut() else {
             return 0;
         };
         let bounds = bounds.as_ref().map(|b| Rect::from(*b));
         let paint = RefCounted::get_ref(paint).cloned();
         let (_, (ox, oy)) = c.target();
-        let rect = c
-            .canvas_with_state()
-            .layer_bounds(&skia_rs_canvas::SaveLayerRec {
-                bounds: bounds.as_ref(),
-                paint: paint.as_ref(),
-                flags: skia_rs_canvas::SaveLayerFlags::NONE,
-            });
+        // The surface, in the coordinates of the current target's pixels:
+        // bounds nested filtered layers by the real device, not the parent
+        // layer.
+        let device = Rect::new(
+            scalar_from_i32(-ox),
+            scalar_from_i32(-oy),
+            scalar_from_i32(c.width - ox),
+            scalar_from_i32(c.height - oy),
+        );
+        let (rect, paint) = {
+            let inner = c.canvas_with_state();
+            let rect = inner.layer_bounds_within(
+                &skia_rs_canvas::SaveLayerRec {
+                    bounds: bounds.as_ref(),
+                    paint: paint.as_ref(),
+                    flags: skia_rs_canvas::SaveLayerFlags::NONE,
+                },
+                &device,
+            );
+            let paint = inner.layer_paint(paint.as_ref(), &rect);
+            (rect, paint)
+        };
         let (w, h) = (rect.width().max(0), rect.height().max(0));
         let pixels = Box::into_raw(Box::new(PixelBuffer::new(w, h)));
         let layer = FfiLayer {
@@ -5095,6 +5121,39 @@ mod tests {
             let again = sk_surface_lock_canvas(surface);
             assert!(!again.is_null());
             sk_canvas_release(again);
+            sk_surface_unref(surface);
+        }
+    }
+
+    #[test]
+    fn test_nested_filtered_layers_stay_bounded_by_the_surface() {
+        // Each filtered layer may reach past the surface by at most the
+        // surface size, however deeply layers nest (the parent layer is
+        // not the device).
+        unsafe {
+            let surface = sk_surface_new_raster(20, 20);
+            let canvas = sk_surface_lock_canvas(surface);
+            let blur = sk_imagefilter_new_blur(1000.0, 1000.0, 0);
+            let paint = sk_paint_new();
+            sk_paint_set_image_filter(paint, blur);
+            for _ in 0..3 {
+                sk_canvas_save_layer(canvas, ptr::null(), paint);
+            }
+            let mut out = sk_irect_t {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            assert!(sk_canvas_get_clip_ibounds(canvas, &raw mut out));
+            assert!(
+                out.left >= -20 && out.top >= -20 && out.right <= 40 && out.bottom <= 40,
+                "layer bounds {:?}",
+                (out.left, out.top, out.right, out.bottom)
+            );
+            sk_canvas_release(canvas);
+            sk_paint_unref(paint);
+            sk_imagefilter_unref(blur);
             sk_surface_unref(surface);
         }
     }
