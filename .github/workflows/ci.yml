@@ -367,9 +367,16 @@ jobs:
               base=$(basename "$img")
               ref="conformance/reference/$base"
               if [ -f "$ref" ]; then
-                # Calculate RMSE difference
+                # RMSE as "absolute (normalized)"; judge the normalized
+                # value against the conformance test's MAX_RMSE (0.01).
                 diff=$(compare -metric RMSE "$img" "$ref" null: 2>&1 || true)
-                echo "${{ matrix.backend }}: $base - RMSE: $diff" >> conformance_results/report.txt
+                norm=$(echo "$diff" | sed -n 's/.*(\([0-9.eE+-]*\)).*/\1/p')
+                if [ -n "$norm" ] && awk -v n="$norm" 'BEGIN { exit !(n + 0 <= 0.01) }'; then
+                  result=PASS
+                else
+                  result=FAIL
+                fi
+                echo "$result ${{ matrix.backend }}: $base - RMSE: $diff" >> conformance_results/report.txt
               fi
             fi
           done
@@ -420,10 +427,13 @@ jobs:
               backend=$(echo "$backend_os" | cut -d'-' -f1)
               os=$(echo "$backend_os" | cut -d'-' -f2-)
 
-              if [ -f "$dir/conformance_results/report.txt" ]; then
-                status="✅ Pass"
-              else
+              report="$dir/conformance_results/report.txt"
+              if [ ! -f "$report" ]; then
                 status="⚠️ No results"
+              elif grep -q '^FAIL ' "$report"; then
+                status="❌ Diverged"
+              else
+                status="✅ Pass"
               fi
 
               echo "| $backend | $os | $status |" >> $GITHUB_STEP_SUMMARY
