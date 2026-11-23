@@ -2648,7 +2648,11 @@ impl Canvas<'_> {
         // maps equal coordinates to equal device values, so rect-by-rect
         // stays exact there (and avoids the costly boundary union).
         let not_scale_translate = !m.is_scale_translate();
-        if not_scale_translate
+        // A recording does not know the matrix it will be played back
+        // under: record the boundary, which is right for any matrix.
+        let recording = matches!(self.backing, Backing::Recording(_));
+        if recording
+            || not_scale_translate
             || complex_paint
             || (paint.is_anti_alias() && (non_translate || fractional_translate))
         {
@@ -3227,9 +3231,9 @@ fn filtered_layer_area(
     if area.is_finite() && area <= budget {
         return needed;
     }
-    let reach = device.width().max(device.height());
+    // Each axis outset by its own size: at most 3W x 3H, i.e. the budget.
     needed
-        .intersect(&device_full.inset(-reach, -reach))
+        .intersect(&device_full.inset(-device.width(), -device.height()))
         .unwrap_or(clip)
 }
 
@@ -3512,6 +3516,52 @@ const fn colr_composite_to_blend(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recorded_regions_record_their_boundary() {
+        // The playback matrix is unknown when recording, so a region is
+        // recorded as one boundary path (seam-free under any matrix), not
+        // rect by rect.
+        use super::{Canvas, DrawCommand, Paint};
+
+        let mut region = skia_rs_core::Region::new();
+        region.op_rect(
+            skia_rs_core::IRect::new(0, 0, 10, 10),
+            skia_rs_core::RegionOp::Union,
+        );
+        region.op_rect(
+            skia_rs_core::IRect::new(10, 0, 20, 5),
+            skia_rs_core::RegionOp::Union,
+        );
+        let mut cmds = Vec::new();
+        let mut c = Canvas::new_recording(&mut cmds, 100, 100);
+        c.draw_region(&region, &Paint::new());
+        drop(c);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, DrawCommand::DrawPath { .. })),
+            "{cmds:?}"
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, DrawCommand::DrawRect { .. })),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn filtered_layer_fallback_stays_within_the_area_budget() {
+        // A wide, short device: the fallback outsets each axis by its own
+        // size, so the layer stays within 9x the device area.
+        let device = super::Rect::new(0.0, 0.0, 10_000.0, 10.0);
+        let filter = skia_rs_paint::OffsetImageFilter::new(-1.0e6, -1.0e6, None);
+        let area = super::filtered_layer_area(&filter, device, &device, &device);
+        assert!(
+            area.width() * area.height() <= 9.0 * 10_000.0 * 10.0,
+            "{area:?}"
+        );
+    }
+
     #[test]
     fn multi_turn_arc_pieces_join_without_extra_lines() {
         // SkPath::arcTo's addPt adds no join line when the next piece starts
