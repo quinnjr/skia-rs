@@ -23,8 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   color filter and image filter. C API clips now keep the matrix they were
   set under, as in Skia; a later transform no longer moves them.
 - Layers implement `SaveLayerFlags::INIT_WITH_PREVIOUS` and apply the
-  layer paint's image filter on restore (the layer is sized to include the
-  filter's reach past the clip, at most the device size past the device).
+  layer paint's image filter on restore. Like Skia, a filtered layer is
+  sized from what the filter reads (new `ImageFilter::input_bounds`: a
+  blur's margin, an offset's or shadow's source, a tile's source rect), up
+  to 9x the device area (Skia downsamples larger layers; past that the
+  layer is cut to the device outset by its size).
   As in Skia, the filter's parameters are mapped from local space into the
   layer (sigmas, offsets and radii scale and rotate with the matrix) via the
   new `ImageFilter::map_params` / `map_image_filter`. Blur and drop-shadow

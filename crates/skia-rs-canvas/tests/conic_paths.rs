@@ -1863,3 +1863,65 @@ fn huge_layer_blurs_are_clamped_like_skia() {
         "{bounds:?}"
     );
 }
+
+#[test]
+fn tile_layer_filters_read_their_source_rect_beyond_the_clip() {
+    // Skia sizes a filtered layer from the filter's input: a tile filter's
+    // source rect past the clip is still drawn into the layer and tiled.
+    use skia_rs_canvas::{ClipOp, SaveLayerRec};
+    use skia_rs_paint::TileImageFilter;
+    use std::sync::Arc;
+
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.clip_rect(&Rect::new(0.0, 0.0, 50.0, 50.0), ClipOp::Intersect, false);
+        let mut layer_paint = Paint::new();
+        layer_paint.set_image_filter(Some(Arc::new(TileImageFilter::new(
+            Rect::new(40.0, 40.0, 60.0, 60.0),
+            Rect::new(0.0, 0.0, 50.0, 50.0),
+            None,
+        ))));
+        canvas.save_layer(&SaveLayerRec {
+            paint: Some(&layer_paint),
+            ..SaveLayerRec::default()
+        });
+        let mut red = Paint::new();
+        red.set_color32(Color::from_argb(255, 255, 0, 0));
+        let mut blue = Paint::new();
+        blue.set_color32(Color::from_argb(255, 0, 0, 255));
+        canvas.draw_rect(&Rect::new(40.0, 40.0, 50.0, 60.0), &red);
+        canvas.draw_rect(&Rect::new(50.0, 40.0, 60.0, 60.0), &blue);
+        canvas.restore();
+    }
+    let c = buffer.get_pixel(15, 5).unwrap_or(Color::BLACK);
+    assert_eq!(
+        (c.red(), c.blue()),
+        (0, 255),
+        "the blue half of the tile: {c:?}"
+    );
+}
+
+#[test]
+fn large_offset_layer_filters_keep_their_source() {
+    // An offset filter moving content well past the device still finds it:
+    // the layer holds the offset's source area.
+    use skia_rs_canvas::SaveLayerRec;
+    use skia_rs_paint::OffsetImageFilter;
+    use std::sync::Arc;
+
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        let mut layer_paint = Paint::new();
+        layer_paint.set_image_filter(Some(Arc::new(OffsetImageFilter::new(-450.0, 0.0, None))));
+        canvas.save_layer(&SaveLayerRec {
+            paint: Some(&layer_paint),
+            ..SaveLayerRec::default()
+        });
+        canvas.draw_rect(&Rect::new(460.0, 10.0, 490.0, 40.0), &white(Style::Fill));
+        canvas.restore();
+    }
+    let a = buffer.get_pixel(25, 20).map_or(0, |c| c.alpha());
+    assert_eq!(a, 255, "the moved rect is drawn at x 10..40");
+}

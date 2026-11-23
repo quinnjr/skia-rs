@@ -453,28 +453,19 @@ impl<'a> Canvas<'a> {
             .paint
             .and_then(Paint::image_filter)
             .map(|f| skia_rs_paint::map_image_filter(f, &ctm));
-        let mut reach = 0.0;
         if let Some(filter) = &filter {
-            // The input a filter needs mirrors how far it spreads its
-            // output (a blur's radius, a shadow's offset): outset by the
-            // largest spread on any side, at most the device size.
-            let out = filter.filter_bounds(&clip_bounds);
-            reach = [
-                clip_bounds.left - out.left,
-                clip_bounds.top - out.top,
-                out.right - clip_bounds.right,
-                out.bottom - clip_bounds.bottom,
-            ]
-            .into_iter()
-            .fold(0.0, Scalar::max)
-            .min(device.width().max(device.height()));
-            clip_bounds = clip_bounds.inset(-reach, -reach);
+            clip_bounds = filtered_layer_area(filter.as_ref(), clip_bounds, device, &device_full);
         }
+        let limit = if filter.is_some() {
+            clip_bounds
+        } else {
+            device_full
+        };
         let hinted = rec.bounds.map_or(Some(clip_bounds), |b| {
             ctm.map_rect(b).intersect(&clip_bounds)
         });
         hinted
-            .and_then(|r| r.intersect(&device_full.inset(-reach, -reach)))
+            .and_then(|r| r.intersect(&limit))
             .map_or_else(|| IRect::new(0, 0, 0, 0), |r| r.round_out())
     }
 
@@ -583,7 +574,21 @@ impl<'a> Canvas<'a> {
         if let Some(filter) = paint.image_filter() {
             let to_usize = |v: i32| usize::try_from(v).unwrap_or(0);
             let (w, h) = (to_usize(src_pixels.width), to_usize(src_pixels.height));
-            if src_pixels.stride == w * 4 {
+            // Filters take tightly packed rows: repack a padded buffer.
+            let row = w * 4;
+            if src_pixels.stride != row && h > 0 {
+                let stride = src_pixels.stride;
+                let fits = stride >= row && src_pixels.pixels.len() >= (h - 1) * stride + row;
+                if fits {
+                    let mut tight = Vec::with_capacity(row * h);
+                    for y in 0..h {
+                        tight.extend_from_slice(&src_pixels.pixels[y * stride..y * stride + row]);
+                    }
+                    src_pixels.pixels = tight;
+                    src_pixels.stride = row;
+                }
+            }
+            if src_pixels.stride == row {
                 filter.apply(&mut src_pixels.pixels, w, h);
             }
         }
@@ -3142,6 +3147,34 @@ fn device_clip_path(path: &Path, matrix: &Matrix) -> Path {
     };
     out.transform(matrix);
     out
+}
+
+/// The device area a layer with image `filter` must cover to produce the
+/// clip area `clip` (`device`: the device; `device_full`: the current
+/// target's extent).
+///
+/// Like Skia (`getInputBounds`), the layer holds what the filter reads to
+/// produce the clip area (a blur's margin, a shadow's or offset's source, a
+/// tile's source rect), and the output area itself, since the filter runs
+/// in place on the layer's pixels. Skia downsamples layers that would be
+/// too large; here a layer past 9x the device area is cut to the device
+/// outset by its size instead.
+fn filtered_layer_area(
+    filter: &dyn skia_rs_paint::ImageFilter,
+    clip: Rect,
+    device: &Rect,
+    device_full: &Rect,
+) -> Rect {
+    let needed = clip.union(&filter.input_bounds(&clip));
+    let area = needed.width() * needed.height();
+    let budget = 9.0 * device.width().max(1.0) * device.height().max(1.0);
+    if area.is_finite() && area <= budget {
+        return needed;
+    }
+    let reach = device.width().max(device.height());
+    needed
+        .intersect(&device_full.inset(-reach, -reach))
+        .unwrap_or(clip)
 }
 
 /// The most whole turns `build_arc_path` draws for one arc.

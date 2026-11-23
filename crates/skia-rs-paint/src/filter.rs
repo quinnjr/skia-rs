@@ -397,6 +397,15 @@ pub trait ImageFilter: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// The area of the source this filter reads to produce `output` (both
+    /// in layer space), like `SkImageFilter_Base::onGetInputLayerBounds`:
+    /// a layer with this filter must hold it. The default mirrors
+    /// [`filter_bounds`](Self::filter_bounds), outsetting `output` by the
+    /// filter's largest spread on any side.
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        spread_input(&self.filter_bounds(output), output)
+    }
+
     /// This filter with its geometric parameters (blur sigmas, offsets,
     /// radii, rects, and those of its inputs) mapped through `matrix`, as
     /// `SkCanvas` maps a layer's image filter from local space into layer
@@ -424,6 +433,30 @@ const MAX_BLUR_SIGMA: Scalar = 532.0;
 /// A blur sigma clamped like `SkBlurImageFilter` (to [`MAX_BLUR_SIGMA`]).
 const fn max_sigma(sigma: Scalar) -> Scalar {
     sigma.min(MAX_BLUR_SIGMA)
+}
+
+/// `output` outset by the largest amount `spread` (a filter's output bounds
+/// for `output`) extends past it on any side.
+fn spread_input(spread: &Rect, output: &Rect) -> Rect {
+    let reach = [
+        output.left - spread.left,
+        output.top - spread.top,
+        spread.right - output.right,
+        spread.bottom - output.bottom,
+    ]
+    .into_iter()
+    .fold(0.0, Scalar::max);
+    if reach.is_finite() {
+        output.inset(-reach, -reach)
+    } else {
+        *output
+    }
+}
+
+/// What an optional input filter reads for `rect` (`None` is the source
+/// itself, which is read as is).
+fn input_of(input: Option<&ImageFilterRef>, rect: &Rect) -> Rect {
+    input.map_or(*rect, |f| f.input_bounds(rect))
 }
 
 /// Maps an optional input filter.
@@ -549,6 +582,21 @@ impl DropShadowImageFilter {
 }
 
 impl ImageFilter for DropShadowImageFilter {
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        // The shadow at `output` comes from the source moved back by the
+        // offset, blurred (3 sigma); the source itself is drawn unless
+        // shadow-only.
+        let shadow = output.offset(-self.dx, -self.dy).inset(
+            -3.0 * max_sigma(self.sigma_x),
+            -3.0 * max_sigma(self.sigma_y),
+        );
+        if self.shadow_only {
+            shadow
+        } else {
+            shadow.union(output)
+        }
+    }
+
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         let (dx, dy) = map_vector(matrix, self.dx, self.dy);
         let (sigma_x, sigma_y) = map_size(matrix, self.sigma_x, self.sigma_y);
@@ -843,6 +891,13 @@ impl MorphologyImageFilter {
 }
 
 impl ImageFilter for MorphologyImageFilter {
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        input_of(
+            self.input.as_ref(),
+            &output.inset(-self.radius_x, -self.radius_y),
+        )
+    }
+
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         let (radius_x, radius_y) = map_size(matrix, self.radius_x, self.radius_y);
         Some(Arc::new(Self {
@@ -977,6 +1032,10 @@ impl ColorFilterImageFilter {
 }
 
 impl ImageFilter for ColorFilterImageFilter {
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        input_of(self.input.as_ref(), output)
+    }
+
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         let input = self.input.as_ref()?;
         Some(Arc::new(Self {
@@ -1097,6 +1156,14 @@ impl DisplacementMapImageFilter {
 }
 
 impl ImageFilter for DisplacementMapImageFilter {
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        // The color input is read up to scale/2 away; the displacement map
+        // at the output itself.
+        let reach = self.scale.abs() / 2.0;
+        let color = input_of(self.color.as_ref(), &output.inset(-reach, -reach));
+        color.union(&self.displacement.input_bounds(output))
+    }
+
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         // Skia maps the scale as a size; this filter has one scale for
         // both axes, so take the mean of the two mapped lengths.
@@ -1285,6 +1352,11 @@ impl LightingImageFilter {
 }
 
 impl ImageFilter for LightingImageFilter {
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        // Surface normals read the neighbouring pixels.
+        input_of(self.input.as_ref(), &output.inset(-1.0, -1.0))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         // Lighting doesn't change bounds
         *src
@@ -1394,6 +1466,11 @@ impl ComposeImageFilter {
 }
 
 impl ImageFilter for ComposeImageFilter {
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        // The inner filter produces what the outer one reads.
+        self.inner.input_bounds(&self.outer.input_bounds(output))
+    }
+
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         Some(Arc::new(Self {
             outer: map_image_filter(&self.outer, matrix),
@@ -1443,6 +1520,13 @@ impl MergeImageFilter {
 }
 
 impl ImageFilter for MergeImageFilter {
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        self.inputs
+            .iter()
+            .map(|i| input_of(i.as_ref(), output))
+            .fold(*output, |acc, r| acc.union(&r))
+    }
+
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         Some(Arc::new(Self {
             inputs: self
@@ -1510,6 +1594,10 @@ impl OffsetImageFilter {
 }
 
 impl ImageFilter for OffsetImageFilter {
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        input_of(self.input.as_ref(), &output.offset(-self.dx, -self.dy))
+    }
+
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         let (dx, dy) = map_vector(matrix, self.dx, self.dy);
         Some(Arc::new(Self {
@@ -1629,6 +1717,13 @@ impl MatrixConvolutionImageFilter {
 }
 
 impl ImageFilter for MatrixConvolutionImageFilter {
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        input_of(
+            self.input.as_ref(),
+            &spread_input(&self.filter_bounds(output), output),
+        )
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         let (kw, kh) = self.kernel_size;
         let (ox, oy) = self.kernel_offset;
@@ -1783,6 +1878,11 @@ impl TileImageFilter {
 }
 
 impl ImageFilter for TileImageFilter {
+    fn input_bounds(&self, _output: &Rect) -> Rect {
+        // SkTileImageFilter reads its source rect, whatever the output.
+        input_of(self.input.as_ref(), &self.src_rect)
+    }
+
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         Some(Arc::new(Self {
             src_rect: matrix.map_rect(&self.src_rect),
@@ -1883,6 +1983,11 @@ impl BlendImageFilter {
 }
 
 impl ImageFilter for BlendImageFilter {
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        input_of(self.background.as_ref(), output)
+            .union(&input_of(self.foreground.as_ref(), output))
+    }
+
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         Some(Arc::new(Self {
             mode: self.mode,
@@ -1978,6 +2083,11 @@ impl ArithmeticImageFilter {
 }
 
 impl ImageFilter for ArithmeticImageFilter {
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        input_of(self.background.as_ref(), output)
+            .union(&input_of(self.foreground.as_ref(), output))
+    }
+
     fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
         Some(Arc::new(Self {
             k1: self.k1,
