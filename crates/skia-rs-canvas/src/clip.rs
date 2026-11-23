@@ -40,13 +40,26 @@ impl ClipMask {
     /// Create a new clip mask filled with the given coverage value.
     #[must_use]
     pub fn new(width: i32, height: i32, initial_coverage: u8) -> Self {
-        let size = usize::try_from(width * height).unwrap_or(0);
+        // Checked: a huge mask must not overflow i32; an impossible size
+        // becomes an empty mask (nothing covered).
+        let size = usize::try_from(width)
+            .ok()
+            .zip(usize::try_from(height).ok())
+            .and_then(|(w, h)| w.checked_mul(h));
+        let (width, height, size) = size.map_or((0, 0, 0), |n| (width, height, n));
         Self {
             width,
             height,
             coverage: vec![initial_coverage; size],
             bounds: IRect::new(0, 0, width, height),
         }
+    }
+
+    /// The coverage index of in-bounds (x, y), in usize so large masks
+    /// cannot overflow i32.
+    fn index(x: i32, y: i32, width: i32) -> usize {
+        let to_usize = |v: i32| usize::try_from(v).unwrap_or(0);
+        to_usize(y) * to_usize(width) + to_usize(x)
     }
 
     /// Create a clip mask from a rectangle with anti-aliased edges.
@@ -139,7 +152,7 @@ impl ClipMask {
         if x < 0 || x >= self.width || y < 0 || y >= self.height {
             return 0;
         }
-        self.coverage[usize::try_from(y * self.width + x).unwrap_or(0)]
+        self.coverage[Self::index(x, y, self.width)]
     }
 
     /// Get the coverage value at device coordinates.
@@ -155,7 +168,8 @@ impl ClipMask {
     #[inline]
     pub fn set_coverage(&mut self, x: i32, y: i32, coverage: u8) {
         if x >= 0 && x < self.width && y >= 0 && y < self.height {
-            self.coverage[usize::try_from(y * self.width + x).unwrap_or(0)] = coverage;
+            let index = Self::index(x, y, self.width);
+            self.coverage[index] = coverage;
         }
     }
 

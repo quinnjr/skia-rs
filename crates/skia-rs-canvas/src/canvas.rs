@@ -559,6 +559,33 @@ impl<'a> Canvas<'a> {
         Some(paint)
     }
 
+    /// The device area an AA clip mask for a shape with device bounds
+    /// `shape` must cover. An intersect with a plain (non-inverse) shape is
+    /// zero outside the shape, so its mask covers just the shape (outset a
+    /// pixel for AA) within [`clip_mask_bounds`](Self::clip_mask_bounds);
+    /// other clips need all of it. Inside a large filtered layer that keeps
+    /// a small clip from allocating and sampling a layer-sized mask.
+    fn clip_mask_area(&self, shape: &Rect, op: ClipOp, inverse: bool) -> IRect {
+        let all = self.clip_mask_bounds();
+        let shape_finite = shape.left.is_finite()
+            && shape.top.is_finite()
+            && shape.right.is_finite()
+            && shape.bottom.is_finite();
+        if op != ClipOp::Intersect || inverse || !shape_finite {
+            return all;
+        }
+        let r = shape.round_out();
+        let outset = IRect::new(
+            r.left.saturating_sub(1),
+            r.top.saturating_sub(1),
+            r.right.saturating_add(1),
+            r.bottom.saturating_add(1),
+        );
+        outset
+            .intersect(&all)
+            .unwrap_or_else(|| IRect::new(all.left, all.top, all.left, all.top))
+    }
+
     /// The device area clip masks cover: the device, extended by the top
     /// layer (a filtered layer may reach past the device, and clips set
     /// inside it must keep that content for the filter).
@@ -867,10 +894,10 @@ impl<'a> Canvas<'a> {
     /// bounding box) is only used for axis-aligned CTMs.
     pub fn clip_rect(&mut self, rect: &Rect, op: ClipOp, do_anti_alias: bool) {
         let matrix = *self.total_matrix();
-        let device_bounds = self.clip_mask_bounds();
 
         if matrix.skew_x() == 0.0 && matrix.skew_y() == 0.0 && !matrix.has_perspective() {
             let transformed = matrix.map_rect(rect);
+            let device_bounds = self.clip_mask_area(&transformed, op, false);
             self.clip_stack
                 .clip_rect_with_op(&transformed, op, &device_bounds, do_anti_alias);
         } else {
@@ -879,6 +906,7 @@ impl<'a> Canvas<'a> {
             let mut b = skia_rs_path::PathBuilder::new();
             b.add_rect(rect);
             let quad = device_clip_path(&b.build(), &matrix);
+            let device_bounds = self.clip_mask_area(&quad.bounds(), op, false);
             self.clip_stack
                 .clip_path_with_op(&quad, &device_bounds, op, do_anti_alias);
         }
@@ -896,7 +924,11 @@ impl<'a> Canvas<'a> {
     pub fn clip_path(&mut self, path: &Path, op: ClipOp, do_anti_alias: bool) {
         let transformed_path = device_clip_path(path, self.total_matrix());
 
-        let device_bounds = self.clip_mask_bounds();
+        let device_bounds = self.clip_mask_area(
+            &transformed_path.bounds(),
+            op,
+            transformed_path.fill_type().is_inverse(),
+        );
         self.clip_stack
             .clip_path_with_op(&transformed_path, &device_bounds, op, do_anti_alias);
 
@@ -3681,6 +3713,33 @@ mod tests {
         let filter = skia_rs_paint::OffsetImageFilter::new(-1.0e6, -1.0e6, None);
         let area = super::filtered_layer_area(&filter, parent, &device);
         assert!(area.width() <= 300.0 && area.height() <= 300.0, "{area:?}");
+    }
+
+    #[test]
+    fn small_aa_clips_in_large_layers_get_small_masks() {
+        // Inside a heavily blurred layer (several times the device), an AA
+        // clip to a small circle builds its mask over the circle only.
+        use super::{Canvas, ClipOp, SaveLayerRec};
+        use crate::ClipState;
+
+        let mut buffer = crate::PixelBuffer::new(100, 100);
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        let mut paint = skia_rs_paint::Paint::new();
+        paint.set_image_filter(Some(std::sync::Arc::new(
+            skia_rs_paint::BlurImageFilter::new(100.0, 100.0, skia_rs_paint::TileMode::Decal),
+        )));
+        canvas.save_layer(&SaveLayerRec {
+            paint: Some(&paint),
+            ..SaveLayerRec::default()
+        });
+        let mut circle = skia_rs_path::PathBuilder::new();
+        circle.add_circle(50.0, 50.0, 10.0);
+        canvas.clip_path(&circle.build(), ClipOp::Intersect, true);
+        let width = match canvas.clip_stack.current() {
+            ClipState::Mask(m) => m.width(),
+            other => panic!("expected a mask, got {other:?}"),
+        };
+        assert!(width <= 24, "mask width {width}");
     }
 
     #[test]
