@@ -849,6 +849,17 @@ impl<'a> Rasterizer<'a> {
         }
     }
 
+    /// The buffer as a device-space rect.
+    const fn device_rect(&self) -> Rect {
+        use skia_rs_core::cast::scalar_from_i32;
+        Rect::new(
+            0.0,
+            0.0,
+            scalar_from_i32(self.buffer.width),
+            scalar_from_i32(self.buffer.height),
+        )
+    }
+
     /// The hairline `p0`-`p1` mapped to device space and clipped to the
     /// device (outset by two pixels, so clipped ends stay off-device), as
     /// Skia clips lines before rasterizing them (`SkLineClipper`). This
@@ -1386,12 +1397,14 @@ impl<'a> Rasterizer<'a> {
     fn hairline_curve(
         &mut self,
         points: &mut Vec<Point>,
-        start: Point,
+        hull: &[Point],
         eval: impl Fn(Scalar) -> Point,
         end: Point,
         paint: &Paint,
     ) {
-        flatten_curve_device_error(points, eval, end, &self.matrix);
+        let start = hull[0];
+        let device = self.device_rect();
+        flatten_curve_culled(points, eval, end, &self.matrix, hull, Some(&device));
         let mut prev = start;
         for &p in points.iter() {
             self.draw_line(prev, p, paint);
@@ -1468,7 +1481,7 @@ impl<'a> Rasterizer<'a> {
                     let [a, b, c] = pts;
                     self.hairline_curve(
                         &mut curve_points,
-                        a,
+                        &pts,
                         |t| quad_point(t, 1.0 - t, a, b, c),
                         c,
                         paint,
@@ -1481,7 +1494,7 @@ impl<'a> Rasterizer<'a> {
                     let [a, b, c] = pts;
                     self.hairline_curve(
                         &mut curve_points,
-                        a,
+                        &pts,
                         |t| conic_point(a, b, c, weight, t),
                         c,
                         paint,
@@ -1494,7 +1507,7 @@ impl<'a> Rasterizer<'a> {
                     let [a, b, c, d] = pts;
                     self.hairline_curve(
                         &mut curve_points,
-                        a,
+                        &pts,
                         |t| cubic_point(t, 1.0 - t, a, b, c, d),
                         d,
                         paint,
@@ -1552,7 +1565,7 @@ impl<'a> Rasterizer<'a> {
         let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
 
-        let edges = collect_edges(path, &self.matrix);
+        let edges = collect_edges(path, &self.matrix, Some(&self.device_rect()));
         if edges.is_empty() && !inverse {
             return;
         }
@@ -1631,7 +1644,7 @@ impl<'a> Rasterizer<'a> {
         let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
 
-        let edges = collect_edges(path, &self.matrix);
+        let edges = collect_edges(path, &self.matrix, Some(&self.device_rect()));
         if edges.is_empty() && !inverse {
             return;
         }
@@ -1736,7 +1749,13 @@ pub(crate) fn path_to_region(path: &Path, clip_bounds: &IRect) -> Region {
     );
 
     let mut region = Region::new();
-    let edges = collect_edges(path, &Matrix::IDENTITY);
+    let device = Rect::new(
+        scalar_from_i32(clip_bounds.left),
+        scalar_from_i32(clip_bounds.top),
+        scalar_from_i32(clip_bounds.right),
+        scalar_from_i32(clip_bounds.bottom),
+    );
+    let edges = collect_edges(path, &Matrix::IDENTITY, Some(&device));
     if !edges.is_empty() {
         let mut get = GlobalEdgeTable::new(edges);
         if let Some(y_start) = get.y_min() {
@@ -2064,15 +2083,18 @@ fn conic_point(start: Point, ctrl: Point, end: Point, weight: Scalar, t: Scalar)
 ///
 /// `eval` gives the curve's local-space point at `t` in `[0, 1]` and `end`
 /// is its exact local end point (see [`flatten_curve_device_error`]).
+/// `hull` is the curve's local control polygon; its last point is the end.
 fn push_curve_edges(
     edges: &mut Vec<Edge>,
     scratch: &mut Vec<Point>,
     mut current: Point,
     eval: impl Fn(Scalar) -> Point,
-    end: Point,
     matrix: &Matrix,
+    hull: &[Point],
+    device: Option<&Rect>,
 ) -> Point {
-    flatten_curve_device_error(scratch, eval, end, matrix);
+    let end = hull[hull.len() - 1];
+    flatten_curve_culled(scratch, eval, end, matrix, hull, device);
     for &p in scratch.iter() {
         let p = matrix.map_point(p);
         if let Some(edge) = Edge::new(current, p) {
@@ -2141,6 +2163,49 @@ fn flatten_curve_device_error(
             len += 2;
         }
     }
+}
+
+/// [`flatten_curve_device_error`] for a curve with local control points
+/// `hull`, except that a curve whose mapped hull lies entirely beyond one
+/// side of `device` becomes a single chord. The curve stays inside its hull,
+/// so every crossing it would make is on the same off-device side as the
+/// chord's: the device's coverage is unchanged, and huge off-screen curves
+/// cost nothing (Skia clips curves to the device before building edges).
+fn flatten_curve_culled(
+    out: &mut Vec<Point>,
+    eval: impl Fn(Scalar) -> Point,
+    end: Point,
+    matrix: &Matrix,
+    hull: &[Point],
+    device: Option<&Rect>,
+) {
+    if let Some(device) = device
+        && !matrix.has_perspective()
+    {
+        let mapped = hull.iter().map(|p| matrix.map_point(*p));
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+            Scalar::INFINITY,
+            Scalar::INFINITY,
+            Scalar::NEG_INFINITY,
+            Scalar::NEG_INFINITY,
+        );
+        for q in mapped {
+            min_x = min_x.min(q.x);
+            min_y = min_y.min(q.y);
+            max_x = max_x.max(q.x);
+            max_y = max_y.max(q.y);
+        }
+        let off = max_x < device.left - 1.0
+            || min_x > device.right + 1.0
+            || max_y < device.top - 1.0
+            || min_y > device.bottom + 1.0;
+        if off {
+            out.clear();
+            out.push(end);
+            return;
+        }
+    }
+    flatten_curve_device_error(out, eval, end, matrix);
 }
 
 /// `path` with every curve flattened in local space so that, after mapping
@@ -2559,7 +2624,7 @@ fn contour_is_closed(rest: &[Verb]) -> bool {
 pub(crate) const CONIC_FLATTEN_TOLERANCE: Scalar = 0.25;
 
 /// Collect edges from a path.
-fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
+fn collect_edges(path: &Path, matrix: &Matrix, device: Option<&Rect>) -> Vec<Edge> {
     let mut edges = Vec::new();
     // A path without a leading move starts at the local origin, so the
     // device-space start is the *mapped* origin (matching the local one).
@@ -2608,8 +2673,9 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
                     &mut curve_scratch,
                     current,
                     |t| conic_point(local_start, ctrl, end, weight, t),
-                    end,
                     matrix,
+                    &[local_start, ctrl, end],
+                    device,
                 );
             }
             // Every curve is evaluated in local space and flattened against
@@ -2622,8 +2688,9 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
                     &mut curve_scratch,
                     current,
                     |t| quad_point(t, 1.0 - t, local_start, ctrl, end),
-                    end,
                     matrix,
+                    &[local_start, ctrl, end],
+                    device,
                 );
             }
             PathElement::Cubic(c1, c2, end) => {
@@ -2632,8 +2699,9 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
                     &mut curve_scratch,
                     current,
                     |t| cubic_point(t, 1.0 - t, local_start, c1, c2, end),
-                    end,
                     matrix,
+                    &[local_start, c1, c2, end],
+                    device,
                 );
             }
             PathElement::Close => {

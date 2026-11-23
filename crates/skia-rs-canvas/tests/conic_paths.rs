@@ -1316,3 +1316,37 @@ fn huge_and_far_off_circles_and_rects_finish_promptly() {
         );
     }
 }
+
+#[test]
+fn off_screen_curves_do_not_change_coverage() {
+    // A cubic whose control hull lies wholly left of the device is culled
+    // to a chord; the device's coverage must match drawing it unculled.
+    // Unculled reference: the same shape on a canvas 200 px wider, shifted
+    // right by 200, where the cubic is on-device and fully flattened.
+    let mut b = PathBuilder::new();
+    b.move_to(150.0, 20.0)
+        .line_to(-10.0, 20.0)
+        .cubic_to(-80.0, 60.0, -80.0, 140.0, -10.0, 180.0)
+        .line_to(150.0, 180.0)
+        .close();
+    let path = b.build();
+    for anti_alias in [false, true] {
+        let mut paint = white(Style::Fill);
+        paint.set_anti_alias(anti_alias);
+        let mut culled = PixelBuffer::new(SIZE, SIZE);
+        Canvas::new_raster(&mut culled).draw_path(&path, &paint);
+        let mut reference = PixelBuffer::new(SIZE + 200, SIZE);
+        {
+            let mut canvas = Canvas::new_raster(&mut reference);
+            canvas.translate(200.0, 0.0);
+            canvas.draw_path(&path, &paint);
+        }
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let a = culled.get_pixel(x, y).map(|c| c.red());
+                let b = reference.get_pixel(x + 200, y).map(|c| c.red());
+                assert_eq!(a, b, "aa={anti_alias} ({x}, {y})");
+            }
+        }
+    }
+}
