@@ -1080,3 +1080,38 @@ fn solid_spans_under_an_aa_clip_lerp_for_non_srcover_modes() {
         }
     }
 }
+
+#[test]
+fn zero_radius_capped_aa_hairline_circles_draw_a_dot_like_aliased_ones() {
+    use skia_rs_core::Point;
+    use skia_rs_paint::StrokeCap;
+
+    for anti_alias in [false, true] {
+        let mut paint = white(Style::Stroke);
+        paint.set_stroke_width(0.0);
+        paint.set_stroke_cap(StrokeCap::Round);
+        paint.set_anti_alias(anti_alias);
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        Canvas::new_raster(&mut buffer).draw_circle(Point::new(30.5, 30.5), 0.0, &paint);
+        let lit_any =
+            (28..33).any(|y| (28..33).any(|x| buffer.get_pixel(x, y).is_some_and(|c| c.red() > 0)));
+        assert!(
+            lit_any,
+            "aa={anti_alias}: a round-capped empty circle is a dot"
+        );
+    }
+}
+
+#[test]
+fn sub_pixel_aa_hairlines_cover_their_column_once() {
+    // A 0.3-px segment inside one column covers it by 0.3, not 1 + 0.3.
+    use skia_rs_core::Point;
+
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    paint.set_anti_alias(true);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    Canvas::new_raster(&mut buffer).draw_line(Point::new(10.0, 5.5), Point::new(10.3, 5.5), &paint);
+    let red = buffer.get_pixel(10, 5).unwrap_or(Color::BLACK).red();
+    assert!(red > 0 && red < 128, "coverage ~0.3: {red}");
+}

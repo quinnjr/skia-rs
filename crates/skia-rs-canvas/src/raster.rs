@@ -773,6 +773,17 @@ impl<'a> Rasterizer<'a> {
         let dy = y1 - y0;
         let gradient = if dx.abs() < 0.0001 { 1.0 } else { dy / dx };
 
+        // A segment inside one column along the major axis covers it once,
+        // by its length (as Skia's anti-hairline does for sub-pixel
+        // segments); plotting both endpoints there would blend it twice.
+        let (first_column, last_column) = (floor_to_i32(x0 + 0.5), floor_to_i32(x1 + 0.5));
+        if first_column == last_column {
+            let column = first_column;
+            let y_mid = f32::midpoint(y0, y1);
+            self.plot_wu_endpoint(steep, column, y_mid, dx.min(1.0), &source, blend_mode);
+            return;
+        }
+
         // Handle first endpoint
         // Round half up, so endpoints are translation-consistent across
         // zero (`f32::round` rounds half away from zero).
@@ -1162,8 +1173,18 @@ impl<'a> Rasterizer<'a> {
         let cx = tc.x;
         let cy = tc.y;
         let r = radius * self.matrix.scale_x().abs();
-        // An empty circle draws nothing (Skia draws the empty oval).
+        // An empty circle is Skia's empty oval: nothing for fills and butt
+        // hairlines, but hair_path extends a degenerate contour's ends for
+        // round/square caps, drawing a dot (as the aliased path does).
         if r.is_nan() || r <= 0.0 {
+            if !r.is_nan()
+                && paint.style() == Style::Stroke
+                && paint.stroke_cap() != skia_rs_paint::StrokeCap::Butt
+            {
+                let mut b = PathBuilder::new();
+                b.add_circle(center.x, center.y, 0.0);
+                self.stroke_path(&b.build(), paint);
+            }
             return;
         }
 
