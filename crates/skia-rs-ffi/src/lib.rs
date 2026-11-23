@@ -2075,9 +2075,10 @@ pub unsafe extern "C" fn sk_canvas_save(canvas: *mut sk_canvas_t) -> i32 {
 /// Later draws go into an offscreen layer until the matching
 /// [`sk_canvas_restore`] (or [`sk_canvas_release`]), which composites it
 /// through the clip in effect here using `paint`'s alpha, blend mode, color
-/// filter and image filter. `bounds` (local coordinates) is a hint limiting
-/// the layer. Both may be null. Inside the layer only clips set after this
-/// call apply, as in Skia.
+/// filter and image filter. `bounds` (local coordinates), if given, clips
+/// what is drawn into the layer, as in Skia; the image filter's result may
+/// still spread past it, up to the clip. Both may be null. Inside the layer
+/// only clips set after this call (and `bounds`) apply, as in Skia.
 ///
 /// Returns the same value as `SkCanvas::saveLayer()` (and
 /// [`sk_canvas_save`]): the save count *before* this call in Skia's
@@ -2317,8 +2318,9 @@ pub unsafe extern "C" fn sk_canvas_clip_path(
 
 /// Fill `out` with the device-space integer clip bounds of this canvas.
 ///
-/// Returns true on success. If the clip is empty or the canvas has no clips,
-/// `out` is filled with `[0, 0, width, height]`.
+/// Returns true on success. With no clips `out` is the device bounds
+/// `[0, 0, width, height]` (inside a layer, the layer's bounds); an empty
+/// clip gives `[0, 0, 0, 0]`, as `SkCanvas::getDeviceClipBounds`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_canvas_get_clip_ibounds(
     canvas: *mut sk_canvas_t,
