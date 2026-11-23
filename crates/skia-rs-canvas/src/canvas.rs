@@ -1610,7 +1610,12 @@ impl<'a> Canvas<'a> {
         font: &skia_rs_text::Font,
         paint: &Paint,
     ) {
-        let deferred = paint_with_fake_bold(paint, font);
+        let mut deferred = paint_with_fake_bold(paint, font);
+        // Keep the effect for playback, but without a cull: glyph effects
+        // run with a null cull rect in Skia's scaler context.
+        if let Some(effect) = paint.path_effect() {
+            deferred.set_path_effect(Some(std::sync::Arc::new(UnculledEffect(effect.clone()))));
+        }
         self.save();
         self.translate(x, y);
         self.draw_path(outline, &deferred);
@@ -1655,14 +1660,10 @@ impl<'a> Canvas<'a> {
                 StrokeRec::StrokeAndFill(w) => StrokeRec::StrokeAndFill(w + extra),
             };
         }
-        // Same resolution scale and cull as rasterize_path gives the
-        // recorded glyph on playback: the local cull for the
-        // fake-bold-folded paint, moved into glyph space.
-        let cull = self
-            .local_cull(&paint_with_fake_bold(paint, font))
-            .map(|c| Rect::new(c.left - x, c.top - y, c.right - x, c.bottom - y));
-        let filtered =
-            effect.filter_path_culled(outline, &mut rec, cull.as_ref(), self.res_scale());
+        // Skia's scaler context filters glyph paths with no cull rect (the
+        // glyph is in glyph space); the resolution scale is the CTM's, as
+        // for any path.
+        let filtered = effect.filter_path_culled(outline, &mut rec, None, self.res_scale());
         let glyph = filtered.as_ref().unwrap_or(outline);
         // Draw with the record's style, and drop the effect so draw_path
         // does not apply it a second time.
@@ -2677,6 +2678,38 @@ fn paint_with_stroke_rec(paint: &Paint, rec: skia_rs_path::StrokeRec) -> Option<
     styled.set_style(style);
     styled.set_stroke_width(width);
     Some(styled)
+}
+
+/// A path effect that ignores the cull rect, for glyph effects recorded into
+/// a picture: Skia applies glyph path effects with a null cull, so playback
+/// (which passes the clip cull to every path effect) must not cull them.
+#[cfg(feature = "text")]
+#[derive(Debug)]
+struct UnculledEffect(skia_rs_path::PathEffectRef);
+
+#[cfg(feature = "text")]
+impl skia_rs_path::PathEffect for UnculledEffect {
+    fn apply(&self, path: &Path) -> Option<Path> {
+        self.0.apply(path)
+    }
+
+    fn filter_path(&self, path: &Path, rec: &mut skia_rs_path::StrokeRec) -> Option<Path> {
+        self.0.filter_path(path, rec)
+    }
+
+    fn filter_path_culled(
+        &self,
+        path: &Path,
+        rec: &mut skia_rs_path::StrokeRec,
+        _cull: Option<&Rect>,
+        res_scale: Scalar,
+    ) -> Option<Path> {
+        self.0.filter_path_culled(path, rec, None, res_scale)
+    }
+
+    fn effect_kind(&self) -> skia_rs_path::PathEffectKind {
+        self.0.effect_kind()
+    }
 }
 
 /// `paint` with fake bold folded into its stroke the way the stroke record
