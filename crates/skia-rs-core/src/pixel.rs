@@ -73,6 +73,12 @@ pub struct ImageInfo {
 
 /// The serialized fields of an [`ImageInfo`], validated through
 /// [`ImageInfo::new`] when deserializing (negative dimensions are rejected).
+///
+/// Deserializing is stricter than `ImageInfo::new` (which, like
+/// `SkImageInfo::Make`, does not bound sizes): it also enforces
+/// `SkImageInfo`'s `kMaxDimension` and a byte size that fits `isize`, so
+/// untrusted data cannot overflow the size computations. An info built
+/// past those limits serializes but does not load back.
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 struct ImageInfoData {
