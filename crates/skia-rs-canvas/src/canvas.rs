@@ -592,7 +592,10 @@ impl<'a> Canvas<'a> {
     pub fn clip_path(&mut self, path: &Path, op: ClipOp, do_anti_alias: bool) {
         // Transform the path to device coordinates
         let matrix = self.total_matrix();
-        let mut transformed_path = path.clone();
+        // Under perspective, clip to the w plane first (PerspectiveClip):
+        // geometry behind it would map to flipped coordinates.
+        let in_front = crate::raster::perspective_clip(path, matrix);
+        let mut transformed_path = in_front.as_ref().unwrap_or(path).clone();
         transformed_path.transform(matrix);
 
         let device_bounds = IRect::new(0, 0, self.width, self.height);

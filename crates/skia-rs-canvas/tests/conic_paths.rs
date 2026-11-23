@@ -1189,3 +1189,47 @@ fn fills_crossing_the_perspective_horizon_are_clipped_to_it() {
         assert!(visible, "aa={anti_alias}: the front half is drawn");
     }
 }
+
+#[test]
+fn hairlines_and_clip_paths_are_clipped_to_the_perspective_horizon() {
+    // w = 1 - y/100: geometry at local y > 100 is behind the horizon and
+    // would map to flipped device coordinates (y < 0 side). The visible part
+    // maps to device y >= 100, so nothing may appear above y = 95.
+    use skia_rs_canvas::ClipOp;
+    use skia_rs_core::{Matrix, Point};
+
+    let perspective = Matrix {
+        values: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -0.01, 1.0],
+    };
+    let mut paint = white(Style::Stroke);
+    paint.set_stroke_width(0.0);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.concat(&perspective);
+        canvas.draw_line(Point::new(10.0, 50.0), Point::new(10.0, 150.0), &paint);
+    }
+    for y in 0..95 {
+        for x in 0..SIZE {
+            assert!(!lit(&buffer, x, y), "hairline: ({x}, {y})");
+        }
+    }
+
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.concat(&perspective);
+        let mut circle = PathBuilder::new();
+        circle.add_circle(100.0, 100.0, 50.0);
+        canvas.clip_path(&circle.build(), ClipOp::Intersect, false);
+        // Fill the whole device through the clip.
+        canvas.reset_matrix();
+        let full = skia_rs_core::cast::scalar_from_i32(SIZE);
+        canvas.draw_rect(&Rect::new(0.0, 0.0, full, full), &white(Style::Fill));
+    }
+    for y in 0..95 {
+        for x in 0..SIZE {
+            assert!(!lit(&buffer, x, y), "clip: ({x}, {y})");
+        }
+    }
+}

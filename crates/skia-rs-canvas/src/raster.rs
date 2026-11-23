@@ -840,6 +840,10 @@ impl<'a> Rasterizer<'a> {
     /// precision. `None` when the segment misses the device or is not
     /// finite.
     fn device_segment(&self, p0: Point, p1: Point) -> Option<(Point, Point)> {
+        // Under perspective, first keep only the part in front of the w
+        // plane (as PerspectiveClip does for paths): points behind it map to
+        // flipped coordinates.
+        let (p0, p1) = clip_to_w_plane(&self.matrix, p0, p1)?;
         let (a, b) = (self.matrix.map_point(p0), self.matrix.map_point(p1));
         let bounds = (
             -2.0,
@@ -2128,7 +2132,7 @@ const PERSPECTIVE_CLIP_STEPS: u16 = 32;
 /// clipped Sutherland-Hodgman style; curves wholly in front of the plane
 /// are kept exactly, and curves that cross it are flattened first (Skia's
 /// edge clipper chops them exactly).
-fn perspective_clip(path: &Path, matrix: &Matrix) -> Option<Path> {
+pub(crate) fn perspective_clip(path: &Path, matrix: &Matrix) -> Option<Path> {
     if !matrix.has_perspective() {
         return None;
     }
@@ -2211,6 +2215,29 @@ fn perspective_clip(path: &Path, matrix: &Matrix) -> Option<Path> {
     }
     clipper.close_contour(current, start);
     Some(out.build())
+}
+
+/// The part of the local segment `p0`-`p1` in front of the perspective
+/// `w = 1/16384` plane (the segment itself without perspective); `None`
+/// when it lies entirely behind.
+fn clip_to_w_plane(matrix: &Matrix, p0: Point, p1: Point) -> Option<(Point, Point)> {
+    if !matrix.has_perspective() {
+        return Some((p0, p1));
+    }
+    let [.., persp_x, persp_y, persp_w] = matrix.values;
+    let plane_offset = persp_w - W0_PLANE_DISTANCE;
+    let w = |p: Point| persp_x * p.x + persp_y * p.y + plane_offset;
+    let (w0, w1) = (w(p0), w(p1));
+    let crossing = || {
+        let t = w0 / (w0 - w1);
+        Point::new(p0.x + (p1.x - p0.x) * t, p0.y + (p1.y - p0.y) * t)
+    };
+    match (w0 > 0.0, w1 > 0.0) {
+        (true, true) => Some((p0, p1)),
+        (true, false) => Some((p0, crossing())),
+        (false, true) => Some((crossing(), p1)),
+        (false, false) => None,
+    }
 }
 
 /// Sutherland-Hodgman clipping of closed contours against `w(p) > 0`.
