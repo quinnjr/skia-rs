@@ -19,7 +19,11 @@ use std::sync::Arc;
 /// caller draws the result with whatever the record says afterwards, even
 /// when the effect itself failed (`skpathutils::FillPathWithPaint`).
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "StrokeRecData")
+)]
 pub enum StrokeRec {
     /// Fill the geometry.
     Fill,
@@ -29,6 +33,39 @@ pub enum StrokeRec {
     Stroke(Scalar),
     /// Fill and stroke with the given width (> 0).
     StrokeAndFill(Scalar),
+}
+
+/// The serialized form of a [`StrokeRec`], validated when deserializing:
+/// stroke widths must be finite and positive, as the variants promise.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+enum StrokeRecData {
+    Fill,
+    Hairline,
+    Stroke(Scalar),
+    StrokeAndFill(Scalar),
+}
+
+/// A serialized [`StrokeRec`] whose stroke width is not finite and positive.
+#[cfg(feature = "serde")]
+#[derive(Debug, thiserror::Error)]
+#[error("invalid StrokeRec: stroke width must be finite and > 0")]
+struct InvalidStrokeRec;
+
+#[cfg(feature = "serde")]
+impl TryFrom<StrokeRecData> for StrokeRec {
+    type Error = InvalidStrokeRec;
+
+    fn try_from(data: StrokeRecData) -> Result<Self, Self::Error> {
+        let valid = |w: Scalar| w.is_finite() && w > 0.0;
+        match data {
+            StrokeRecData::Fill => Ok(Self::Fill),
+            StrokeRecData::Hairline => Ok(Self::Hairline),
+            StrokeRecData::Stroke(w) if valid(w) => Ok(Self::Stroke(w)),
+            StrokeRecData::StrokeAndFill(w) if valid(w) => Ok(Self::StrokeAndFill(w)),
+            _ => Err(InvalidStrokeRec),
+        }
+    }
 }
 
 impl StrokeRec {
@@ -3347,6 +3384,19 @@ mod tests {
             })
             .expect("a stamp");
         assert!((first.x - 0.1).abs() < 0.02, "rotated stamp at {first:?}");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn stroke_recs_validate_their_width_when_deserialized() {
+        let ok = serde_json::to_string(&StrokeRec::Stroke(2.0)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<StrokeRec>(&ok).unwrap(),
+            StrokeRec::Stroke(2.0)
+        );
+        for bad in [r#"{"Stroke":0.0}"#, r#"{"StrokeAndFill":-1.0}"#] {
+            assert!(serde_json::from_str::<StrokeRec>(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
