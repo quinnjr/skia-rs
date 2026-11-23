@@ -1596,6 +1596,102 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Record a glyph drawn with a path effect: in glyph space (under a
+    /// recorded translate) with the effect kept on the paint, so playback
+    /// applies it at the playback CTM's resolution, as every other recorded
+    /// draw defers its effect. Fake bold is folded into the paint's stroke
+    /// the way the stroke record would fold it.
+    #[cfg(feature = "text")]
+    fn record_glyph_with_effect(
+        &mut self,
+        outline: &Path,
+        x: Scalar,
+        y: Scalar,
+        font: &skia_rs_text::Font,
+        paint: &Paint,
+    ) {
+        use skia_rs_paint::Style;
+        let mut deferred = paint.clone();
+        if font.is_embolden() {
+            let extra = fake_bold_extra(font.size());
+            match paint.style() {
+                Style::Fill => {
+                    use_fake_bold_stroke_params(&mut deferred);
+                    deferred.set_style(Style::StrokeAndFill);
+                    deferred.set_stroke_width(extra);
+                }
+                Style::Stroke | Style::StrokeAndFill => {
+                    deferred.set_stroke_width(paint.stroke_width() + extra);
+                }
+            }
+        }
+        self.save();
+        self.translate(x, y);
+        self.draw_path(outline, &deferred);
+        self.restore();
+    }
+
+    /// `draw_glyph_outline` for a paint with a path effect: the effect runs
+    /// on the glyph in glyph space (or, when recording, is deferred to
+    /// playback), with fake bold folded into the stroke record first.
+    #[cfg(feature = "text")]
+    fn draw_glyph_with_effect(
+        &mut self,
+        outline: &Path,
+        x: Scalar,
+        y: Scalar,
+        font: &skia_rs_text::Font,
+        paint: &Paint,
+        effect: &dyn skia_rs_path::PathEffect,
+    ) {
+        use skia_rs_paint::Style;
+        use skia_rs_path::StrokeRec;
+
+        if matches!(self.backing, Backing::Recording(_)) {
+            self.record_glyph_with_effect(outline, x, y, font, paint);
+            return;
+        }
+        // Skia's scaler context applies the path effect to the glyph in
+        // glyph space, before positioning, so every instance of a glyph
+        // gets the same pattern regardless of where it is drawn. Fake
+        // bold is folded into the stroke record first
+        // (useStrokeForFakeBold), then the effect filters the outline.
+        let mut rec = stroke_rec_from_paint(paint);
+        // A filled glyph made bold is outlined with Skia's fake-bold
+        // stroke defaults, not the paint's join/miter/cap.
+        let bold_fill = font.is_embolden() && paint.style() == Style::Fill;
+        if font.is_embolden() {
+            let extra = fake_bold_extra(font.size());
+            rec = match rec {
+                StrokeRec::Fill => StrokeRec::StrokeAndFill(extra),
+                StrokeRec::Hairline => StrokeRec::Stroke(extra),
+                StrokeRec::Stroke(w) => StrokeRec::Stroke(w + extra),
+                StrokeRec::StrokeAndFill(w) => StrokeRec::StrokeAndFill(w + extra),
+            };
+        }
+        // Same resolution scale as rasterize_path, so dashed glyph
+        // curves stay smooth when zoomed; the outline is in glyph space,
+        // so no cull is passed.
+        let filtered = effect.filter_path_culled(outline, &mut rec, None, self.res_scale());
+        let glyph = filtered.as_ref().unwrap_or(outline);
+        // Draw with the record's style, and drop the effect so draw_path
+        // does not apply it a second time.
+        let (style, width) = match rec {
+            StrokeRec::Fill => (Style::Fill, paint.stroke_width()),
+            StrokeRec::Hairline => (Style::Stroke, 0.0),
+            StrokeRec::Stroke(w) => (Style::Stroke, w),
+            StrokeRec::StrokeAndFill(w) => (Style::StrokeAndFill, w),
+        };
+        let mut styled = paint.clone();
+        if bold_fill {
+            use_fake_bold_stroke_params(&mut styled);
+        }
+        styled.set_style(style);
+        styled.set_stroke_width(width);
+        styled.set_path_effect(None);
+        self.draw_path(&glyph.transformed(&Matrix::translate(x, y)), &styled);
+    }
+
     /// Draw one glyph outline translated to `(x, y)`, applying the font's
     /// fake-bold (embolden) setting the way Skia's scaler context does
     /// (`SkScalerContextRec::useStrokeForFakeBold`): the outline is outset by
@@ -1611,48 +1707,9 @@ impl<'a> Canvas<'a> {
         paint: &Paint,
     ) {
         use skia_rs_paint::Style;
-        use skia_rs_path::StrokeRec;
 
         if let Some(effect) = paint.path_effect() {
-            // Skia's scaler context applies the path effect to the glyph in
-            // glyph space, before positioning, so every instance of a glyph
-            // gets the same pattern regardless of where it is drawn. Fake
-            // bold is folded into the stroke record first
-            // (useStrokeForFakeBold), then the effect filters the outline.
-            let mut rec = stroke_rec_from_paint(paint);
-            // A filled glyph made bold is outlined with Skia's fake-bold
-            // stroke defaults, not the paint's join/miter/cap.
-            let bold_fill = font.is_embolden() && paint.style() == Style::Fill;
-            if font.is_embolden() {
-                let extra = fake_bold_extra(font.size());
-                rec = match rec {
-                    StrokeRec::Fill => StrokeRec::StrokeAndFill(extra),
-                    StrokeRec::Hairline => StrokeRec::Stroke(extra),
-                    StrokeRec::Stroke(w) => StrokeRec::Stroke(w + extra),
-                    StrokeRec::StrokeAndFill(w) => StrokeRec::StrokeAndFill(w + extra),
-                };
-            }
-            // Same resolution scale as rasterize_path, so dashed glyph
-            // curves stay smooth when zoomed; the outline is in glyph space,
-            // so no cull is passed.
-            let filtered = effect.filter_path_culled(outline, &mut rec, None, self.res_scale());
-            let glyph = filtered.as_ref().unwrap_or(outline);
-            // Draw with the record's style, and drop the effect so draw_path
-            // does not apply it a second time.
-            let (style, width) = match rec {
-                StrokeRec::Fill => (Style::Fill, paint.stroke_width()),
-                StrokeRec::Hairline => (Style::Stroke, 0.0),
-                StrokeRec::Stroke(w) => (Style::Stroke, w),
-                StrokeRec::StrokeAndFill(w) => (Style::StrokeAndFill, w),
-            };
-            let mut styled = paint.clone();
-            if bold_fill {
-                use_fake_bold_stroke_params(&mut styled);
-            }
-            styled.set_style(style);
-            styled.set_stroke_width(width);
-            styled.set_path_effect(None);
-            self.draw_path(&glyph.transformed(&Matrix::translate(x, y)), &styled);
+            self.draw_glyph_with_effect(outline, x, y, font, paint, effect.as_ref());
             return;
         }
 

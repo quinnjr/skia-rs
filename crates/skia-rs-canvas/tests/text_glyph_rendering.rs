@@ -416,3 +416,67 @@ fn fake_bold_with_a_path_effect_ignores_the_paint_stroke_join() {
         render(skia_rs_paint::StrokeJoin::Miter)
     );
 }
+
+#[test]
+fn recorded_text_keeps_its_path_effect_for_playback() {
+    // Like every other recorded draw, a glyph drawn with a path effect is
+    // recorded with the effect still on its paint (in glyph space, under a
+    // recorded translate), so playback applies it at the playback CTM's
+    // resolution instead of a dash baked in at record time.
+    use skia_rs_canvas::{DrawCommand, Picture};
+    use skia_rs_core::Rect;
+    use skia_rs_paint::Style;
+    use skia_rs_path::DashEffect;
+
+    let font = demo_font(12.0);
+    let mut paint = Paint::new();
+    paint.set_color(Color::WHITE.into());
+    paint.set_style(Style::Stroke);
+    paint.set_stroke_width(0.3);
+    paint.set_anti_alias(true);
+    paint.set_path_effect(Some(Arc::new(
+        DashEffect::new(vec![3.0, 1.0], 0.0).unwrap(),
+    )));
+
+    let mut commands = Vec::new();
+    {
+        let mut rec = Canvas::new_recording(&mut commands, 40, 40);
+        rec.draw_string("O", 2.0, 14.0, &font, &paint);
+    }
+    let deferred = commands
+        .iter()
+        .any(|c| matches!(c, DrawCommand::DrawPath { paint, .. } if paint.path_effect().is_some()));
+    assert!(deferred, "the glyph's path effect is deferred to playback");
+
+    // Playback renders essentially what drawing directly does (the recorded
+    // translate rounds a hair differently from translating the geometry).
+    let picture = Picture::from_parts(commands, Rect::from_xywh(0.0, 0.0, 40.0, 40.0));
+    let render = |use_picture: bool| {
+        let mut buffer = PixelBuffer::new(200, 200);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            canvas.scale(8.0, 8.0);
+            if use_picture {
+                picture.playback(&mut canvas);
+            } else {
+                canvas.draw_string("O", 2.0, 14.0, &font, &paint);
+            }
+        }
+        (0..200)
+            .flat_map(|y| (0..200).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).map_or(0, |c| c.red()))
+            .collect::<Vec<_>>()
+    };
+    let (direct, played) = (render(false), render(true));
+    assert!(direct.iter().any(|&v| v > 0));
+    let worst = direct
+        .iter()
+        .zip(&played)
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        worst <= 2,
+        "playback differs from direct drawing by up to {worst}"
+    );
+}
