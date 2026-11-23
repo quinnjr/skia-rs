@@ -323,18 +323,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mesa-utils libgl1-mesa-dri libegl1 libegl-mesa0 libgbm1 mesa-vulkan-drivers
 
-      # Install ImageMagick for image comparison
+      # Install ImageMagick for image comparison (only Ubuntu compares)
       - name: Install ImageMagick
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get install -y imagemagick
-
-      - name: Install ImageMagick (macOS)
-        if: matrix.os == 'macos-latest'
-        run: brew install imagemagick
-
-      - name: Install ImageMagick (Windows)
-        if: matrix.os == 'windows-latest'
-        run: choco install imagemagick -y
 
       # Build with specific backend features
       - name: Build (${{ matrix.backend }})
@@ -362,6 +354,14 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           mkdir -p conformance_results
+          # A reference with no generated image means a case stopped being
+          # produced (or was renamed): that is a failure, not a skip.
+          for ref in conformance/reference/*.png; do
+            base=$(basename "$ref")
+            if [ ! -f "conformance_output/$base" ]; then
+              echo "FAIL ${{ matrix.backend }}: $base - MISSING (no generated image)" >> conformance_results/report.txt
+            fi
+          done
           for img in conformance_output/*.png; do
             if [ -f "$img" ]; then
               base=$(basename "$img")
@@ -377,6 +377,9 @@ jobs:
                   result=FAIL
                 fi
                 echo "$result ${{ matrix.backend }}: $base - RMSE: $diff" >> conformance_results/report.txt
+              else
+                # A new case without a committed reference was never checked.
+                echo "FAIL ${{ matrix.backend }}: $base - NO REFERENCE" >> conformance_results/report.txt
               fi
             fi
           done
