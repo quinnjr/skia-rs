@@ -1071,6 +1071,17 @@ mod tests {
     }
 
     #[test]
+    fn rect_radius_with_a_spaced_unit_counts_as_missing() {
+        // "5 px" is not a length (it would read as 0): rx takes ry.
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="80" height="80" rx="5 px" ry="20" fill="red"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = pixel_at(&surface, 11, 11).map_or(0, |c| c.green());
+        assert!(green > 200, "the corner is rounded");
+    }
+
+    #[test]
     fn rects_with_negative_size_are_not_drawn() {
         let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
             <rect x="50" y="10" width="-40" height="40" rx="5" fill="red"/>

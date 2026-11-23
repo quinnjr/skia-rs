@@ -525,12 +525,12 @@ fn is_length(s: &str) -> bool {
         "vmin", "vmax", "rem", "px", "pt", "pc", "em", "ex", "ch", "vw", "vh", "cm", "mm", "in",
         "%",
     ];
+    // Exactly as parse_length reads it: no space between number and unit.
     let s = s.trim();
     let number = UNITS
         .iter()
         .find_map(|unit| s.strip_suffix(unit))
-        .unwrap_or(s)
-        .trim();
+        .unwrap_or(s);
     number.parse::<Scalar>().is_ok_and(Scalar::is_finite)
 }
 
