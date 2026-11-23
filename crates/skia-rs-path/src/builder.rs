@@ -608,7 +608,14 @@ impl PathBuilder {
     ) {
         // Based on W3C SVG arc implementation notes
         let phi_rad = phi.to_radians();
-        let (sin_phi, cos_phi) = phi_rad.sin_cos();
+        // The same (snapped) sin/cos as the rotation applied below, like
+        // SkPath::arcTo's single setRotate matrix: mixing snapped and
+        // unsnapped values misses the endpoint for tiny rotations.
+        let rotation = skia_rs_core::Matrix::rotate(phi_rad);
+        let (sin_phi, cos_phi) = (
+            rotation.values[skia_rs_core::Matrix::SKEW_Y],
+            rotation.values[skia_rs_core::Matrix::SCALE_X],
+        );
 
         // Step 1: Compute (x1', y1')
         let dx = (x1 - x2) / 2.0;
@@ -682,6 +689,21 @@ fn angle_between(ux: Scalar, uy: Scalar, vx: Scalar, vy: Scalar) -> Scalar {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn svg_arcs_with_tiny_rotations_end_at_their_endpoint() {
+        // The ellipse center and the emitted rotation must use the same
+        // (snapped) sin/cos, as SkPath::arcTo's single matrix does.
+        let mut b = super::PathBuilder::new();
+        b.move_to(0.0, 0.0)
+            .arc_to(10_000.0, 5_000.0, 0.01, false, true, 3_000.0, 1_000.0);
+        let path = b.build();
+        let last = *path.points().last().unwrap();
+        assert!(
+            (last.x - 3_000.0).abs() < 0.05 && (last.y - 1_000.0).abs() < 0.05,
+            "ends at {last:?}"
+        );
+    }
+
     use super::*;
     use crate::{PathElement, Verb};
 
