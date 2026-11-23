@@ -1010,13 +1010,55 @@ impl From<IRect> for Rect {
 ///
 /// Equivalent to Skia's `SkRRect`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "RRectData")
+)]
 pub struct RRect {
     /// The bounding rectangle.
     pub rect: Rect,
     /// Corner radii: [top-left, top-right, bottom-right, bottom-left].
     /// Each corner has (x-radius, y-radius).
     pub radii: [Point; 4],
+}
+
+/// The serialized fields of an [`RRect`], validated like
+/// `SkRRect::readFromMemory` (`AreRectAndRadiiValid`) when deserializing.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct RRectData {
+    rect: Rect,
+    radii: [Point; 4],
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RRectData> for RRect {
+    type Error = &'static str;
+
+    fn try_from(data: RRectData) -> Result<Self, Self::Error> {
+        // SkRRect's are_radius_check_predicates_valid, per axis.
+        let valid = |rad: Scalar, min: Scalar, max: Scalar| {
+            min <= max && rad <= max - min && min + rad <= max && max - rad >= min && rad >= 0.0
+        };
+        let r = data.rect;
+        let sorted = r.left <= r.right && r.top <= r.bottom;
+        let finite = [r.left, r.top, r.right, r.bottom]
+            .iter()
+            .all(|v| v.is_finite());
+        let radii_ok = data
+            .radii
+            .iter()
+            .all(|p| valid(p.x, r.left, r.right) && valid(p.y, r.top, r.bottom));
+        if finite && sorted && radii_ok {
+            Ok(Self {
+                rect: data.rect,
+                radii: data.radii,
+            })
+        } else {
+            Err("invalid RRect: unsorted or non-finite rect, or a radius out of range")
+        }
+    }
 }
 
 /// Corner indices for `RRect`.
@@ -2043,7 +2085,22 @@ mod serde_tests {
             info
         );
 
+        // RRects validate like SkRRect::readFromMemory.
+        let rr = RRect {
+            rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+            radii: [Point::new(2.0, 3.0); 4],
+        };
+        let json = serde_json::to_string(&rr).unwrap();
+        assert_eq!(serde_json::from_str::<RRect>(&json).unwrap(), rr);
+        let bad_rr = RRect {
+            radii: [Point::new(-5.0, 50.0); 4],
+            ..rr
+        };
+        let bad = serde_json::to_string(&bad_rr).unwrap();
+        assert!(serde_json::from_str::<RRect>(&bad).is_err());
+
         // Deserializing validates like ImageInfo::new: no negative sizes.
+        let json = serde_json::to_string(&info).unwrap();
         let bad = json.replacen("\"width\":4", "\"width\":-1", 1);
         assert_ne!(bad, json);
         assert!(serde_json::from_str::<crate::ImageInfo>(&bad).is_err());
