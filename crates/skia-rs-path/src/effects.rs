@@ -1773,6 +1773,17 @@ fn morph_stamp(
                 current = p;
             }
             PathElement::Close => {
+                // SkPath::Iter(src, false) reports the closing edge as a Line
+                // before the Close (autoClose), so morphpath bends it too.
+                if current != start {
+                    let mid = Point::new(
+                        f32::midpoint(current.x, start.x),
+                        f32::midpoint(current.y, start.y),
+                    );
+                    if let (Some(c), Some(e)) = (morph(mid), morph(start)) {
+                        dst.quad_to(c.x, c.y, e.x, e.y);
+                    }
+                }
                 dst.close();
                 current = start;
             }
@@ -3397,6 +3408,27 @@ mod tests {
         for bad in [r#"{"Stroke":0.0}"#, r#"{"StrokeAndFill":-1.0}"#] {
             assert!(serde_json::from_str::<StrokeRec>(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn morph_bends_a_closed_stamps_closing_edge() {
+        // A closed triangle stamp: its implicit closing edge is bent along
+        // the path like its other edges (a quad), not kept as a chord.
+        let mut stamp = PathBuilder::new();
+        stamp
+            .move_to(0.0, 0.0)
+            .line_to(10.0, 0.0)
+            .line_to(5.0, 5.0)
+            .close();
+        let effect = Path1DEffect::new(stamp.build(), 100.0, 0.0, Path1DStyle::Morph).unwrap();
+        let mut line = PathBuilder::new();
+        line.move_to(0.0, 0.0).line_to(50.0, 0.0);
+        let out = effect.apply(&line.build()).expect("stamps");
+        let quads = out
+            .iter()
+            .filter(|e| matches!(e, PathElement::Quad(..)))
+            .count();
+        assert_eq!(quads, 3, "all three edges are morphed: {out:?}");
     }
 
     #[test]
