@@ -497,3 +497,34 @@ fn hairline_points_with_a_path_effect_draw_nothing_like_skia() {
         }
     }
 }
+
+#[test]
+fn dashed_regions_stroke_their_boundary_not_each_rect() {
+    // SkDevice::drawRegion draws the boundary path with a path effect, so
+    // the edge shared by a region's rects is not stroked. An L-shape keeps
+    // two rects (different bands): they share y = 12 for x in 4..16.
+    use skia_rs_core::{IRect, Region, RegionOp};
+
+    let mut region = Region::from_rect(IRect::new(4, 4, 16, 12));
+    region.op_rect(IRect::new(4, 12, 28, 20), RegionOp::Union);
+    assert_eq!(region.rects().len(), 2, "the L stays two rects");
+    let mut paint = Paint::new();
+    paint.set_color32(Color::WHITE);
+    paint.set_style(Style::Stroke);
+    paint.set_stroke_width(1.0);
+    paint.set_path_effect(Some(Arc::new(
+        DashEffect::new(vec![3.0, 1.0], 0.0).unwrap(),
+    )));
+    let mut buffer = PixelBuffer::new(32, 32);
+    Canvas::new_raster(&mut buffer).draw_region(&region, &paint);
+    for y in 11..13 {
+        for x in 6..14 {
+            assert!(
+                buffer.get_pixel(x, y).is_none_or(|c| c.red() == 0),
+                "shared edge drawn at ({x}, {y})"
+            );
+        }
+    }
+    let outline = (0..32).any(|x| buffer.get_pixel(x, 4).is_some_and(|c| c.red() > 0));
+    assert!(outline, "the outer outline is dashed");
+}

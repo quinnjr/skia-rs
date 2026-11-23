@@ -2118,6 +2118,73 @@ fn flatten_curve_device_error(
     }
 }
 
+/// `path` with every curve flattened in local space so that, after mapping
+/// through `matrix`, the polyline stays within the device-pixel flattening
+/// error (the same bound fills use). Lets a path be mapped point-by-point
+/// under perspective, where mapping control points would bend curves wrong.
+pub(crate) fn flatten_for_matrix(path: &Path, matrix: &Matrix) -> Path {
+    let mut out = PathBuilder::new();
+    out.fill_type(path.fill_type());
+    let mut scratch: Vec<Point> = Vec::new();
+    let mut current = Point::zero();
+    let mut start = Point::zero();
+    let emit = |out: &mut PathBuilder, points: &[Point]| {
+        for q in points {
+            out.line_to(q.x, q.y);
+        }
+    };
+    for element in path {
+        match element {
+            PathElement::Move(p) => {
+                out.move_to(p.x, p.y);
+                (current, start) = (p, p);
+            }
+            PathElement::Line(p) => {
+                out.line_to(p.x, p.y);
+                current = p;
+            }
+            PathElement::Quad(c1, p) => {
+                let s0 = current;
+                flatten_curve_device_error(
+                    &mut scratch,
+                    |t| quad_point(t, 1.0 - t, s0, c1, p),
+                    p,
+                    matrix,
+                );
+                emit(&mut out, &scratch);
+                current = p;
+            }
+            PathElement::Conic(c1, p, weight) => {
+                let s0 = current;
+                flatten_curve_device_error(
+                    &mut scratch,
+                    |t| conic_point(s0, c1, p, weight, t),
+                    p,
+                    matrix,
+                );
+                emit(&mut out, &scratch);
+                current = p;
+            }
+            PathElement::Cubic(c1, c2, p) => {
+                let s0 = current;
+                flatten_curve_device_error(
+                    &mut scratch,
+                    |t| cubic_point(t, 1.0 - t, s0, c1, c2, p),
+                    p,
+                    matrix,
+                );
+                emit(&mut out, &scratch);
+                current = p;
+            }
+            PathElement::Close => {
+                out.close();
+                current = start;
+            }
+        }
+    }
+    out.build()
+}
+
 /// Skia's `SkPathPriv::kW0PlaneDistance`: perspective geometry is clipped
 /// to `w > 1/16384`.
 const W0_PLANE_DISTANCE: Scalar = 1.0 / 16384.0;

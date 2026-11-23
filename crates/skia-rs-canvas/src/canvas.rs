@@ -595,7 +595,15 @@ impl<'a> Canvas<'a> {
         // Under perspective, clip to the w plane first (PerspectiveClip):
         // geometry behind it would map to flipped coordinates.
         let in_front = crate::raster::perspective_clip(path, matrix);
-        let mut transformed_path = in_front.as_ref().unwrap_or(path).clone();
+        let in_front = in_front.as_ref().unwrap_or(path);
+        // Path::transform maps control points only, which is wrong for
+        // curves under perspective: flatten them in local space against the
+        // device-error bound first, as fills do.
+        let mut transformed_path = if matrix.has_perspective() {
+            crate::raster::flatten_for_matrix(in_front, matrix)
+        } else {
+            in_front.clone()
+        };
         transformed_path.transform(matrix);
 
         let device_bounds = IRect::new(0, 0, self.width, self.height);
@@ -2288,6 +2296,29 @@ impl Canvas<'_> {
 
     /// Draw a region.
     pub fn draw_region(&mut self, region: &skia_rs_core::Region, paint: &Paint) {
+        // SkDevice::drawRegion: with a path effect, mask filter, non-fill
+        // style, a non-translate matrix, or AA under a fractional translate,
+        // the region is drawn as its boundary path (one outline, so dashes
+        // run continuously and shared edges between rects are not drawn);
+        // otherwise rect by rect.
+        let m = self.total_matrix();
+        let non_translate = !m.is_translate();
+        let fractional_translate =
+            m.values[Matrix::TRANS_X].fract() != 0.0 || m.values[Matrix::TRANS_Y].fract() != 0.0;
+        let complex_paint = paint.path_effect().is_some()
+            || paint.mask_filter().is_some()
+            || paint.style() != skia_rs_paint::Style::Fill;
+        if non_translate || complex_paint || (paint.is_anti_alias() && fractional_translate) {
+            let mut rects = skia_rs_path::PathBuilder::new();
+            for rect in region.iter() {
+                rects.add_rect(&rect.to_rect());
+            }
+            // The union of the region's (disjoint) rects is its boundary.
+            if let Some(boundary) = skia_rs_path::simplify(&rects.build()) {
+                self.draw_path(&boundary, paint);
+                return;
+            }
+        }
         for rect in region.iter() {
             let rect_f = rect.to_rect();
             self.draw_rect(&rect_f, paint);

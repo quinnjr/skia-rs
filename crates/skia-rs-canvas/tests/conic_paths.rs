@@ -1233,3 +1233,40 @@ fn hairlines_and_clip_paths_are_clipped_to_the_perspective_horizon() {
         }
     }
 }
+
+#[test]
+fn perspective_clip_paths_follow_the_projected_curve_like_fills() {
+    // A circle clip under perspective must match the same circle filled:
+    // mapping only control points would give a different outline.
+    use skia_rs_canvas::ClipOp;
+    use skia_rs_core::{Matrix, Point};
+
+    let perspective = Matrix {
+        values: [1.0, 0.3, 0.0, 0.0, 1.0, 0.0, 0.004, 0.002, 1.0],
+    };
+    let mut filled = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut filled);
+        canvas.concat(&perspective);
+        canvas.draw_circle(Point::new(80.0, 80.0), 60.0, &white(Style::Fill));
+    }
+    let mut clipped = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut clipped);
+        canvas.concat(&perspective);
+        let mut circle = PathBuilder::new();
+        circle.add_circle(80.0, 80.0, 60.0);
+        canvas.clip_path(&circle.build(), ClipOp::Intersect, false);
+        canvas.reset_matrix();
+        let full = skia_rs_core::cast::scalar_from_i32(SIZE);
+        canvas.draw_rect(&Rect::new(0.0, 0.0, full, full), &white(Style::Fill));
+    }
+    let differing = (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .filter(|&(x, y)| lit(&filled, x, y) != lit(&clipped, x, y))
+        .count();
+    assert!(
+        differing <= 8,
+        "clip and fill outlines differ at {differing} pixels"
+    );
+}
