@@ -2425,8 +2425,10 @@ impl Canvas<'_> {
                 rects.add_rect(&rect.to_rect());
             }
             // The union of the region's (disjoint) rects is its boundary. If
-            // the union fails, the rects as one winding-fill path still
-            // fill the same area as a single draw (no per-rect seams).
+            // the union fails, the rects as one winding-fill path fill the
+            // same area in a single draw; a stroke or path effect would then
+            // also trace the interior seams (simplify of disjoint integer
+            // rects is not expected to fail).
             let rects = rects.build();
             let boundary = skia_rs_path::simplify(&rects).unwrap_or(rects);
             self.draw_path(&boundary, paint);
@@ -2943,6 +2945,12 @@ fn build_arc_path(
     builder.build()
 }
 
+/// `SkScalarNearlyEqual` on both coordinates (tolerance 1/4096).
+fn nearly_equal_points(a: Point, b: Point) -> bool {
+    const TOL: Scalar = 1.0 / 4096.0;
+    (a.x - b.x).abs() <= TOL && (a.y - b.y).abs() <= TOL
+}
+
 /// The most whole turns `build_arc_path` draws for one arc.
 const MAX_ARC_TURNS: Scalar = 1024.0;
 
@@ -2966,7 +2974,9 @@ impl ArcPiece<'_> {
                     if self.force_move {
                         self.builder.move_to(p.x, p.y);
                         self.force_move = false;
-                    } else if self.last != Some(p) {
+                    } else if !self.last.is_some_and(|l| nearly_equal_points(l, p)) {
+                        // SkPath::arcTo's addPt: no join line when the new
+                        // start is within SK_ScalarNearlyZero of the end.
                         self.builder.line_to(p.x, p.y);
                     }
                     self.last = Some(p);
@@ -3220,6 +3230,26 @@ const fn colr_composite_to_blend(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn multi_turn_arc_pieces_join_without_extra_lines() {
+        // SkPath::arcTo's addPt adds no join line when the next piece starts
+        // within 1/4096 of the last end; an exact comparison inserted
+        // near-zero lines between the 180-degree pieces of 720-degree arcs.
+        use super::{Rect, build_arc_path};
+
+        for i in 0..3600_u16 {
+            let start = f32::from(i) * 0.1;
+            for (w, h) in [(120.0, 80.0), (33.3, 77.7)] {
+                let oval = Rect::new(10.0, 10.0, 10.0 + w, 10.0 + h);
+                let path = build_arc_path(&oval, start, 720.0, false, false);
+                let lines = path
+                    .iter()
+                    .filter(|e| matches!(e, skia_rs_path::PathElement::Line(_)))
+                    .count();
+                assert_eq!(lines, 0, "start {start}, oval {w}x{h}");
+            }
+        }
+    }
     #[test]
     fn res_scale_matches_skia_compute_res_scale_for_stroking() {
         use skia_rs_core::Matrix;
