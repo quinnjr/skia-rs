@@ -404,15 +404,25 @@ impl GpuSurface for WgpuSurface {
         ) else {
             return false;
         };
-        let aligned_bytes_per_row = (self.width as usize * bytes_per_pixel + 255) & !255;
-        let buffer_size = aligned_bytes_per_row * self.height as usize;
+        // Checked (and the buffer size in u64): on 32-bit targets such as
+        // wasm32 a large surface would overflow usize.
+        let Some(aligned_bytes_per_row) = (self.width as usize)
+            .checked_mul(bytes_per_pixel)
+            .and_then(|row| row.checked_add(255))
+            .map(|row| row & !255)
+        else {
+            return false;
+        };
         let Ok(bytes_per_row) = u32::try_from(aligned_bytes_per_row) else {
+            return false;
+        };
+        let Some(buffer_size) = u64::from(bytes_per_row).checked_mul(u64::from(self.height)) else {
             return false;
         };
 
         let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback buffer"),
-            size: buffer_size as u64,
+            size: buffer_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
