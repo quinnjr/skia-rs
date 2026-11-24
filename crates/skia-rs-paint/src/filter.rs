@@ -532,6 +532,13 @@ fn store_premul(px: &mut [u8], color: Color4f) {
     px[3] = byte(color.a);
 }
 
+/// The pixel a displacement map samples for pixel `coord` moved by `disp`:
+/// Skia evaluates the color image at the displaced pixel *center* with
+/// nearest sampling, `floor(coord + 0.5 + disp)`.
+fn displaced_sample(coord: i32, disp: Scalar) -> i32 {
+    saturate_to_i32((scalar_from_i32(coord) + 0.5 + disp).floor())
+}
+
 /// `SkDisplacementMapImageFilter`'s offset for one channel of a premultiplied
 /// map pixel: the channel is unpremultiplied, then `scale * (c / 255 - 0.5)`
 /// (so the full channel range moves by at most `scale / 2`).
@@ -1429,8 +1436,8 @@ impl ImageFilter for DisplacementMapImageFilter {
                 let y_i32 = i32::try_from(y).unwrap_or(i32::MAX);
                 let width_i32 = i32::try_from(width).unwrap_or(i32::MAX);
                 let height_i32 = i32::try_from(height).unwrap_or(i32::MAX);
-                let sample_x = saturate_to_i32(scalar_from_i32(x_i32) + disp_x);
-                let sample_y = saturate_to_i32(scalar_from_i32(y_i32) + disp_y);
+                let sample_x = displaced_sample(x_i32, disp_x);
+                let sample_y = displaced_sample(y_i32, disp_y);
                 // Samples outside the color image are transparent.
                 if !((0..width_i32).contains(&sample_x) && (0..height_i32).contains(&sample_y)) {
                     pixels[idx..idx + 4].fill(0);
@@ -3351,6 +3358,17 @@ mod tests {
         let mut px = source;
         ArithmeticImageFilter::new(0.0, 0.0, 0.0, 1.0, true, None, None).apply(&mut px, 3, 1);
         assert!(px.iter().all(|&v| v == 255), "arithmetic k4");
+    }
+
+    #[test]
+    fn displacement_samples_at_the_displaced_pixel_center() {
+        assert_eq!(
+            displaced_sample(5, -0.25),
+            5,
+            "less than half a pixel: no move"
+        );
+        assert_eq!(displaced_sample(5, 0.7), 6);
+        assert_eq!(displaced_sample(5, -0.6), 4);
     }
 
     #[test]
