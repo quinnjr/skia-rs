@@ -320,7 +320,14 @@ impl ExpressionEvaluator {
 
                     let normalized = (t - t_min) / (t_max - t_min);
                     let clamped = normalized.clamp(0.0, 1.0);
-                    Some(Value::Number(clamped.mul_add(v_max - v_min, v_min)))
+                    {
+                        #[allow(
+                            clippy::suboptimal_flops,
+                            reason = "the interpolation as originally written (unfused)"
+                        )]
+                        let value = v_min + clamped * (v_max - v_min);
+                        Some(Value::Number(value))
+                    }
                 } else {
                     None
                 }
@@ -346,7 +353,14 @@ impl ExpressionEvaluator {
                         }
                         _ => normalized, // Default to linear
                     };
-                    Some(Value::Number(eased.mul_add(v_max - v_min, v_min)))
+                    {
+                        #[allow(
+                            clippy::suboptimal_flops,
+                            reason = "the interpolation as originally written (unfused)"
+                        )]
+                        let value = v_min + eased * (v_max - v_min);
+                        Some(Value::Number(value))
+                    }
                 } else {
                     None
                 }

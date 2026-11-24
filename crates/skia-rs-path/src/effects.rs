@@ -1410,7 +1410,7 @@ impl PathEffect for TrimEffect {
                     && let Some(tail) = measure.get_segment(end_dist, total)
                 {
                     append_trim_segment(&mut builder, &tail, true);
-                    !is_single_closed_contour(path)
+                    !is_single_closed_contour(path, &measure)
                 } else {
                     true
                 };
@@ -1463,12 +1463,12 @@ fn append_trim_segment(builder: &mut PathBuilder, segment: &Path, requires_move:
 /// One contour, closed (`SkTrimPE`'s `contour_count == 1 &&
 /// isLastContourClosed()`). As in Skia, the contours counted are those the
 /// path measure keeps: zero-length ones do not count.
-fn is_single_closed_contour(path: &Path) -> bool {
+fn is_single_closed_contour(path: &Path, measure: &crate::measure::PathMeasure) -> bool {
     let last_closed = path
         .iter()
         .last()
         .is_some_and(|elem| matches!(elem, PathElement::Close));
-    last_closed && crate::measure::PathMeasure::new(path).contour_count() == 1
+    last_closed && measure.contour_count() == 1
 }
 
 // =============================================================================

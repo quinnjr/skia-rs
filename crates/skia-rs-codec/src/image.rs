@@ -944,7 +944,11 @@ fn resample_linear(
 
                 let top = c00.mul_add(1.0 - tx, c01 * tx);
                 let bot = c10.mul_add(1.0 - tx, c11 * tx);
-                let v = top.mul_add(1.0 - ty, bot * ty);
+                #[allow(
+                    clippy::suboptimal_flops,
+                    reason = "the vertical lerp as originally written (unfused)"
+                )]
+                let v = top * (1.0 - ty) + bot * ty;
 
                 new_pixels[dst_offset + i] = skia_rs_core::cast::f32_to_u8_sat(v);
             }
