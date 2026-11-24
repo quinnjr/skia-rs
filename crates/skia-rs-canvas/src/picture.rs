@@ -669,8 +669,15 @@ impl RecordingCanvas {
         });
     }
 
-    /// Record a draw round rect command.
+    /// Record a draw round rect command. Like `SkCanvas::drawRoundRect`
+    /// (which `SkRecorder` inherits), radii that are not both positive
+    /// record a rect. The command keeps the call's arguments, so playback
+    /// draws exactly what the live call draws.
     pub fn draw_round_rect(&mut self, rect: &Rect, rx: Scalar, ry: Scalar, paint: &Paint) {
+        if !(rx > 0.0 && ry > 0.0) {
+            self.draw_rect(rect, paint);
+            return;
+        }
         self.inner.commands.push(DrawCommand::DrawRoundRect {
             rect: *rect,
             rx,
@@ -816,6 +823,27 @@ mod tests {
         assert_eq!(canvas.save(), 2);
         canvas.restore();
         assert_eq!(canvas.save(), 2);
+    }
+
+    #[test]
+    fn round_rects_without_positive_radii_record_as_rects() {
+        let mut recorder = PictureRecorder::new();
+        let canvas = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, 10.0, 10.0));
+        let r = Rect::from_xywh(1.0, 1.0, 4.0, 4.0);
+        canvas.draw_round_rect(&r, 0.0, 2.0, &Paint::new());
+        canvas.draw_round_rect(&r, 2.0, 2.0, &Paint::new());
+        let picture = recorder.finish_recording().unwrap();
+        assert!(
+            matches!(
+                picture.commands.as_slice(),
+                [
+                    DrawCommand::DrawRect { .. },
+                    DrawCommand::DrawRoundRect { .. }
+                ]
+            ),
+            "{:?}",
+            picture.commands
+        );
     }
 
     #[test]

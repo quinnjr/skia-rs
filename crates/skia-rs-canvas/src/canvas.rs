@@ -1471,30 +1471,11 @@ impl<'a> Canvas<'a> {
                 // SkCanvas::onDrawRRect hands rect-type rrects to drawRect and
                 // oval-type ones to drawOval, so they draw exactly as those
                 // (e.g. the aliased hairline frame of drawRect).
-                use skia_rs_path::Verb;
-                let path = build_round_rect_path(rect, rx, ry);
-                let sorted = sorted_rect(rect);
-                if sorted.width() > 0.0 && sorted.height() > 0.0 {
-                    match path.verbs() {
-                        [Verb::Move, Verb::Line, Verb::Line, Verb::Line, Verb::Close] => {
-                            self.draw_rect(&sorted, paint);
-                            return;
-                        }
-                        [
-                            Verb::Move,
-                            Verb::Conic,
-                            Verb::Conic,
-                            Verb::Conic,
-                            Verb::Conic,
-                            Verb::Close,
-                        ] => {
-                            self.draw_oval(&sorted, paint);
-                            return;
-                        }
-                        _ => {}
-                    }
+                match round_rect_shape(rect, rx, ry) {
+                    RoundRectShape::Rect(r) => self.draw_rect(&r, paint),
+                    RoundRectShape::Oval(r) => self.draw_oval(&r, paint),
+                    RoundRectShape::Path(path) => self.rasterize_path(&path, paint),
                 }
-                self.rasterize_path(&path, paint);
             }
             Backing::Recording(commands) => {
                 commands.push(DrawCommand::DrawRoundRect {
@@ -3384,37 +3365,47 @@ pub enum VertexMode {
 }
 
 // =============================================================================
-// Arc / Round rect path construction shared with PictureRecorder playback.
+// Arc path and round rect shape construction.
 // =============================================================================
 
-fn build_round_rect_path(rect: &Rect, rx: Scalar, ry: Scalar) -> Path {
+/// What `SkCanvas::onDrawRRect` draws for a round rect with positive radii
+/// (`SkRRect::setRectXY` scales them uniformly to fit): a rect-type rrect
+/// goes to drawRect and an oval-type one to drawOval (their start points
+/// differ from addRRect's); the rest is the addRRect path. An empty rect is
+/// a kEmpty rrect, not a rect-type one, so it stays a path.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a short-lived value matched right away by its only caller; boxing the path variant would add an allocation to every general round rect"
+)]
+enum RoundRectShape {
+    Rect(Rect),
+    Oval(Rect),
+    Path(Path),
+}
+
+fn round_rect_shape(rect: &Rect, rx: Scalar, ry: Scalar) -> RoundRectShape {
     use skia_rs_path::Verb;
 
-    // SkCanvas::drawRoundRect: a plain drawRect unless both radii are
-    // positive, otherwise SkRRect::setRectXY (uniform radius scaling) and
-    // SkCanvas::onDrawRRect, which delegates rect-type rrects to drawRect
-    // and oval-type ones to drawOval (their start points differ from
-    // addRRect's), and adds the rest with addRRect.
+    // Callers send radii that are not both positive to draw_rect (what
+    // drawRoundRect draws for them); here add_round_rect would add nothing
+    // for a negative radius.
+    debug_assert!(
+        rx > 0.0 && ry > 0.0,
+        "round_rect_shape needs positive radii"
+    );
+
     let mut builder = skia_rs_path::PathBuilder::new();
-    if !(rx > 0.0 && ry > 0.0) {
-        // drawRect sorts the rect first (fixing start corner and direction).
-        builder.add_rect(&sorted_rect(rect));
-        return builder.build();
-    }
     builder.add_round_rect(rect, rx, ry);
-    let round_rect = builder.build();
-    // add_round_rect emits a plain rect contour for rect-type rrects and a
-    // four-conic contour for oval-type ones.
-    // An empty rect is a kEmpty rrect, not a rect-type one: onDrawRRect does
-    // not hand it to drawRect, and addRRect keeps its own start corner.
+    let path = builder.build();
     let sorted = sorted_rect(rect);
     if !(sorted.width() > 0.0 && sorted.height() > 0.0) {
-        return round_rect;
+        return RoundRectShape::Path(path);
     }
-    let mut delegated = skia_rs_path::PathBuilder::new();
-    match round_rect.verbs() {
+    // add_round_rect emits a plain rect contour for rect-type rrects and a
+    // four-conic contour for oval-type ones.
+    match path.verbs() {
         [Verb::Move, Verb::Line, Verb::Line, Verb::Line, Verb::Close] => {
-            delegated.add_rect(&sorted_rect(rect));
+            RoundRectShape::Rect(sorted)
         }
         [
             Verb::Move,
@@ -3423,12 +3414,9 @@ fn build_round_rect_path(rect: &Rect, rx: Scalar, ry: Scalar) -> Path {
             Verb::Conic,
             Verb::Conic,
             Verb::Close,
-        ] => {
-            delegated.add_oval(&sorted_rect(rect));
-        }
-        _ => return round_rect,
+        ] => RoundRectShape::Oval(sorted),
+        _ => RoundRectShape::Path(path),
     }
-    delegated.build()
 }
 
 /// `SkPathPriv::CreateDrawArcPath`. Only a plain fill (no path effect) may
