@@ -1606,6 +1606,20 @@ impl GpuImageBackend for WgpuGpuImageBackend {
             GpuImageError::ReadBackFailed(format!("unknown handle {}", handle.id))
         })?;
 
+        // Fail before touching dst unless it can hold every row (checked:
+        // a huge dst_row_bytes must not overflow).
+        if readback_row_bytes(
+            width as usize,
+            height as usize,
+            bpp as usize,
+            dst.len(),
+            dst_row_bytes,
+        )
+        .is_none()
+        {
+            return Err(GpuImageError::ReadBackFailed("dst buffer too small".into()));
+        }
+
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("skia-rs gpu image staging"),
             size: buffer_size,
@@ -1655,13 +1669,11 @@ impl GpuImageBackend for WgpuGpuImageBackend {
             .map_err(|e| GpuImageError::ReadBackFailed(e.to_string()))?;
 
         let data = slice.get_mapped_range();
+        let len = unpadded_bpr as usize;
         for y in 0..height as usize {
             let src_off = y * padded_bpr as usize;
+            // Checked up front: every row fits, so these cannot overflow.
             let dst_off = y * dst_row_bytes;
-            let len = unpadded_bpr as usize;
-            if dst_off + len > dst.len() {
-                return Err(GpuImageError::ReadBackFailed("dst buffer too small".into()));
-            }
             dst[dst_off..dst_off + len].copy_from_slice(&data[src_off..src_off + len]);
         }
         drop(data);
