@@ -2515,3 +2515,39 @@ fn hinted_layers_keep_the_spread_of_a_wrapped_filter() {
     let alpha = buffer.get_pixel(64, 50).map_or(0, |c| c.alpha());
     assert!(alpha > 0, "the blur's halo reaches past the hint");
 }
+
+#[test]
+fn round_rects_that_are_rects_or_ovals_draw_as_those() {
+    // SkCanvas::drawRoundRect / onDrawRRect delegate to drawRect and
+    // drawOval, so an aliased hairline round rect with no radius gets
+    // drawRect's closed pixel frame, and a fully rounded one draws as the
+    // oval.
+    let mut hair = white(Style::Stroke);
+    hair.set_stroke_width(0.0);
+    hair.set_anti_alias(false);
+    let r = Rect::new(10.0, 10.0, 20.0, 20.0);
+    let render = |f: &dyn Fn(&mut Canvas)| {
+        let mut buffer = PixelBuffer::new(SIZE, SIZE);
+        f(&mut Canvas::new_raster(&mut buffer));
+        buffer
+    };
+    let as_rect = render(&|c| c.draw_rect(&r, &hair));
+    let as_round = render(&|c| c.draw_round_rect(&r, 0.0, 0.0, &hair));
+    assert!(lit(&as_round, 20, 20), "the frame's far corner is drawn");
+    assert!(
+        as_round.pixels == as_rect.pixels,
+        "zero radii draw as the rect"
+    );
+
+    let mut fill = white(Style::Stroke);
+    fill.set_stroke_width(3.0);
+    let oval = Rect::new(30.5, 40.25, 90.75, 70.5);
+    let as_oval = render(&|c| c.draw_oval(&oval, &fill));
+    // Radii of exactly half each side make an oval-type rrect.
+    let (rx, ry) = (oval.width() / 2.0, oval.height() / 2.0);
+    let as_round = render(&|c| c.draw_round_rect(&oval, rx, ry, &fill));
+    assert!(
+        as_round.pixels == as_oval.pixels,
+        "a full round rect draws as the oval"
+    );
+}

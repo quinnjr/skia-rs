@@ -1460,9 +1460,40 @@ impl<'a> Canvas<'a> {
         if !rect.is_finite() {
             return;
         }
+        // SkCanvas::drawRoundRect: drawRect unless both radii are positive
+        // (recorded as a rect, too).
+        if !(rx > 0.0 && ry > 0.0) {
+            self.draw_rect(rect, paint);
+            return;
+        }
         match &mut self.backing {
             Backing::Raster(_) => {
+                // SkCanvas::onDrawRRect hands rect-type rrects to drawRect and
+                // oval-type ones to drawOval, so they draw exactly as those
+                // (e.g. the aliased hairline frame of drawRect).
+                use skia_rs_path::Verb;
                 let path = build_round_rect_path(rect, rx, ry);
+                let sorted = sorted_rect(rect);
+                if sorted.width() > 0.0 && sorted.height() > 0.0 {
+                    match path.verbs() {
+                        [Verb::Move, Verb::Line, Verb::Line, Verb::Line, Verb::Close] => {
+                            self.draw_rect(&sorted, paint);
+                            return;
+                        }
+                        [
+                            Verb::Move,
+                            Verb::Conic,
+                            Verb::Conic,
+                            Verb::Conic,
+                            Verb::Conic,
+                            Verb::Close,
+                        ] => {
+                            self.draw_oval(&sorted, paint);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 self.rasterize_path(&path, paint);
             }
             Backing::Recording(commands) => {

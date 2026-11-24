@@ -507,8 +507,11 @@ impl RecordingCanvas {
 
     /// Record a restore command.
     pub fn restore(&mut self) {
-        self.inner.commands.push(DrawCommand::Restore);
-        self.inner.save_count = self.inner.save_count.saturating_sub(1).max(1);
+        // Like SkRecorder, a restore with no save to undo is dropped.
+        if self.inner.save_count > 1 {
+            self.inner.commands.push(DrawCommand::Restore);
+            self.inner.save_count -= 1;
+        }
     }
 
     /// Record a save layer command.
@@ -813,6 +816,16 @@ mod tests {
         assert_eq!(canvas.save(), 2);
         canvas.restore();
         assert_eq!(canvas.save(), 2);
+    }
+
+    #[test]
+    fn unbalanced_restores_are_not_recorded() {
+        let mut recorder = PictureRecorder::new();
+        let canvas = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, 10.0, 10.0));
+        canvas.draw_rect(&Rect::from_xywh(1.0, 1.0, 4.0, 4.0), &Paint::new());
+        canvas.restore();
+        let picture = recorder.finish_recording().unwrap();
+        assert_eq!(picture.approximate_op_count(), 1);
     }
 
     #[test]
