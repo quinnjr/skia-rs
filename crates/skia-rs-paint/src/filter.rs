@@ -498,6 +498,22 @@ fn input_affects(input: Option<&ImageFilterRef>) -> bool {
     input.is_some_and(|f| f.affects_transparent_black())
 }
 
+/// `SkDisplacementMapImageFilter`'s offset for one channel of a premultiplied
+/// map pixel: the channel is unpremultiplied, then `scale * (c / 255 - 0.5)`
+/// (so the full channel range moves by at most `scale / 2`).
+fn displacement_offset(map_px: &[u8], channel: usize, scale: Scalar) -> Scalar {
+    let alpha = u32::from(map_px[3]);
+    let value = if channel == 3 {
+        alpha
+    } else {
+        (u32::from(map_px[channel]) * 255 + alpha / 2)
+            .checked_div(alpha)
+            .map_or(0, |v| v.min(255))
+    };
+    let value = u8::try_from(value).unwrap_or(u8::MAX);
+    scale * (f32::from(value) / 255.0 - 0.5)
+}
+
 /// The bounds an optional `input` filter produces from `src` (`src` itself
 /// with no input): filters with an input start from it, as Skia's
 /// `onFilterBounds` maps through the inputs first.
@@ -748,14 +764,20 @@ impl ImageFilter for DropShadowImageFilter {
         let original = pixels.to_vec();
         for y in 0..height {
             for x in 0..width {
-                // Read shadow from offset position (clamp)
+                // Read the shadow from the offset position; outside the
+                // buffer there is none (transparent, as in Skia).
                 let x_i32 = i32::try_from(x).unwrap_or(i32::MAX);
                 let y_i32 = i32::try_from(y).unwrap_or(i32::MAX);
                 let width_i32 = i32::try_from(width).unwrap_or(i32::MAX);
                 let height_i32 = i32::try_from(height).unwrap_or(i32::MAX);
-                let sx = usize::try_from((x_i32 - dx).clamp(0, width_i32 - 1)).unwrap_or(0);
-                let sy = usize::try_from((y_i32 - dy).clamp(0, height_i32 - 1)).unwrap_or(0);
-                let shadow_alpha = (f32::from(shadow[sy * width + sx]) / 255.0) * sa_mul;
+                let (sx, sy) = (x_i32 - dx, y_i32 - dy);
+                let coverage = if (0..width_i32).contains(&sx) && (0..height_i32).contains(&sy) {
+                    shadow[usize::try_from(sy).unwrap_or(0) * width
+                        + usize::try_from(sx).unwrap_or(0)]
+                } else {
+                    0
+                };
+                let shadow_alpha = (f32::from(coverage) / 255.0) * sa_mul;
                 let shadow_rgba = [
                     f32_to_u8_trunc(f32::from(sr) * shadow_alpha),
                     f32_to_u8_trunc(f32::from(sg) * shadow_alpha),
@@ -969,7 +991,7 @@ impl ImageFilter for MorphologyImageFilter {
     fn input_bounds(&self, output: &Rect) -> Rect {
         input_of(
             self.input.as_ref(),
-            &output.inset(-self.radius_x, -self.radius_y),
+            &output.inset(-self.radius_x.max(0.0), -self.radius_y.max(0.0)),
         )
     }
 
@@ -986,13 +1008,10 @@ impl ImageFilter for MorphologyImageFilter {
     }
 
     fn filter_bounds(&self, src: &Rect) -> Rect {
+        // A negative or NaN radius does nothing (as apply treats it).
+        let (rx, ry) = (self.radius_x.max(0.0), self.radius_y.max(0.0));
         let src = input_filter_bounds(self.input.as_ref(), src);
-        Rect::new(
-            src.left - self.radius_x,
-            src.top - self.radius_y,
-            src.right + self.radius_x,
-            src.bottom + self.radius_y,
-        )
+        Rect::new(src.left - rx, src.top - ry, src.right + rx, src.bottom + ry)
     }
 
     fn serialize(&self) -> Option<Vec<u8>> {
@@ -1368,22 +1387,25 @@ impl ImageFilter for DisplacementMapImageFilter {
         for y in 0..height {
             for x in 0..width {
                 let idx = (y * width + x) * 4;
-                // Read displacement channels (0..255 maps to -1..1)
-                let disp_x = (f32::from(map[idx + x_channel_idx]) / 127.5 - 1.0) * scale;
-                let disp_y = (f32::from(map[idx + y_channel_idx]) / 127.5 - 1.0) * scale;
+                // Offsets from the unpremultiplied map channels.
+                let map_px = &map[idx..idx + 4];
+                let disp_x = displacement_offset(map_px, x_channel_idx, scale);
+                let disp_y = displacement_offset(map_px, y_channel_idx, scale);
                 let x_i32 = i32::try_from(x).unwrap_or(i32::MAX);
                 let y_i32 = i32::try_from(y).unwrap_or(i32::MAX);
                 let width_i32 = i32::try_from(width).unwrap_or(i32::MAX);
                 let height_i32 = i32::try_from(height).unwrap_or(i32::MAX);
                 let sample_x = saturate_to_i32(scalar_from_i32(x_i32) + disp_x);
                 let sample_y = saturate_to_i32(scalar_from_i32(y_i32) + disp_y);
-                let sx = usize::try_from(sample_x.clamp(0, width_i32 - 1)).unwrap_or(0);
-                let sy = usize::try_from(sample_y.clamp(0, height_i32 - 1)).unwrap_or(0);
-                let src_idx = (sy * width + sx) * 4;
-                pixels[idx] = src[src_idx];
-                pixels[idx + 1] = src[src_idx + 1];
-                pixels[idx + 2] = src[src_idx + 2];
-                pixels[idx + 3] = src[src_idx + 3];
+                // Samples outside the color image are transparent.
+                if !((0..width_i32).contains(&sample_x) && (0..height_i32).contains(&sample_y)) {
+                    pixels[idx..idx + 4].fill(0);
+                    continue;
+                }
+                let src_idx = (usize::try_from(sample_y).unwrap_or(0) * width
+                    + usize::try_from(sample_x).unwrap_or(0))
+                    * 4;
+                pixels[idx..idx + 4].copy_from_slice(&src[src_idx..src_idx + 4]);
             }
         }
     }
@@ -1848,7 +1870,7 @@ impl ImageFilter for OffsetImageFilter {
         if let Some(ref input) = self.input {
             input.apply(pixels, width, height);
         }
-        // Shift pixels with clamp-to-edge
+        // Shift pixels; the area uncovered is transparent (as in Skia).
         let offset_x = saturate_to_i32(self.dx.round());
         let offset_y = saturate_to_i32(self.dy.round());
         if offset_x == 0 && offset_y == 0 {
@@ -1866,13 +1888,16 @@ impl ImageFilter for OffsetImageFilter {
             for x in 0..width {
                 let x_i32 = i32::try_from(x).unwrap_or(i32::MAX);
                 let y_i32 = i32::try_from(y).unwrap_or(i32::MAX);
-                let src_x =
-                    usize::try_from((x_i32 - offset_x).clamp(0, width_i32 - 1)).unwrap_or(0);
-                let src_y =
-                    usize::try_from((y_i32 - offset_y).clamp(0, height_i32 - 1)).unwrap_or(0);
+                let (src_x, src_y) = (x_i32 - offset_x, y_i32 - offset_y);
                 let dst_idx = (y * width + x) * 4;
-                let src_idx = (src_y * width + src_x) * 4;
-                pixels[dst_idx..dst_idx + 4].copy_from_slice(&copy[src_idx..src_idx + 4]);
+                if (0..width_i32).contains(&src_x) && (0..height_i32).contains(&src_y) {
+                    let src_idx = (usize::try_from(src_y).unwrap_or(0) * width
+                        + usize::try_from(src_x).unwrap_or(0))
+                        * 4;
+                    pixels[dst_idx..dst_idx + 4].copy_from_slice(&copy[src_idx..src_idx + 4]);
+                } else {
+                    pixels[dst_idx..dst_idx + 4].fill(0);
+                }
             }
         }
     }
@@ -3226,6 +3251,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn displacement_offsets_match_skia() {
+        // scale * (c / 255 - 0.5) on the unpremultiplied channel.
+        assert!((displacement_offset(&[255, 0, 0, 255], 0, 20.0) - 10.0).abs() < 1e-5);
+        assert!((displacement_offset(&[0, 0, 0, 255], 0, 20.0) + 10.0).abs() < 1e-5);
+        // R 255 at 50% alpha is stored as 128: still the full +scale/2.
+        assert!((displacement_offset(&[128, 0, 0, 128], 0, 20.0) - 10.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn shifted_content_leaves_transparent_pixels_behind() {
+        let red = [255, 0, 0, 255];
+        let mut px = [red, [0; 4], [0; 4]].concat();
+        OffsetImageFilter::new(1.0, 0.0, None).apply(&mut px, 3, 1);
+        assert_eq!(&px[..8], &[0, 0, 0, 0, 255, 0, 0, 255], "offset");
+
+        let mut px = [red, [0; 4], [0; 4]].concat();
+        let shadow =
+            DropShadowImageFilter::new(1.0, 0.0, 0.0, 0.0, Color4f::new(0.0, 0.0, 1.0, 1.0), true);
+        shadow.apply(&mut px, 3, 1);
+        assert_eq!(px[3], 0, "no shadow enters from outside");
+        assert_eq!(px[7], 255, "the shadow moved right");
+    }
+
+    #[test]
+    fn morphology_bounds_ignore_negative_and_nan_radii() {
+        let src = Rect::new(10.0, 10.0, 60.0, 60.0);
+        assert_eq!(
+            MorphologyImageFilter::dilate(-5.0, -5.0, None).filter_bounds(&src),
+            src
+        );
+        assert_eq!(
+            MorphologyImageFilter::dilate(f32::NAN, 0.0, None).filter_bounds(&src),
+            src
+        );
+        assert_eq!(
+            MorphologyImageFilter::dilate(-5.0, -5.0, None).input_bounds(&src),
+            src
+        );
+    }
+
+    #[test]
     fn filters_run_their_inputs_and_bound_through_them() {
         // Each filter runs its input first: here a 1-pixel shift right.
         let shift: ImageFilterRef = Arc::new(OffsetImageFilter::new(1.0, 0.0, None));
@@ -3559,9 +3625,10 @@ mod tests {
         pixels[0] = 255; // red at top-left
         pixels[3] = 255; // alpha
         filter.apply(&mut pixels, 4, 4);
-        // Pixel should have shifted right and down
-        // Top-left should now be clamped from what was at (-1, -1) = top-left
-        assert_eq!(pixels[0], 255, "clamp-to-edge should preserve top-left");
+        // The pixel moved right and down; the uncovered top-left is
+        // transparent, as in Skia.
+        assert_eq!(&pixels[..4], &[0, 0, 0, 0], "top-left uncovered");
+        assert_eq!(&pixels[20..24], &[255, 0, 0, 255], "moved to (1, 1)");
     }
 
     #[test]
