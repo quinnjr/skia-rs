@@ -339,6 +339,7 @@ jobs:
 
       # Build with specific backend features
       - name: Build (${{ matrix.backend }})
+        id: build
         run: cargo build --workspace --features "${{ matrix.features }}"
 
       # Run conformance tests for this backend. This is the gate: the raster
@@ -357,15 +358,18 @@ jobs:
       # Generate test images. Only the raster backend has a canvas renderer;
       # the GPU backends are covered by the build and test steps above.
       # Run even when the conformance test failed, so its divergences are
-      # still reported and uploaded.
+      # still reported and uploaded (but not after a failed build).
       - name: Generate test images
-        if: ${{ !cancelled() && matrix.backend == 'raster' }}
+        id: generate
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.backend == 'raster' }}
         run: cargo run -p skia-rs-safe --example conformance_gen -- --backend raster --output-dir conformance_output
 
       # Compare against reference images with ImageMagick, for the summary
-      # report only (informational: the conformance test above gates).
+      # report only (informational: the conformance test above gates). Its
+      # RMSE is over the PNGs' unpremultiplied pixels, while the test's is
+      # over premultiplied ones, so near-threshold verdicts may differ.
       - name: Compare with reference images
-        if: ${{ !cancelled() && matrix.backend == 'raster' && matrix.os == 'ubuntu-latest' }}
+        if: ${{ !cancelled() && steps.generate.outcome == 'success' && matrix.os == 'ubuntu-latest' }}
         run: |
           mkdir -p conformance_results
           # A reference with no generated image means a case stopped being
@@ -390,7 +394,7 @@ jobs:
                 else
                   result=FAIL
                 fi
-                echo "$result ${{ matrix.backend }}: $base - RMSE: $diff" >> conformance_results/report.txt
+                echo "$result ${{ matrix.backend }}: $base - ImageMagick RMSE (unpremultiplied, informational): $diff" >> conformance_results/report.txt
               else
                 # A new case without a committed reference was never checked.
                 echo "FAIL ${{ matrix.backend }}: $base - NO REFERENCE" >> conformance_results/report.txt
