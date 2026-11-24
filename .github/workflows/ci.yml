@@ -356,14 +356,16 @@ jobs:
 
       # Generate test images. Only the raster backend has a canvas renderer;
       # the GPU backends are covered by the build and test steps above.
+      # Run even when the conformance test failed, so its divergences are
+      # still reported and uploaded.
       - name: Generate test images
-        if: matrix.backend == 'raster'
+        if: ${{ !cancelled() && matrix.backend == 'raster' }}
         run: cargo run -p skia-rs-safe --example conformance_gen -- --backend raster --output-dir conformance_output
 
       # Compare against reference images with ImageMagick, for the summary
       # report only (informational: the conformance test above gates).
       - name: Compare with reference images
-        if: matrix.backend == 'raster' && matrix.os == 'ubuntu-latest'
+        if: ${{ !cancelled() && matrix.backend == 'raster' && matrix.os == 'ubuntu-latest' }}
         run: |
           mkdir -p conformance_results
           # A reference with no generated image means a case stopped being
