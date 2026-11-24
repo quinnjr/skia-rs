@@ -2066,6 +2066,9 @@ pub unsafe extern "C" fn sk_canvas_get_height(canvas: *const sk_canvas_t) -> i32
 /// Returns the same value as `SkCanvas::save()`: the save count *before*
 /// this call in Skia's 1-based counting (1 for the first save, 2 for a
 /// nested one, ...). Returns 0 if `canvas` is null.
+///
+/// # Safety
+/// `canvas` must be null or a live canvas handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_canvas_save(canvas: *mut sk_canvas_t) -> i32 {
     catch_panic(|| {
@@ -2339,6 +2342,10 @@ pub unsafe extern "C" fn sk_canvas_clip_path(
 /// `[0, 0, width, height]` (inside a layer, the layer's content bounds:
 /// its `bounds` hint, if one was given); an empty clip gives
 /// `[0, 0, 0, 0]`, as `SkCanvas::getDeviceClipBounds`.
+///
+/// # Safety
+/// `canvas` must be null or a live canvas handle, and `out` must be null or
+/// point to writable memory for one `sk_irect_t`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_canvas_get_clip_ibounds(
     canvas: *mut sk_canvas_t,
@@ -3327,6 +3334,10 @@ pub unsafe extern "C" fn sk_picture_recorder_finish_recording(
 /// Like `SkPicture`, the recording stores the save and later transform ops
 /// as commands and keeps geometry in local coordinates, so playback composes
 /// with the target canvas's own matrix and path effects see local geometry.
+///
+/// # Safety
+/// `canvas` must be null or a recording canvas handle from
+/// `sk_picture_recorder_begin_recording`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_recording_canvas_save(canvas: *mut sk_recording_canvas_t) -> i32 {
     catch_panic(|| {
