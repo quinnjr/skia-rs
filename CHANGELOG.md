@@ -19,11 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   found on the first call, later calls return `None` without re-probing,
   even if fonts are installed afterwards. A font that loads is always kept
   (so every call returns the same typeface); a miss after a clearly
-  transient read error, such as too many open files, is not, and the next
+  transient read error (too many open files, an interrupted, timed-out or
+  busy read, or a Windows sharing or lock violation) is not, and the next
   call tries again.
 - `StrokeRec::set_stroke_style` maps a NaN or infinite width to `Fill`
   (Skia keeps an infinite width as a stroke), so a `Stroke` width is
   always finite and positive.
+- `TrimEffect::new` (and the C API's trim constructor) pins `start` and
+  `end` to [0, 1] like `SkTrimPathEffect::Make`; only non-finite values
+  give `None` (out-of-range values used to).
 - **Breaking**: the C API's `sk_canvas_save_layer` returns `int32_t`
   (was `uint32_t`), the same type and value as `sk_canvas_save`.
 - **Breaking**: the C API's `sk_surface_lock_canvas` now holds a reference

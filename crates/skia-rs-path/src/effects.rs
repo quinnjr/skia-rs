@@ -1169,11 +1169,17 @@ impl DiscreteEffect {
 
     /// Adds a line to `point` moved by a random offset of up to `deviation`.
     fn jitter_to(&self, builder: &mut PathBuilder, point: Point, seed: &mut u32) {
+        let moved = self.jittered(point, seed);
+        builder.line_to(moved.x, moved.y);
+    }
+
+    /// `point` moved by a random offset of up to `deviation` per axis.
+    fn jittered(&self, point: Point, seed: &mut u32) -> Point {
         let dx = Self::random(*seed) * self.deviation;
         *seed = seed.wrapping_add(1);
         let dy = Self::random(*seed) * self.deviation;
         *seed = seed.wrapping_add(1);
-        builder.line_to(point.x + dx, point.y + dy);
+        Point::new(point.x + dx, point.y + dy)
     }
 }
 
@@ -1197,14 +1203,12 @@ impl PathEffect for DiscreteEffect {
             n
         };
 
-        for element in path {
+        let elements: Vec<PathElement> = path.iter().collect();
+        for (index, &element) in elements.iter().enumerate() {
             match element {
                 PathElement::Move(p) => {
-                    let dx = Self::random(seed) * self.deviation;
-                    seed = seed.wrapping_add(1);
-                    let dy = Self::random(seed) * self.deviation;
-                    seed = seed.wrapping_add(1);
-                    builder.move_to(p.x + dx, p.y + dy);
+                    let moved = self.jittered(p, &mut seed);
+                    builder.move_to(moved.x, moved.y);
                     current_pos = p;
                     contour_start = p;
                     contour_budget = MAX_DISCRETE_SEGMENTS;
@@ -1213,12 +1217,17 @@ impl PathEffect for DiscreteEffect {
                     let length = current_pos.distance(&end);
                     let num_segments =
                         take_segments(ceil_to_i32(length / self.seg_length), &mut contour_budget);
+                    // A last line back to the start, then a close: the start
+                    // is already emitted (jittered) by the move, so it is
+                    // not emitted again.
+                    let returns_to_start = end == contour_start
+                        && matches!(elements.get(index + 1), Some(PathElement::Close));
                     self.jitter_line(
                         &mut builder,
                         current_pos,
                         end,
                         num_segments,
-                        true,
+                        !returns_to_start,
                         &mut seed,
                     );
                     current_pos = end;
@@ -1333,11 +1342,17 @@ pub enum TrimMode {
 impl TrimEffect {
     /// Create a new trim effect.
     #[must_use]
-    pub fn new(start: Scalar, end: Scalar, mode: TrimMode) -> Option<Self> {
-        if !(0.0..=1.0).contains(&start) || !(0.0..=1.0).contains(&end) {
+    pub const fn new(start: Scalar, end: Scalar, mode: TrimMode) -> Option<Self> {
+        // SkTrimPathEffect::Make: only non-finite values fail; the rest are
+        // pinned to [0, 1].
+        if !(start.is_finite() && end.is_finite()) {
             return None;
         }
-        Some(Self { start, end, mode })
+        Some(Self {
+            start: start.clamp(0.0, 1.0),
+            end: end.clamp(0.0, 1.0),
+            mode,
+        })
     }
 
     /// Get the start position.
@@ -3208,6 +3223,32 @@ mod tests {
         let mut b = PathBuilder::new();
         b.move_to(-1e7, 50.0).line_to(1e7, 50.0);
         assert!(dash.filter_path(&b.build(), &mut rec).is_none());
+    }
+
+    #[test]
+    fn discrete_emits_a_closed_contour_start_once() {
+        // An explicit last line back to the start, then close: the start is
+        // emitted once (by the move), with no doubled, separately jittered copy.
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0)
+            .line_to(100.0, 0.0)
+            .line_to(100.0, 100.0)
+            .line_to(0.0, 100.0)
+            .line_to(0.0, 0.0)
+            .close();
+        let out = DiscreteEffect::new(20.0, 3.0, 0)
+            .unwrap()
+            .apply(&b.build())
+            .unwrap();
+        let near_start = out.points().iter().filter(|p| p.x.hypot(p.y) < 8.0).count();
+        assert_eq!(near_start, 1, "{:?}", out.points());
+    }
+
+    #[test]
+    fn trim_parameters_are_pinned_like_skia() {
+        let trim = TrimEffect::new(-0.5, 1.000_000_1, TrimMode::Normal).unwrap();
+        assert_eq!((trim.start(), trim.end()), (0.0, 1.0));
+        assert!(TrimEffect::new(f32::NAN, 0.5, TrimMode::Normal).is_none());
     }
 
     #[test]

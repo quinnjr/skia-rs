@@ -369,7 +369,8 @@ impl Typeface {
     /// a fallback reached because a preferred candidate failed, so every call
     /// returns the same typeface. A miss is not kept when a candidate failed
     /// with a clearly transient error (too many open files, an interrupted,
-    /// timed-out or busy read): the next call tries again.
+    /// timed-out or busy read, or on Windows a file briefly held by another
+    /// process: a sharing or lock violation): the next call tries again.
     #[must_use]
     pub fn system_default() -> Option<Self> {
         // A hit, or a definite miss, is cached; every call shares it.
