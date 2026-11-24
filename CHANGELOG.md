@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-24
+
 ### Changed
 
 - **Breaking**: the minimum supported Rust version is now **1.94** (was
@@ -1301,5 +1303,6 @@ The first public release of skia-rs, a pure Rust implementation of the Skia 2D g
 [0.1.0]: https://github.com/quinnjr/skia-rs/releases/tag/v0.1.0
 [0.3.0]: https://github.com/quinnjr/skia-rs/compare/v0.2.7...v0.3.0
 [0.4.0]: https://github.com/quinnjr/skia-rs/compare/v0.3.0...v0.4.0
-[Unreleased]: https://github.com/quinnjr/skia-rs/compare/v0.4.0...HEAD
+[0.5.0]: https://github.com/quinnjr/skia-rs/compare/v0.4.0...v0.5.0
+[Unreleased]: https://github.com/quinnjr/skia-rs/compare/v0.5.0...HEAD
 
