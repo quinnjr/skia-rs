@@ -394,8 +394,8 @@ impl Typeface {
         if found.is_none() && transient_error {
             return None;
         }
-        // Parse the font tables before caching: clones share the filled
-        // OnceLock, so callers do not each re-parse them.
+        // Parse the font tables before caching: each returned clone copies
+        // the already-parsed metrics instead of parsing the font again.
         if let Some(typeface) = &found {
             let _ = typeface.parsed();
         }
@@ -607,7 +607,7 @@ pub type TypefaceRef = Arc<Typeface>;
 #[cfg(test)]
 mod tests {
     #[test]
-    fn the_system_default_typeface_shares_its_parsed_tables() {
+    fn the_system_default_typeface_comes_already_parsed() {
         // Needs a system font; where there is none there is nothing to share.
         if let Some(typeface) = Typeface::system_default() {
             assert!(typeface.parsed.get().is_some(), "parsed before caching");
