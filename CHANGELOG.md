@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   always finite and positive.
 - **Breaking**: the C API's `sk_canvas_save_layer` returns `int32_t`
   (was `uint32_t`), the same type and value as `sk_canvas_save`.
+- **Breaking**: the C API's `sk_surface_lock_canvas` now holds a reference
+  on the surface until `sk_canvas_release`, so the surface outlives its
+  locked canvas. While locked, `sk_surface_get_refcnt` reports one more
+  and `sk_surface_is_unique` returns false.
 - The C API's `sk_canvas_save_layer` now makes a real offscreen layer
   (it was a plain save): later draws go into it, and `sk_canvas_restore`
   (or `sk_canvas_release`, which like `~SkCanvas` unwinds open saves)
