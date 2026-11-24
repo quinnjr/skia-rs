@@ -332,9 +332,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mesa-utils libgl1-mesa-dri libegl1 libegl-mesa0 libgbm1 mesa-vulkan-drivers
 
-      # Install ImageMagick for image comparison (only Ubuntu compares)
+      # Install ImageMagick for image comparison (raster on Ubuntu only)
       - name: Install ImageMagick
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.backend == 'raster' && matrix.os == 'ubuntu-latest'
         run: sudo apt-get install -y imagemagick
 
       # Build with specific backend features
