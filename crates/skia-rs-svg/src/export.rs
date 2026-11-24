@@ -166,7 +166,7 @@ fn export_node(output: &mut String, node: &SvgNode, options: &SvgExportOptions, 
 
             // Write both radii when either is set: a missing one reads back as
             // "auto" (copying the other), which would round square corners.
-            if rect.rx > 0.0 || rect.ry > 0.0 {
+            if rect.rx != 0.0 || rect.ry != 0.0 {
                 write!(
                     output,
                     " rx=\"{}\"",
@@ -174,7 +174,7 @@ fn export_node(output: &mut String, node: &SvgNode, options: &SvgExportOptions, 
                 )
                 .unwrap();
             }
-            if rect.rx > 0.0 || rect.ry > 0.0 {
+            if rect.rx != 0.0 || rect.ry != 0.0 {
                 write!(
                     output,
                     " ry=\"{}\"",

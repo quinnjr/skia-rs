@@ -191,18 +191,17 @@ fn build_node(
         "svg" => SvgNode::new(SvgNodeKind::Svg),
         "g" => SvgNode::new(SvgNodeKind::Group),
         "rect" => {
-            // SVG: a missing (or negative) rx/ry is "auto", taking the
-            // other radius (SkSVGRect::resolve).
-            // `auto` or any value that is not a length counts as missing.
+            // SkSVGRect's ResolveOptionalRadii (SVG 2): a missing rx/ry is
+            // "auto" (as is `auto` or any value that is not a length); a
+            // given one resolves on its own axis, and an auto one takes the
+            // other's resolved value. A given negative radius is kept: it
+            // draws square corners (SkRRect::MakeRectXY).
             let given = |k: &str| attrs.get(k).is_some_and(|v| is_length(v));
-            let rx = given("rx").then(|| hlen("rx", "0")).filter(|r| *r >= 0.0);
-            let ry = given("ry").then(|| vlen("ry", "0")).filter(|r| *r >= 0.0);
-            // An auto radius copies the other *length*, resolved against its
-            // own axis (rx="10%" gives ry = 10% of the height).
+            let rx = given("rx").then(|| hlen("rx", "0"));
+            let ry = given("ry").then(|| vlen("ry", "0"));
             let (rx, ry) = match (rx, ry) {
                 (Some(rx), Some(ry)) => (rx, ry),
-                (Some(rx), None) => (rx, vlen("rx", "0")),
-                (None, Some(ry)) => (hlen("ry", "0"), ry),
+                (Some(r), None) | (None, Some(r)) => (r, r),
                 (None, None) => (0.0, 0.0),
             };
             SvgNode::new(SvgNodeKind::Rect(SvgRect {

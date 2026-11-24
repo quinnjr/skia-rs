@@ -446,7 +446,8 @@ fn render_node(
         SvgNodeKind::Rect(rect) if rect.width > 0.0 && rect.height > 0.0 => {
             let r = Rect::from_xywh(rect.x, rect.y, rect.width, rect.height);
             let (rx, ry) = rect_radii(rect);
-            if rx > 0.0 || ry > 0.0 {
+            // SkRRect::MakeRectXY: a radius <= 0 gives square corners.
+            if rx > 0.0 && ry > 0.0 {
                 if let Some(paint) = &fill_paint {
                     canvas.draw_round_rect(&r, rx, ry, paint);
                 }
@@ -1094,9 +1095,9 @@ mod tests {
     }
 
     #[test]
-    fn auto_radius_resolves_a_percentage_on_its_own_axis() {
-        // rx="10%" in a 200x100 viewport: rx = 20, and auto ry copies the
-        // length, so ry = 10% of the height = 10 (not 20).
+    fn auto_radius_takes_the_other_resolved_radius() {
+        // SkSVGRect's ResolveOptionalRadii: rx="10%" in a 200x100 viewport
+        // resolves on the width (20), and the auto ry takes that value.
         let svg = r#"<svg width="200" height="100" xmlns="http://www.w3.org/2000/svg">
             <rect width="150" height="80" rx="10%"/>
         </svg>"#;
@@ -1110,7 +1111,19 @@ mod tests {
                 _ => None,
             })
             .expect("a rect");
-        assert_eq!((rect.rx, rect.ry), (20.0, 10.0));
+        assert_eq!((rect.rx, rect.ry), (20.0, 20.0));
+    }
+
+    #[test]
+    fn a_negative_rect_radius_gives_square_corners() {
+        // A given negative ry is kept, not auto: SkRRect::MakeRectXY then
+        // draws square corners, so the corner pixel is filled.
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="80" height="80" rx="10" ry="-5" fill="red"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = pixel_at(&surface, 11, 11).map_or(255, |c| c.green());
+        assert!(green < 50, "square corner: (11, 11) is filled");
     }
 
     #[test]
