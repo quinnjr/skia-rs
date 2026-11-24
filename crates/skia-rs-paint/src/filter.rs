@@ -498,6 +498,40 @@ fn input_affects(input: Option<&ImageFilterRef>) -> bool {
     input.is_some_and(|f| f.affects_transparent_black())
 }
 
+/// The image an optional input produces from the source `pixels` (the
+/// source itself with no input), for filters that combine several inputs.
+fn input_image(
+    input: Option<&ImageFilterRef>,
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
+    let mut image = pixels.to_vec();
+    if let Some(input) = input {
+        input.apply(&mut image, width, height);
+    }
+    image
+}
+
+/// A premultiplied RGBA8 pixel as a `Color4f` (still premultiplied).
+fn premul_color(px: &[u8]) -> Color4f {
+    Color4f::new(
+        f32::from(px[0]) / 255.0,
+        f32::from(px[1]) / 255.0,
+        f32::from(px[2]) / 255.0,
+        f32::from(px[3]) / 255.0,
+    )
+}
+
+/// Stores a premultiplied `Color4f` (clamped to [0, 1]) as RGBA8.
+fn store_premul(px: &mut [u8], color: Color4f) {
+    let byte = |v: Scalar| f32_to_u8_sat((v.clamp(0.0, 1.0) * 255.0).round());
+    px[0] = byte(color.r);
+    px[1] = byte(color.g);
+    px[2] = byte(color.b);
+    px[3] = byte(color.a);
+}
+
 /// `SkDisplacementMapImageFilter`'s offset for one channel of a premultiplied
 /// map pixel: the channel is unpremultiplied, then `scale * (c / 255 - 0.5)`
 /// (so the full channel range moves by at most `scale / 2`).
@@ -1789,13 +1823,26 @@ impl ImageFilter for MergeImageFilter {
         Some(buf)
     }
 
-    /// Apply is a no-op for this filter in the single-buffer `apply()` API.
-    ///
-    /// `MergeImageFilter` requires multiple independent input pixel buffers,
-    /// which the current single-buffer signature cannot provide. A future
-    /// revision will introduce a multi-input apply variant.
-    fn apply(&self, _pixels: &mut [u8], _width: usize, _height: usize) {
-        // Documented limitation: multi-input filter requires extended API.
+    fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
+        // SkMergeImageFilter: each input's image (the source for `None`)
+        // drawn in order with src-over onto transparent black.
+        let images: Vec<Vec<u8>> = self
+            .inputs
+            .iter()
+            .map(|input| input_image(input.as_ref(), pixels, width, height))
+            .collect();
+        pixels.fill(0);
+        for image in &images {
+            for (dst, src) in pixels
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(image.as_chunks::<4>().0.iter())
+            {
+                let blended = crate::BlendMode::SrcOver.apply(premul_color(src), premul_color(dst));
+                store_premul(dst, blended);
+            }
+        }
     }
 }
 
@@ -2369,13 +2416,20 @@ impl ImageFilter for BlendImageFilter {
         Some(buf)
     }
 
-    /// Apply is a no-op for this filter in the single-buffer `apply()` API.
-    ///
-    /// `BlendImageFilter` requires separate background and foreground pixel
-    /// buffers, which the current single-buffer signature cannot provide.
-    /// A future revision will introduce a multi-input apply variant.
-    fn apply(&self, _pixels: &mut [u8], _width: usize, _height: usize) {
-        // Documented limitation: multi-input filter requires extended API.
+    fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
+        // SkBlendImageFilter: the foreground image blended onto the
+        // background image with the mode (each the source for `None`).
+        let background = input_image(self.background.as_ref(), pixels, width, height);
+        let foreground = input_image(self.foreground.as_ref(), pixels, width, height);
+        for ((dst, bg), fg) in pixels
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(background.as_chunks::<4>().0.iter())
+            .zip(foreground.as_chunks::<4>().0.iter())
+        {
+            store_premul(dst, self.mode.apply(premul_color(fg), premul_color(bg)));
+        }
     }
 }
 
@@ -2454,6 +2508,36 @@ impl ImageFilter for ArithmeticImageFilter {
         bg.union(&fg)
     }
 
+    fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
+        // SkArithmeticImageFilter on premultiplied values, src being the
+        // foreground and dst the background: k1*src*dst + k2*src + k3*dst
+        // + k4, clamped to [0, 1], and (enforcing premul) color <= alpha.
+        let background = input_image(self.background.as_ref(), pixels, width, height);
+        let foreground = input_image(self.foreground.as_ref(), pixels, width, height);
+        let (k1, k2, k3, k4) = (self.k1, self.k2, self.k3, self.k4);
+        let combine = |s: Scalar, d: Scalar| (k1 * s * d + k2 * s + k3 * d + k4).clamp(0.0, 1.0);
+        for ((out, bg), fg) in pixels
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(background.as_chunks::<4>().0.iter())
+            .zip(foreground.as_chunks::<4>().0.iter())
+        {
+            let (src, dst) = (premul_color(fg), premul_color(bg));
+            let a = combine(src.a, dst.a);
+            let mut color = Color4f::new(
+                combine(src.r, dst.r),
+                combine(src.g, dst.g),
+                combine(src.b, dst.b),
+                a,
+            );
+            if self.enforce_pm_color {
+                color = Color4f::new(color.r.min(a), color.g.min(a), color.b.min(a), a);
+            }
+            store_premul(out, color);
+        }
+    }
+
     fn serialize(&self) -> Option<Vec<u8>> {
         let mut buf = vec![IMAGE_FILTER_KIND_ARITHMETIC];
         buf.extend_from_slice(&self.k1.to_le_bytes());
@@ -2482,15 +2566,6 @@ impl ImageFilter for ArithmeticImageFilter {
             None => buf.push(0),
         }
         Some(buf)
-    }
-
-    /// Apply is a no-op for this filter in the single-buffer `apply()` API.
-    ///
-    /// `ArithmeticImageFilter` requires separate background and foreground pixel
-    /// buffers, which the current single-buffer signature cannot provide.
-    /// A future revision will introduce a multi-input apply variant.
-    fn apply(&self, _pixels: &mut [u8], _width: usize, _height: usize) {
-        // Documented limitation: multi-input filter requires extended API.
     }
 }
 
@@ -3249,6 +3324,34 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn multi_input_filters_combine_their_inputs() {
+        // Source: a red pixel at x = 0 of a 3x1 image; `shift` moves it to 1.
+        let red = [255, 0, 0, 255];
+        let source = [red, [0; 4], [0; 4]].concat();
+        let shift: ImageFilterRef = Arc::new(OffsetImageFilter::new(1.0, 0.0, None));
+
+        // Merge: the source and its shifted copy, src-over.
+        let mut px = source.clone();
+        MergeImageFilter::new(vec![None, Some(shift.clone())]).apply(&mut px, 3, 1);
+        assert_eq!(&px[..8], &[255, 0, 0, 255, 255, 0, 0, 255], "merge");
+
+        // Blend: the shifted copy (foreground) over the source (background).
+        let mut px = source.clone();
+        BlendImageFilter::new(crate::BlendMode::SrcOver, None, Some(shift.clone()))
+            .apply(&mut px, 3, 1);
+        assert_eq!(&px[..8], &[255, 0, 0, 255, 255, 0, 0, 255], "blend");
+
+        // Arithmetic k2 = 1: the foreground alone; k4 = 1: opaque white.
+        let mut px = source.clone();
+        ArithmeticImageFilter::new(0.0, 1.0, 0.0, 0.0, true, None, Some(shift))
+            .apply(&mut px, 3, 1);
+        assert_eq!(&px[..8], &[0, 0, 0, 0, 255, 0, 0, 255], "arithmetic k2");
+        let mut px = source;
+        ArithmeticImageFilter::new(0.0, 0.0, 0.0, 1.0, true, None, None).apply(&mut px, 3, 1);
+        assert!(px.iter().all(|&v| v == 255), "arithmetic k4");
+    }
 
     #[test]
     fn displacement_offsets_match_skia() {

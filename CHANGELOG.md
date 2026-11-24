@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `StrokeRec::set_stroke_style` maps a NaN or infinite width to `Fill`
   (Skia keeps an infinite width as a stroke), so a `Stroke` width is
   always finite and positive.
+- `MergeImageFilter`, `BlendImageFilter` and `ArithmeticImageFilter` now
+  apply (they were no-ops): each input runs on the source and the results
+  are merged (src-over), blended with the mode, or combined arithmetically,
+  as in Skia.
 - `TrimEffect::new` (and the C API's trim constructor) pins `start` and
   `end` to [0, 1] like `SkTrimPathEffect::Make`; only non-finite values
   give `None` (out-of-range values used to).
