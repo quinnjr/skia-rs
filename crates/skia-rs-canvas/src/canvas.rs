@@ -333,8 +333,8 @@ impl<'a> Canvas<'a> {
         // Only raster backings allocate an offscreen layer — Recording and
         // Null have no pixels to composite.
         if matches!(self.backing, Backing::Raster(_)) {
-            let device_rect = self.layer_bounds(rec);
-            let content = self.layer_content_bounds_within(
+            // Both rects from one pass (it maps the whole filter tree).
+            let (device_rect, content) = self.layer_bounds_and_content_within(
                 rec,
                 &Rect::from_xywh(
                     0.0,
@@ -476,6 +476,19 @@ impl<'a> Canvas<'a> {
     #[must_use]
     pub fn layer_content_bounds_within(&self, rec: &SaveLayerRec<'_>, device: &Rect) -> IRect {
         self.layer_rects(rec, device).1
+    }
+
+    /// Both [`layer_bounds_within`](Self::layer_bounds_within) and
+    /// [`layer_content_bounds_within`](Self::layer_content_bounds_within)
+    /// from one pass, which maps the layer paint's whole image-filter tree:
+    /// (layer buffer bounds, content bounds).
+    #[must_use]
+    pub fn layer_bounds_and_content_within(
+        &self,
+        rec: &SaveLayerRec<'_>,
+        device: &Rect,
+    ) -> (IRect, IRect) {
+        self.layer_rects(rec, device)
     }
 
     /// (layer buffer bounds, content bounds) for `rec`.

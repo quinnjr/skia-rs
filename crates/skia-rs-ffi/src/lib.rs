@@ -2133,8 +2133,7 @@ pub unsafe extern "C" fn sk_canvas_save_layer(
                 paint: paint.as_ref(),
                 flags: skia_rs_canvas::SaveLayerFlags::NONE,
             };
-            let rect = inner.layer_bounds_within(&rec, &device);
-            let content = inner.layer_content_bounds_within(&rec, &device);
+            let (rect, content) = inner.layer_bounds_and_content_within(&rec, &device);
             let paint = inner.layer_paint(paint.as_ref(), &rect);
             (rect, content, paint)
         };
