@@ -2474,3 +2474,17 @@ fn non_integer_shared_edges_are_drawn_once_without_holes() {
         }
     }
 }
+
+#[test]
+fn zero_sweep_arcs_are_not_recorded() {
+    // SkCanvas::drawArc returns on a zero sweep before recording anything.
+    let mut cmds = Vec::new();
+    Canvas::new_recording(&mut cmds, SIZE, SIZE).draw_arc(
+        &Rect::from_xywh(10.0, 10.0, 50.0, 50.0),
+        0.0,
+        0.0,
+        false,
+        &white(Style::Stroke),
+    );
+    assert!(cmds.is_empty(), "{cmds:?}");
+}

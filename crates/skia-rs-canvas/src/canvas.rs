@@ -1425,6 +1425,7 @@ impl<'a> Canvas<'a> {
         if !oval.is_finite()
             || !start_angle.is_finite()
             || !sweep_angle.is_finite()
+            || sweep_angle == 0.0
             || oval.left >= oval.right
             || oval.top >= oval.bottom
         {
