@@ -210,15 +210,19 @@ fn run_drawing_benchmarks(report: &mut ComparisonReport, runner: &BenchmarkRunne
     let mut builder = PathBuilder::new();
     let cx = 500.0;
     let cy = 500.0;
-    let outer = 100.0;
-    let inner = 40.0;
+    let outer: f32 = 100.0;
+    let inner: f32 = 40.0;
     for i in 0..5 {
         let angle_o = (i as f32).mul_add(72.0, -90.0).to_radians();
         let angle_i = ((i as f32).mul_add(72.0, 36.0) - 90.0).to_radians();
-        let ox = cx + outer * angle_o.cos();
-        let oy = cy + outer * angle_o.sin();
-        let ix = cx + inner * angle_i.cos();
-        let iy = cy + inner * angle_i.sin();
+        // Unfused, as Skia's own drawing of this star computes it.
+        #[allow(clippy::suboptimal_flops, reason = "match Skia's unfused rounding")]
+        let (ox, oy, ix, iy) = (
+            cx + outer * angle_o.cos(),
+            cy + outer * angle_o.sin(),
+            cx + inner * angle_i.cos(),
+            cy + inner * angle_i.sin(),
+        );
         if i == 0 {
             builder.move_to(ox, oy);
         } else {

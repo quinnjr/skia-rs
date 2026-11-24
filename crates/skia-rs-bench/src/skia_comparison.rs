@@ -406,14 +406,14 @@ pub mod reference_timings {
 
         // Simple JSON parsing (in real code, use serde_json)
         for line in content.lines() {
-            if let Some(name_start) = line.find('"') {
-                if let Some(name_end) = line[name_start + 1..].find('"') {
-                    let name = &line[name_start + 1..name_start + 1 + name_end];
-                    if let Some(ns_str) = line.split(':').next_back() {
-                        if let Ok(ns) = ns_str.trim().trim_matches(',').parse::<u64>() {
-                            timings.insert(name.to_string(), Duration::from_nanos(ns));
-                        }
-                    }
+            if let Some(name_start) = line.find('"')
+                && let Some(name_end) = line[name_start + 1..].find('"')
+            {
+                let name = &line[name_start + 1..name_start + 1 + name_end];
+                if let Some(ns_str) = line.split(':').next_back()
+                    && let Ok(ns) = ns_str.trim().trim_matches(',').parse::<u64>()
+                {
+                    timings.insert(name.to_string(), Duration::from_nanos(ns));
                 }
             }
         }

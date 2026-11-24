@@ -27,6 +27,7 @@ use crate::geometry::{Matrix, Point, Point3};
 /// | m[3]  m[7]  m[11]  m[15] |
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Matrix44 {
     /// Matrix values in column-major order.
     pub values: [Scalar; 16],

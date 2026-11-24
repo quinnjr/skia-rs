@@ -70,13 +70,13 @@
 //! - [`safe`] - High-level ergonomic API (recommended for most users)
 //!
 //! Optional modules (enabled via features):
-//! - [`text`] - Typography: font loading, text shaping, layout
-//! - [`codec`] - Image I/O: PNG, JPEG, GIF, WebP, AVIF
-//! - [`svg`] - SVG parsing and rendering
-//! - [`pdf`] - PDF document generation
-//! - [`gpu`] - GPU rendering backends
-//! - [`skottie`] - Lottie/Skottie animation
-//! - [`ffi`] - C FFI bindings
+//! - [`text`](https://docs.rs/skia-rs-text) - Typography: font loading, text shaping, layout
+//! - [`codec`](https://docs.rs/skia-rs-codec) - Image I/O: PNG, JPEG, GIF, WebP, AVIF
+//! - [`svg`](https://docs.rs/skia-rs-svg) - SVG parsing and rendering
+//! - [`pdf`](https://docs.rs/skia-rs-pdf) - PDF document generation
+//! - [`gpu`](https://docs.rs/skia-rs-gpu) - GPU rendering backends
+//! - [`skottie`](https://docs.rs/skia-rs-skottie) - Lottie/Skottie animation
+//! - [`ffi`](https://docs.rs/skia-rs-ffi) - C FFI bindings
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]

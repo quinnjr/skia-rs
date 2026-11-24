@@ -448,7 +448,7 @@ impl Layer {
 
     /// Check if this layer has masks.
     #[must_use]
-    pub fn has_masks(&self) -> bool {
+    pub const fn has_masks(&self) -> bool {
         !self.masks.is_empty()
     }
 

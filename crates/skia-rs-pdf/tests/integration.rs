@@ -475,7 +475,7 @@ fn build_synthetic_ttf(num_glyphs: u16, outline_bytes: usize) -> Vec<u8> {
         // origin). But we still need at least some bytes or ttf-parser may
         // complain. Padding out glyph bodies to a large, distinctive size.
         glyf.extend_from_slice(&vec![0u8; outline_bytes]);
-        while glyf.len() % 2 != 0 {
+        while !glyf.len().is_multiple_of(2) {
             glyf.push(0);
         }
         offsets.push(u32::try_from(glyf.len()).unwrap_or(u32::MAX));
@@ -557,7 +557,7 @@ fn build_synthetic_ttf(num_glyphs: u16, outline_bytes: usize) -> Vec<u8> {
     for (_, body) in &sorted {
         body_offsets.push(u32::try_from(cursor).unwrap_or(u32::MAX));
         cursor += body.len();
-        while cursor % 4 != 0 {
+        while !cursor.is_multiple_of(4) {
             cursor += 1;
         }
     }

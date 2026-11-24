@@ -46,6 +46,7 @@ const fn sorted_rect(rect: Rect) -> Rect {
 ///
 /// Equivalent to Skia's `SkIPoint`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct IPoint {
     /// X coordinate.
@@ -101,6 +102,7 @@ impl IPoint {
 ///
 /// Equivalent to Skia's `SkPoint` / `SkVector`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct Point {
     /// X coordinate.
@@ -325,6 +327,7 @@ impl std::ops::Neg for Point {
 ///
 /// Equivalent to Skia's `SkPoint3`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct Point3 {
     /// X coordinate.
@@ -388,6 +391,7 @@ impl Point3 {
 ///
 /// Equivalent to Skia's `SkISize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct ISize {
     /// Width.
@@ -433,6 +437,7 @@ impl ISize {
 ///
 /// Equivalent to Skia's `SkSize`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct Size {
     /// Width.
@@ -518,6 +523,7 @@ impl From<ISize> for Size {
 ///
 /// Equivalent to Skia's `SkIRect`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct IRect {
     /// Left edge.
@@ -700,6 +706,7 @@ impl IRect {
 ///
 /// Equivalent to Skia's `SkRect`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct Rect {
     /// Left edge.
@@ -803,10 +810,10 @@ impl Rect {
     /// Returns the center point.
     #[inline]
     #[must_use]
-    pub fn center(&self) -> Point {
+    pub const fn center(&self) -> Point {
         Point {
-            x: (self.left + self.right) * 0.5,
-            y: (self.top + self.bottom) * 0.5,
+            x: f32::midpoint(self.left, self.right),
+            y: f32::midpoint(self.top, self.bottom),
         }
     }
 
@@ -1003,6 +1010,11 @@ impl From<IRect> for Rect {
 ///
 /// Equivalent to Skia's `SkRRect`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "RRectData")
+)]
 pub struct RRect {
     /// The bounding rectangle.
     pub rect: Rect,
@@ -1011,8 +1023,142 @@ pub struct RRect {
     pub radii: [Point; 4],
 }
 
+/// The serialized fields of an [`RRect`], validated like
+/// `SkRRect::readFromMemory` (`AreRectAndRadiiValid`) when deserializing.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct RRectData {
+    rect: Rect,
+    radii: [Point; 4],
+}
+
+/// A serialized [`RRect`] whose rect is unsorted or non-finite, or whose
+/// radius is out of range.
+#[cfg(feature = "serde")]
+#[derive(Debug, thiserror::Error)]
+#[error("invalid RRect: unsorted or non-finite rect, or a radius out of range")]
+struct InvalidRRect;
+
+#[cfg(feature = "serde")]
+impl TryFrom<RRectData> for RRect {
+    type Error = InvalidRRect;
+
+    fn try_from(data: RRectData) -> Result<Self, Self::Error> {
+        // SkRRect's are_radius_check_predicates_valid, per axis.
+        let valid = |rad: Scalar, min: Scalar, max: Scalar| {
+            min <= max && rad <= max - min && min + rad <= max && max - rad >= min && rad >= 0.0
+        };
+        let r = data.rect;
+        let sorted = r.left <= r.right && r.top <= r.bottom;
+        let finite = [r.left, r.top, r.right, r.bottom]
+            .iter()
+            .all(|v| v.is_finite());
+        let radii_ok = data
+            .radii
+            .iter()
+            .all(|p| valid(p.x, r.left, r.right) && valid(p.y, r.top, r.bottom));
+        if finite && sorted && radii_ok {
+            // SkRRect::readFromMemory then normalizes through setRectRadii.
+            Ok(Self::from_rect_radii(data.rect, data.radii))
+        } else {
+            Err(InvalidRRect)
+        }
+    }
+}
+
+/// `SkRRect`'s `clamp_to_zero`: a corner with either radius `<= 0` becomes
+/// square. Returns whether every corner is square.
+fn clamp_radii_to_zero(radii: &mut [Point; 4]) -> bool {
+    let mut all_square = true;
+    for r in radii.iter_mut() {
+        if r.x <= 0.0 || r.y <= 0.0 {
+            *r = Point::zero();
+        } else {
+            all_square = false;
+        }
+    }
+    all_square
+}
+
+/// `SkRRect`'s `compute_min_scale`.
+fn compute_min_scale(rad1: Scalar, rad2: Scalar, limit: f64, cur_min: f64) -> f64 {
+    let sum = f64::from(rad1) + f64::from(rad2);
+    if sum > limit {
+        cur_min.min(limit / sum)
+    } else {
+        cur_min
+    }
+}
+
+/// `SkRRect`'s `flush_to_zero`: a radius too small to change the sum is
+/// zeroed.
+#[allow(clippy::float_cmp, reason = "exact absorption test, as in Skia")]
+fn flush_to_zero(a: Scalar, b: Scalar) -> (Scalar, Scalar) {
+    if a + b == a {
+        (a, 0.0)
+    } else if a + b == b {
+        (0.0, b)
+    } else {
+        (a, b)
+    }
+}
+
+/// `nextafterf(x, 0)`.
+fn next_toward_zero(x: Scalar) -> Scalar {
+    if x == 0.0 || x.is_nan() {
+        x
+    } else {
+        Scalar::from_bits(x.to_bits() - 1)
+    }
+}
+
+/// `SkScaleToSides::AdjustRadii`: scales the pair, then steps radii down
+/// so they fit between `min_coord` and `max_coord` despite float rounding.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "f64 -> f32 narrowing, as in SkScaleToSides"
+)]
+fn adjust_radii(
+    scale: f64,
+    a: Scalar,
+    b: Scalar,
+    min_coord: Scalar,
+    max_coord: Scalar,
+) -> (Scalar, Scalar) {
+    let limit = (f64::from(max_coord) - f64::from(min_coord)).min(f64::from(max_coord - min_coord));
+    let (mut a, mut b) = (a, b);
+    if scale < 1.0 {
+        a = (f64::from(a) * scale) as Scalar;
+        b = (f64::from(b) * scale) as Scalar;
+    }
+    if max_coord - b < min_coord {
+        b = next_toward_zero(max_coord - min_coord);
+    }
+    if min_coord + a > max_coord {
+        a = next_toward_zero(max_coord - min_coord);
+    }
+    if f64::from(a + b) > limit {
+        let a_is_min = a <= b;
+        let new_min = if a_is_min { a } else { b };
+        let mut new_max = (limit - f64::from(new_min)) as Scalar;
+        loop {
+            if !(f64::from(new_max + new_min) > limit && new_max > 0.0) {
+                break;
+            }
+            new_max = next_toward_zero(new_max);
+        }
+        if a_is_min {
+            b = new_max;
+        } else {
+            a = new_max;
+        }
+    }
+    (a, b)
+}
+
 /// Corner indices for `RRect`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum Corner {
     /// Top-left corner.
@@ -1074,6 +1220,86 @@ impl RRect {
         }
     }
 
+    /// Creates a rounded rectangle with per-corner radii (upper-left,
+    /// upper-right, lower-right, lower-left), like `SkRRect::setRectRadii`.
+    ///
+    /// A non-finite rect gives the empty rrect, and the rect is sorted. Non-
+    /// finite radii give a plain rect. A corner with either radius `<= 0` is
+    /// square. Radii that overlap along a side are scaled down together to
+    /// fit (`scaleRadii`, CSS "overlapping curves").
+    #[must_use]
+    pub fn from_rect_radii(rect: Rect, radii: [Point; 4]) -> Self {
+        let base = Self::from_rect(rect);
+        if !rect.is_finite() || base.rect.is_empty() {
+            return base;
+        }
+        if radii.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+            return base;
+        }
+        let mut radii = radii;
+        if clamp_radii_to_zero(&mut radii) {
+            return base;
+        }
+        let mut rr = Self {
+            rect: base.rect,
+            radii,
+        };
+        rr.scale_radii();
+        rr
+    }
+
+    /// `SkRRect::scaleRadii`: scales all radii by the smallest ratio of a
+    /// side to the sum of its two radii (if below 1), then fixes up float
+    /// precision so each pair fits its side.
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact comparisons, as in SkRRect::scaleRadii"
+    )]
+    fn scale_radii(&mut self) {
+        let r = &mut self.radii;
+        let was_simple = r[0] == r[1] && r[0] == r[2] && r[0] == r[3];
+        let was_circular = was_simple && r[0].x == r[0].y;
+        let (left, top, right, bottom) = (
+            self.rect.left,
+            self.rect.top,
+            self.rect.right,
+            self.rect.bottom,
+        );
+        let width = f64::from(right) - f64::from(left);
+        let height = f64::from(bottom) - f64::from(top);
+        let mut scale = 1.0;
+        scale = compute_min_scale(r[0].x, r[1].x, width, scale);
+        scale = compute_min_scale(r[1].y, r[2].y, height, scale);
+        scale = compute_min_scale(r[2].x, r[3].x, width, scale);
+        scale = compute_min_scale(r[3].y, r[0].y, height, scale);
+
+        (r[0].x, r[1].x) = flush_to_zero(r[0].x, r[1].x);
+        (r[1].y, r[2].y) = flush_to_zero(r[1].y, r[2].y);
+        (r[2].x, r[3].x) = flush_to_zero(r[2].x, r[3].x);
+        (r[3].y, r[0].y) = flush_to_zero(r[3].y, r[0].y);
+
+        // Argument order exactly as SkRRect::scaleRadii (the bottom edge
+        // passes lower-left before lower-right, the left edge upper-left
+        // before lower-left); AdjustRadii scales only when scale < 1 but
+        // always applies its float fix-ups.
+        (r[0].x, r[1].x) = adjust_radii(scale, r[0].x, r[1].x, left, right);
+        (r[1].y, r[2].y) = adjust_radii(scale, r[1].y, r[2].y, top, bottom);
+        (r[3].x, r[2].x) = adjust_radii(scale, r[3].x, r[2].x, left, right);
+        (r[0].y, r[3].y) = adjust_radii(scale, r[0].y, r[3].y, top, bottom);
+
+        // Adjusting may zero one radius of a corner: square it. Keep a
+        // simple (and circular) rrect symmetric if 1-ulp fixes broke it.
+        if !clamp_radii_to_zero(r) && was_simple {
+            let mut min_x = r.iter().map(|p| p.x).fold(Scalar::INFINITY, Scalar::min);
+            let mut min_y = r.iter().map(|p| p.y).fold(Scalar::INFINITY, Scalar::min);
+            if was_circular {
+                min_x = min_x.min(min_y);
+                min_y = min_x;
+            }
+            *r = [Point::new(min_x, min_y); 4];
+        }
+    }
+
     /// Creates a rounded rectangle with a uniform radius.
     #[inline]
     #[must_use]
@@ -1085,6 +1311,22 @@ impl RRect {
     #[inline]
     #[must_use]
     pub const fn from_rect(rect: Rect) -> Self {
+        // SkRRect::setRect (initializeRect): a non-finite rect gives the
+        // empty rrect, and the rect is sorted.
+        let finite = rect.left.is_finite()
+            && rect.top.is_finite()
+            && rect.right.is_finite()
+            && rect.bottom.is_finite();
+        let rect = if finite {
+            Rect::new(
+                rect.left.min(rect.right),
+                rect.top.min(rect.bottom),
+                rect.left.max(rect.right),
+                rect.top.max(rect.bottom),
+            )
+        } else {
+            Rect::EMPTY
+        };
         Self {
             rect,
             radii: [Point::zero(); 4],
@@ -1164,6 +1406,7 @@ impl RRect {
 /// | persp_0  persp_1  persp_2 |
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Matrix {
     /// Matrix values in row-major order.
     pub values: [Scalar; 9],
@@ -1173,6 +1416,25 @@ impl Default for Matrix {
     fn default() -> Self {
         Self::IDENTITY
     }
+}
+
+/// Skia's `SK_ScalarNearlyZero` (`1 / (1 << 12)`): the default tolerance for
+/// near-zero scalar comparisons in matrix classification.
+const SCALAR_NEARLY_ZERO: Scalar = 1.0 / 4096.0;
+
+/// `SkScalarSinSnapToZero` / `SkScalarCosSnapToZero`: sin and cos with
+/// values within `SCALAR_NEARLY_ZERO` of zero snapped to it, as
+/// `SkMatrix::setRotate` uses, so multiples of 90 degrees give exact zeros.
+fn snapped_sin_cos(radians: Scalar) -> (Scalar, Scalar) {
+    let (sin, cos) = radians.sin_cos();
+    let snap = |v: Scalar| {
+        if v.abs() <= SCALAR_NEARLY_ZERO {
+            0.0
+        } else {
+            v
+        }
+    };
+    (snap(sin), snap(cos))
 }
 
 impl Matrix {
@@ -1229,7 +1491,7 @@ impl Matrix {
     #[inline]
     #[must_use]
     pub fn rotate(radians: Scalar) -> Self {
-        let (sin, cos) = radians.sin_cos();
+        let (sin, cos) = snapped_sin_cos(radians);
         Self {
             values: [cos, -sin, 0.0, sin, cos, 0.0, 0.0, 0.0, 1.0],
         }
@@ -1239,7 +1501,7 @@ impl Matrix {
     #[inline]
     #[must_use]
     pub fn rotate_around(radians: Scalar, pivot: Point) -> Self {
-        let (sin, cos) = radians.sin_cos();
+        let (sin, cos) = snapped_sin_cos(radians);
         Self {
             values: [
                 cos,
@@ -1291,6 +1553,41 @@ impl Matrix {
             && self.values[Self::PERSP_2] == 1.0
     }
 
+    /// Returns true if the matrix maps every rectangle to a rectangle: no
+    /// perspective, and either (scale, no skew) or (skew, no scale, i.e. a
+    /// 90- or 270-degree rotation), with no zero scale on either axis.
+    ///
+    /// Corresponds to Skia's `SkMatrix::rectStaysRect`.
+    ///
+    /// # Examples
+    /// ```
+    /// use skia_rs_core::Matrix;
+    /// assert!(Matrix::scale(2.0, 3.0).rect_stays_rect());
+    /// assert!(Matrix::rotate(90.0_f32.to_radians()).rect_stays_rect());
+    /// assert!(!Matrix::rotate(45.0_f32.to_radians()).rect_stays_rect());
+    /// ```
+    #[must_use]
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact comparison is intentional and matches Skia's exact SkScalar comparison"
+    )]
+    pub fn rect_stays_rect(&self) -> bool {
+        if self.has_perspective() {
+            return false;
+        }
+        let v = &self.values;
+        let (sx, kx, ky, sy) = (
+            v[Self::SCALE_X],
+            v[Self::SKEW_X],
+            v[Self::SKEW_Y],
+            v[Self::SCALE_Y],
+        );
+        // Exact zero tests, as in Skia (rotate() snaps the sin/cos residue
+        // of multiples of 90 degrees to zero, like SkMatrix::setRotate).
+        (kx == 0.0 && ky == 0.0 && sx != 0.0 && sy != 0.0)
+            || (sx == 0.0 && sy == 0.0 && kx != 0.0 && ky != 0.0)
+    }
+
     /// Returns true if the matrix only contains scale and translation.
     #[inline]
     #[must_use]
@@ -1304,6 +1601,123 @@ impl Matrix {
             && self.values[Self::PERSP_0] == 0.0
             && self.values[Self::PERSP_1] == 0.0
             && self.values[Self::PERSP_2] == 1.0
+    }
+
+    /// Returns true if the matrix has a perspective component.
+    ///
+    /// Corresponds to Skia's `SkMatrix::hasPerspective`.
+    #[inline]
+    #[must_use]
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact comparison is intentional and matches Skia's exact SkScalar comparison"
+    )]
+    pub fn has_perspective(&self) -> bool {
+        self.values[Self::PERSP_0] != 0.0
+            || self.values[Self::PERSP_1] != 0.0
+            || self.values[Self::PERSP_2] != 1.0
+    }
+
+    /// Returns the largest factor by which the matrix scales any vector (the
+    /// larger singular value of its 2x2 linear part), or `None` if the
+    /// matrix has perspective or the result is not finite.
+    ///
+    /// Corresponds to Skia's `SkMatrix::getMaxScale` (which returns `-1`
+    /// where this returns `None`).
+    ///
+    /// # Examples
+    /// ```
+    /// use skia_rs_core::Matrix;
+    /// assert_eq!(Matrix::scale(3.0, 0.5).max_scale(), Some(3.0));
+    /// assert!((Matrix::rotate(1.0).max_scale().unwrap() - 1.0).abs() < 1e-6);
+    /// ```
+    #[must_use]
+    pub fn max_scale(&self) -> Option<Scalar> {
+        if self.has_perspective() {
+            return None;
+        }
+        let sx = self.values[Self::SCALE_X];
+        let kx = self.values[Self::SKEW_X];
+        let ky = self.values[Self::SKEW_Y];
+        let sy = self.values[Self::SCALE_Y];
+
+        // Eigenvalues of M^T M = [[a, b], [b, c]] are the squared singular
+        // values of M (SkMatrix::getMinMaxScaleFactors).
+        let a = sx * sx + ky * ky;
+        let b = sx * kx + sy * ky;
+        let c = kx * kx + sy * sy;
+        let b_sq = b * b;
+        // SkMatrix::getMinMaxScaleFactors: `bSqd <= SK_ScalarNearlyZero *
+        // SK_ScalarNearlyZero` (the square of the tolerance, on b squared).
+        let largest_sq = if b_sq <= SCALAR_NEARLY_ZERO * SCALAR_NEARLY_ZERO {
+            a.max(c)
+        } else {
+            let a_minus_c = a - c;
+            let half_sum = f32::midpoint(a, c);
+            let x = (a_minus_c * a_minus_c + 4.0 * b_sq).sqrt() * 0.5;
+            half_sum + x
+        };
+        let scale = largest_sq.sqrt();
+        scale.is_finite().then_some(scale)
+    }
+
+    /// Returns true if the matrix contains only translation, rotation,
+    /// reflection, and uniform scale, so it preserves angles and maps
+    /// circles to circles.
+    ///
+    /// Corresponds to Skia's `SkMatrix::isSimilarity()` with the default
+    /// tolerance (`SK_ScalarNearlyZero`).
+    ///
+    /// # Examples
+    /// ```
+    /// use skia_rs_core::Matrix;
+    /// assert!(Matrix::scale(2.0, 2.0).is_similarity());
+    /// assert!(Matrix::rotate(0.5).is_similarity());
+    /// assert!(!Matrix::scale(4.0, 1.0).is_similarity());
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn is_similarity(&self) -> bool {
+        self.is_similarity_with_tolerance(SCALAR_NEARLY_ZERO)
+    }
+
+    /// [`is_similarity`](Self::is_similarity) with an explicit tolerance
+    /// for comparing the 2x2 linear part.
+    ///
+    /// Corresponds to Skia's `SkMatrix::isSimilarity(SkScalar tol)`. As in
+    /// Skia, `tol` only applies to matrices with skew: a scale + translate
+    /// matrix compares `|sx|` and `|sy|` with the default near-zero
+    /// tolerance.
+    #[must_use]
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact zero tests mirror Skia's type-mask classification"
+    )]
+    pub fn is_similarity_with_tolerance(&self, tol: Scalar) -> bool {
+        if self.has_perspective() {
+            return false;
+        }
+        let mx = self.values[Self::SCALE_X];
+        let my = self.values[Self::SCALE_Y];
+        let sx = self.values[Self::SKEW_X];
+        let sy = self.values[Self::SKEW_Y];
+
+        if sx == 0.0 && sy == 0.0 {
+            // Scale + translate only: uniform (possibly mirrored) scale.
+            return mx.abs() > SCALAR_NEARLY_ZERO
+                && (mx.abs() - my.abs()).abs() <= SCALAR_NEARLY_ZERO;
+        }
+
+        // A degenerate 2x2 collapses the plane; it is not a similarity.
+        let perp_dot = mx * my - sx * sy;
+        if perp_dot.abs() <= SCALAR_NEARLY_ZERO * SCALAR_NEARLY_ZERO {
+            return false;
+        }
+
+        // Rotation (+ uniform scale) or reflection (+ uniform scale): the
+        // basis vectors are 90-degree rotations of each other.
+        ((mx - my).abs() <= tol && (sx + sy).abs() <= tol)
+            || ((mx + my).abs() <= tol && (sx - sy).abs() <= tol)
     }
 
     /// Returns the translation component.
@@ -1398,6 +1812,78 @@ impl Matrix {
         }
     }
 
+    /// Maps `rect` and returns the bounds of the result, clipping it to the
+    /// w > 0 side of the camera first under perspective, as
+    /// `SkMatrix::mapRect` does (corners behind the camera would otherwise
+    /// project to flipped positions). Without perspective this is
+    /// [`map_rect`](Self::map_rect). Returns an empty rect when the whole
+    /// rect is behind the camera.
+    ///
+    /// # Examples
+    /// ```
+    /// use skia_rs_core::{Matrix, Rect};
+    /// let mut m = Matrix::translate(0.0, 100.0);
+    /// m.values[Matrix::PERSP_0] = -0.01; // w <= 0 for x >= 100
+    /// let r = m.map_rect_clipped(&Rect::new(0.0, 0.0, 200.0, 200.0));
+    /// assert!(r.left >= 0.0 && r.right > 100.0);
+    /// ```
+    #[must_use]
+    pub fn map_rect_clipped(&self, rect: &Rect) -> Rect {
+        // SkPathPriv's kW0PlaneDistance.
+        const W_MIN: Scalar = 1.0 / 16384.0;
+        if !self.has_perspective() {
+            return self.map_rect(rect);
+        }
+        let values = &self.values;
+        let homogeneous = |px: Scalar, py: Scalar| {
+            (
+                values[Self::SCALE_X] * px + values[Self::SKEW_X] * py + values[Self::TRANS_X],
+                values[Self::SKEW_Y] * px + values[Self::SCALE_Y] * py + values[Self::TRANS_Y],
+                values[Self::PERSP_0] * px + values[Self::PERSP_1] * py + values[Self::PERSP_2],
+            )
+        };
+        let corners = [
+            homogeneous(rect.left, rect.top),
+            homogeneous(rect.right, rect.top),
+            homogeneous(rect.right, rect.bottom),
+            homogeneous(rect.left, rect.bottom),
+        ];
+        // Sutherland-Hodgman against w >= W_MIN, in homogeneous coordinates
+        // (where the projection is linear).
+        let mut kept: [(Scalar, Scalar, Scalar); 8] = [(0.0, 0.0, 0.0); 8];
+        let mut count = 0;
+        for edge in 0..4 {
+            let from = corners[edge];
+            let to = corners[(edge + 1) % 4];
+            let (from_in, to_in) = (from.2 >= W_MIN, to.2 >= W_MIN);
+            if from_in {
+                kept[count] = from;
+                count += 1;
+            }
+            if from_in != to_in {
+                let along = (W_MIN - from.2) / (to.2 - from.2);
+                kept[count] = (
+                    (to.0 - from.0) * along + from.0,
+                    (to.1 - from.1) * along + from.1,
+                    W_MIN,
+                );
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return Rect::EMPTY;
+        }
+        let (mut min_x, mut min_y) = (Scalar::INFINITY, Scalar::INFINITY);
+        let (mut max_x, mut max_y) = (Scalar::NEG_INFINITY, Scalar::NEG_INFINITY);
+        for &(hx, hy, hw) in &kept[..count] {
+            let (px, py) = (hx / hw, hy / hw);
+            min_x = min_x.min(px);
+            min_y = min_y.min(py);
+            max_x = max_x.max(px);
+            max_y = max_y.max(py);
+        }
+        Rect::new(min_x, min_y, max_x, max_y)
+    }
     /// Transforms a rectangle by this matrix (returns bounding box of transformed corners).
     #[inline]
     #[must_use]
@@ -1499,6 +1985,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_matrix_max_scale() {
+        let close = |a: Option<Scalar>, b: Scalar| (a.unwrap() - b).abs() < 1e-5;
+        assert!(close(Matrix::IDENTITY.max_scale(), 1.0));
+        assert!(close(Matrix::scale(100.0, 1.0).max_scale(), 100.0));
+        assert!(close(Matrix::scale(-3.0, 2.0).max_scale(), 3.0));
+        assert!(close(
+            Matrix::rotate(0.8)
+                .concat(&Matrix::scale(4.0, 2.0))
+                .max_scale(),
+            4.0
+        ));
+        // A shear [[1, 1], [0, 1]] stretches by the golden ratio.
+        assert!(close(
+            Matrix::skew(1.0, 0.0).max_scale(),
+            f32::midpoint(1.0, 5.0_f32.sqrt())
+        ));
+        let mut persp = Matrix::IDENTITY;
+        persp.values[Matrix::PERSP_1] = 0.01;
+        assert_eq!(persp.max_scale(), None);
+    }
+
+    #[test]
+    fn test_matrix_is_similarity() {
+        // Similarities: translate, uniform scale, mirror, rotation, and
+        // combinations of them.
+        assert!(Matrix::IDENTITY.is_similarity());
+        assert!(Matrix::translate(5.0, -3.0).is_similarity());
+        assert!(Matrix::scale(3.0, 3.0).is_similarity());
+        assert!(Matrix::scale(-2.0, 2.0).is_similarity());
+        assert!(Matrix::rotate(0.7).is_similarity());
+        assert!(
+            Matrix::rotate(1.1)
+                .concat(&Matrix::scale(2.5, 2.5))
+                .concat(&Matrix::translate(4.0, 1.0))
+                .is_similarity()
+        );
+        assert!(
+            Matrix::rotate(0.4)
+                .concat(&Matrix::scale(-1.5, 1.5))
+                .is_similarity()
+        );
+
+        // Not similarities: non-uniform scale, skew, perspective, degenerate.
+        assert!(!Matrix::scale(4.0, 1.0).is_similarity());
+        assert!(!Matrix::skew(0.3, 0.0).is_similarity());
+        assert!(
+            !Matrix::rotate(0.5)
+                .concat(&Matrix::scale(2.0, 1.0))
+                .is_similarity()
+        );
+        assert!(!Matrix::scale(0.0, 0.0).is_similarity());
+        let mut persp = Matrix::IDENTITY;
+        persp.values[Matrix::PERSP_0] = 0.001;
+        assert!(persp.has_perspective());
+        assert!(!persp.is_similarity());
+        assert!(!Matrix::rotate(0.3).has_perspective());
+    }
+
+    #[test]
     fn test_point_operations() {
         let p1 = Point::new(3.0, 4.0);
         assert!((p1.length() - 5.0).abs() < 1e-6);
@@ -1593,6 +2138,29 @@ mod tests {
         // x/w = 4/2 = 2, y/w = 6/2 = 3
         assert_eq!(point.x, 2.0);
         assert_eq!(point.y, 3.0);
+    }
+
+    #[test]
+    fn test_rrect_from_rect_radii_normalizes_like_set_rect_radii() {
+        let rect = Rect::new(0.0, 0.0, 10.0, 10.0);
+        // Overlapping radii scale by 10 / 16.
+        let rr = RRect::from_rect_radii(rect, [Point::new(8.0, 8.0); 4]);
+        assert_eq!(rr.radii, [Point::new(5.0, 5.0); 4]);
+        // A half-zero corner is square; the others keep their radii.
+        let rr = RRect::from_rect_radii(
+            rect,
+            [
+                Point::new(0.0, 5.0),
+                Point::new(2.0, 2.0),
+                Point::new(2.0, 2.0),
+                Point::new(2.0, 2.0),
+            ],
+        );
+        assert_eq!(rr.radii[0], Point::zero());
+        assert_eq!(rr.radii[1], Point::new(2.0, 2.0));
+        // Non-finite radii give a plain rect.
+        let rr = RRect::from_rect_radii(rect, [Point::new(f32::NAN, 1.0); 4]);
+        assert_eq!(rr.radii, [Point::zero(); 4]);
     }
 
     #[test]
@@ -1777,5 +2345,69 @@ mod tests {
         let rect = Rect::new(0.0, 0.0, 40.0, 20.0);
         let rr = RRect::from_rect_xy(rect, 5.0, 0.0);
         assert!(rr.is_rect(), "one zero radius must yield square corners");
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use super::*;
+
+    #[test]
+    fn geometry_round_trips_through_serde() {
+        let rect = Rect::new(1.0, 2.5, 30.0, 40.25);
+        let json = serde_json::to_string(&rect).unwrap();
+        assert_eq!(serde_json::from_str::<Rect>(&json).unwrap(), rect);
+
+        let m = Matrix::translate(3.0, 4.0).concat(&Matrix::scale(2.0, 0.5));
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(serde_json::from_str::<Matrix>(&json).unwrap(), m);
+
+        let info =
+            crate::ImageInfo::new_srgb(4, 3, crate::ColorType::Rgba8888, crate::AlphaType::Premul)
+                .unwrap();
+        let json = serde_json::to_string(&info).unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::ImageInfo>(&json).unwrap(),
+            info
+        );
+
+        // An unsorted rect is sorted by from_rect (SkRRect::setRect), so it
+        // round-trips.
+        let unsorted = RRect::from_rect(Rect::new(10.0, 10.0, 0.0, 0.0));
+        let json = serde_json::to_string(&unsorted).unwrap();
+        assert_eq!(serde_json::from_str::<RRect>(&json).unwrap(), unsorted);
+
+        // RRects validate like SkRRect::readFromMemory.
+        let rr = RRect {
+            rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+            radii: [Point::new(2.0, 3.0); 4],
+        };
+        let json = serde_json::to_string(&rr).unwrap();
+        assert_eq!(serde_json::from_str::<RRect>(&json).unwrap(), rr);
+        let bad_rr = RRect {
+            radii: [Point::new(-5.0, 50.0); 4],
+            ..rr
+        };
+        let bad = serde_json::to_string(&bad_rr).unwrap();
+        assert!(serde_json::from_str::<RRect>(&bad).is_err());
+        // ... and normalize like setRectRadii: overlapping radii scale down.
+        let overlapping = RRect {
+            radii: [Point::new(8.0, 8.0); 4],
+            ..rr
+        };
+        let json = serde_json::to_string(&overlapping).unwrap();
+        let back = serde_json::from_str::<RRect>(&json).unwrap();
+        assert_eq!(back.radii, [Point::new(5.0, 5.0); 4]);
+
+        // Deserializing validates like ImageInfo::new: no negative sizes.
+        let json = serde_json::to_string(&info).unwrap();
+        let bad = json.replacen("\"width\":4", "\"width\":-1", 1);
+        assert_ne!(bad, json);
+        assert!(serde_json::from_str::<crate::ImageInfo>(&bad).is_err());
+        // ... nor sizes whose byte count would overflow.
+        let huge = json
+            .replacen("\"width\":4", "\"width\":2147483647", 1)
+            .replacen("\"height\":3", "\"height\":2147483647", 1);
+        assert!(serde_json::from_str::<crate::ImageInfo>(&huge).is_err());
     }
 }

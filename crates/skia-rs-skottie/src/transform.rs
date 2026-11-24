@@ -262,17 +262,17 @@ impl Transform {
         }
 
         // Skew (if present)
-        if let Some(skew) = self.skew_at(frame) {
-            if skew != 0.0 {
-                let skew_axis = self.skew_axis_at(frame).unwrap_or(0.0);
-                // Rotate to skew axis, apply skew, rotate back
-                if skew_axis != 0.0 {
-                    matrix = matrix.concat(&Matrix::rotate(skew_axis));
-                }
-                matrix = matrix.concat(&Matrix::skew(skew.tan(), 0.0));
-                if skew_axis != 0.0 {
-                    matrix = matrix.concat(&Matrix::rotate(-skew_axis));
-                }
+        if let Some(skew) = self.skew_at(frame)
+            && skew != 0.0
+        {
+            let skew_axis = self.skew_axis_at(frame).unwrap_or(0.0);
+            // Rotate to skew axis, apply skew, rotate back
+            if skew_axis != 0.0 {
+                matrix = matrix.concat(&Matrix::rotate(skew_axis));
+            }
+            matrix = matrix.concat(&Matrix::skew(skew.tan(), 0.0));
+            if skew_axis != 0.0 {
+                matrix = matrix.concat(&Matrix::rotate(-skew_axis));
             }
         }
 
@@ -334,16 +334,16 @@ impl TransformSnapshot {
         }
 
         // Skew
-        if let Some(skew) = self.skew {
-            if skew != 0.0 {
-                let skew_axis = self.skew_axis.unwrap_or(0.0);
-                if skew_axis != 0.0 {
-                    matrix = matrix.concat(&Matrix::rotate(skew_axis));
-                }
-                matrix = matrix.concat(&Matrix::skew(skew.tan(), 0.0));
-                if skew_axis != 0.0 {
-                    matrix = matrix.concat(&Matrix::rotate(-skew_axis));
-                }
+        if let Some(skew) = self.skew
+            && skew != 0.0
+        {
+            let skew_axis = self.skew_axis.unwrap_or(0.0);
+            if skew_axis != 0.0 {
+                matrix = matrix.concat(&Matrix::rotate(skew_axis));
+            }
+            matrix = matrix.concat(&Matrix::skew(skew.tan(), 0.0));
+            if skew_axis != 0.0 {
+                matrix = matrix.concat(&Matrix::rotate(-skew_axis));
             }
         }
 

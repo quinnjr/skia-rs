@@ -228,14 +228,14 @@ impl ExpressionEvaluator {
     /// Evaluate function calls.
     fn evaluate_function(source: &str, ctx: &ExpressionContext) -> Option<Value> {
         // Parse function call: name(args)
-        if let Some(paren_pos) = source.find('(') {
-            if source.ends_with(')') {
-                let name = &source[..paren_pos];
-                let args_str = &source[paren_pos + 1..source.len() - 1];
-                let args: Vec<&str> = args_str.split(',').map(str::trim).collect();
+        if let Some(paren_pos) = source.find('(')
+            && source.ends_with(')')
+        {
+            let name = &source[..paren_pos];
+            let args_str = &source[paren_pos + 1..source.len() - 1];
+            let args: Vec<&str> = args_str.split(',').map(str::trim).collect();
 
-                return Self::call_function(name, &args, ctx);
-            }
+            return Self::call_function(name, &args, ctx);
         }
 
         None
@@ -320,7 +320,14 @@ impl ExpressionEvaluator {
 
                     let normalized = (t - t_min) / (t_max - t_min);
                     let clamped = normalized.clamp(0.0, 1.0);
-                    Some(Value::Number(v_min + clamped * (v_max - v_min)))
+                    {
+                        #[allow(
+                            clippy::suboptimal_flops,
+                            reason = "the interpolation as originally written (unfused)"
+                        )]
+                        let value = v_min + clamped * (v_max - v_min);
+                        Some(Value::Number(value))
+                    }
                 } else {
                     None
                 }
@@ -346,7 +353,14 @@ impl ExpressionEvaluator {
                         }
                         _ => normalized, // Default to linear
                     };
-                    Some(Value::Number(v_min + eased * (v_max - v_min)))
+                    {
+                        #[allow(
+                            clippy::suboptimal_flops,
+                            reason = "the interpolation as originally written (unfused)"
+                        )]
+                        let value = v_min + eased * (v_max - v_min);
+                        Some(Value::Number(value))
+                    }
                 } else {
                     None
                 }

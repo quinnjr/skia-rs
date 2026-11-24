@@ -300,18 +300,22 @@ impl StandardGms {
             let mut builder = PathBuilder::new();
             let cx = 100.0;
             let cy = 100.0;
-            let outer = 80.0;
-            let inner = 30.0;
+            let outer: f32 = 80.0;
+            let inner: f32 = 30.0;
 
             for i in 0..5 {
                 let angle_outer =
                     std::f32::consts::PI * 2.0 * i as f32 / 5.0 - std::f32::consts::PI / 2.0;
                 let angle_inner = angle_outer + std::f32::consts::PI / 5.0;
 
-                let px = cx + outer * angle_outer.cos();
-                let py = cy + outer * angle_outer.sin();
-                let ix = cx + inner * angle_inner.cos();
-                let iy = cy + inner * angle_inner.sin();
+                // Unfused, as Skia's own drawing of this star computes it.
+                #[allow(clippy::suboptimal_flops, reason = "match Skia's unfused rounding")]
+                let (px, py, ix, iy) = (
+                    cx + outer * angle_outer.cos(),
+                    cy + outer * angle_outer.sin(),
+                    cx + inner * angle_inner.cos(),
+                    cy + inner * angle_inner.sin(),
+                );
 
                 if i == 0 {
                     builder.move_to(px, py);
@@ -739,10 +743,10 @@ impl DmRunner {
 
         for source in &self.sources {
             // Apply filter
-            if let Some(filter) = &self.filter {
-                if !source.name().contains(filter) {
-                    continue;
-                }
+            if let Some(filter) = &self.filter
+                && !source.name().contains(filter)
+            {
+                continue;
             }
 
             for renderer in &self.renderers {
@@ -902,7 +906,7 @@ mod tests {
         for gm in gms {
             let (w, h) = gm.size();
             assert!(w > 0 && h > 0);
-            assert!(!gm.name().is_empty());
+            assert_ne!(gm.name(), "");
         }
     }
 
@@ -915,6 +919,6 @@ mod tests {
         gm.draw(&mut surface);
 
         let pixels = surface.pixels();
-        assert!(!pixels.is_empty());
+        assert_ne!(pixels, []);
     }
 }

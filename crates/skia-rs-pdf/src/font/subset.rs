@@ -390,7 +390,7 @@ fn write_font(sfnt_version: [u8; 4], tables: &[(Tag, Vec<u8>)]) -> Vec<u8> {
         body_offsets.push(u32::try_from(cursor).unwrap_or(u32::MAX));
         cursor += body.len();
         // 4-byte alignment between table bodies.
-        while cursor % 4 != 0 {
+        while !cursor.is_multiple_of(4) {
             cursor += 1;
         }
     }
@@ -449,15 +449,15 @@ fn table_checksum(body: &[u8]) -> u32 {
     sum
 }
 
-fn read_u16_be(buf: &[u8], off: usize) -> u16 {
+const fn read_u16_be(buf: &[u8], off: usize) -> u16 {
     u16::from_be_bytes([buf[off], buf[off + 1]])
 }
 
-fn read_i16_be(buf: &[u8], off: usize) -> i16 {
+const fn read_i16_be(buf: &[u8], off: usize) -> i16 {
     i16::from_be_bytes([buf[off], buf[off + 1]])
 }
 
-fn read_u32_be(buf: &[u8], off: usize) -> u32 {
+const fn read_u32_be(buf: &[u8], off: usize) -> u32 {
     u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
 

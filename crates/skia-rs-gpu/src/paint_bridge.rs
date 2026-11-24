@@ -312,13 +312,13 @@ pub struct PaintUniforms {
 impl PaintUniforms {
     /// Number of bytes in the uniform block.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.bytes.len()
     }
 
     /// True if no uniform data is set.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
 }

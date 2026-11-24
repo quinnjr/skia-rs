@@ -49,6 +49,10 @@ impl SimdCapabilities {
     /// Detect SIMD capabilities at runtime.
     #[inline]
     #[must_use]
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "only const on non-x86 targets; x86 probes CPU features at runtime"
+    )]
     pub fn detect() -> Self {
         Self {
             sse42: Self::has_sse42(),
@@ -70,7 +74,7 @@ impl SimdCapabilities {
     }
 
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    fn has_sse42() -> bool {
+    const fn has_sse42() -> bool {
         false
     }
 
@@ -87,12 +91,12 @@ impl SimdCapabilities {
     }
 
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    fn has_avx2() -> bool {
+    const fn has_avx2() -> bool {
         false
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn has_neon() -> bool {
+    const fn has_neon() -> bool {
         // NEON is mandatory on AArch64
         true
     }
@@ -197,7 +201,7 @@ pub fn fill_span_solid(dst: &mut [u8], color: Color) {
 #[inline]
 fn fill_span_opaque(dst: &mut [u8], color: Color) {
     let pattern = [color.red(), color.green(), color.blue(), color.alpha()];
-    for chunk in dst.chunks_exact_mut(4) {
+    for chunk in dst.as_chunks_mut::<4>().0 {
         chunk.copy_from_slice(&pattern);
     }
 }
@@ -213,7 +217,7 @@ fn fill_span_blend_scalar(dst: &mut [u8], src: Color) {
     let sb = u32::from(src.blue());
     let inv_sa = 255 - sa;
 
-    for chunk in dst.chunks_exact_mut(4) {
+    for chunk in dst.as_chunks_mut::<4>().0 {
         chunk[0] = (sr + u32::from(mul_div_255_round(u32::from(chunk[0]), inv_sa))).min(255) as u8;
         chunk[1] = (sg + u32::from(mul_div_255_round(u32::from(chunk[1]), inv_sa))).min(255) as u8;
         chunk[2] = (sb + u32::from(mul_div_255_round(u32::from(chunk[2]), inv_sa))).min(255) as u8;
@@ -332,7 +336,10 @@ unsafe fn fill_span_blend_avx2(dst: &mut [u8], src: Color) {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn fill_span_blend_neon(dst: &mut [u8], src: Color) {
-    use std::arch::aarch64::*;
+    use std::arch::aarch64::{
+        uint8x8_t, uint8x8x4_t, uint16x8_t, vaddq_u16, vdupq_n_u16, vld4_u8, vmovl_u8, vmovn_u16,
+        vmulq_u16, vshrq_n_u16, vst4_u8,
+    };
 
     let len = dst.len() / 4;
     // Process 8 pixels per iteration. `vld4_u8`/`vst4_u8` each touch exactly
@@ -344,12 +351,14 @@ unsafe fn fill_span_blend_neon(dst: &mut [u8], src: Color) {
     let remainder_start = chunks * 32;
 
     // Prepare premultiplied-source vectors (broadcast to 16-bit lanes).
-    let src_r = unsafe { vdupq_n_u16(src.red() as u16) };
-    let src_g = unsafe { vdupq_n_u16(src.green() as u16) };
-    let src_b = unsafe { vdupq_n_u16(src.blue() as u16) };
-    let src_a = unsafe { vdupq_n_u16(src.alpha() as u16) };
-    let inv_alpha = unsafe { vdupq_n_u16((255 - src.alpha()) as u16) };
-    let c128 = unsafe { vdupq_n_u16(128) };
+    // Register-only NEON intrinsics are safe inside this `target_feature`
+    // function; only the pointer loads/stores below need `unsafe`.
+    let src_r = vdupq_n_u16(u16::from(src.red()));
+    let src_g = vdupq_n_u16(u16::from(src.green()));
+    let src_b = vdupq_n_u16(u16::from(src.blue()));
+    let src_a = vdupq_n_u16(u16::from(src.alpha()));
+    let inv_alpha = vdupq_n_u16(u16::from(255 - src.alpha()));
+    let c128 = vdupq_n_u16(128);
 
     let ptr = dst.as_mut_ptr();
 
@@ -361,10 +370,10 @@ unsafe fn fill_span_blend_neon(dst: &mut [u8], src: Color) {
         let dst_rgba = unsafe { vld4_u8(dst_ptr) };
 
         // Widen each channel to 16-bit for arithmetic.
-        let dst_r = unsafe { vmovl_u8(dst_rgba.0) };
-        let dst_g = unsafe { vmovl_u8(dst_rgba.1) };
-        let dst_b = unsafe { vmovl_u8(dst_rgba.2) };
-        let dst_a = unsafe { vmovl_u8(dst_rgba.3) };
+        let dst_r = vmovl_u8(dst_rgba.0);
+        let dst_g = vmovl_u8(dst_rgba.1);
+        let dst_b = vmovl_u8(dst_rgba.2);
+        let dst_a = vmovl_u8(dst_rgba.3);
 
         // Premultiplied SrcOver with SkMulDiv255Round on the dst term:
         //   prod = dst * inv_alpha + 128
@@ -372,9 +381,9 @@ unsafe fn fill_span_blend_neon(dst: &mut [u8], src: Color) {
         //   out  = src + res              (src is premultiplied)
         // Identical to the scalar and AVX2 paths.
         let blend = |s: uint16x8_t, d: uint16x8_t| -> uint8x8_t {
-            let prod = unsafe { vaddq_u16(vmulq_u16(d, inv_alpha), c128) };
-            let res = unsafe { vshrq_n_u16(vaddq_u16(prod, vshrq_n_u16(prod, 8)), 8) };
-            unsafe { vmovn_u16(vaddq_u16(s, res)) }
+            let prod = vaddq_u16(vmulq_u16(d, inv_alpha), c128);
+            let res = vshrq_n_u16(vaddq_u16(prod, vshrq_n_u16(prod, 8)), 8);
+            vmovn_u16(vaddq_u16(s, res))
         };
 
         let result_r = blend(src_r, dst_r);
@@ -412,7 +421,12 @@ pub fn blend_pixels_src_over(dst: &mut [u8], src: &[u8]) {
 
 /// Scalar fallback for pixel blending.
 fn blend_pixels_src_over_scalar(dst: &mut [u8], src: &[u8]) {
-    for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+    for (d, s) in dst
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(src.as_chunks::<4>().0)
+    {
         let sa = u32::from(s[3]);
         if sa == 0 {
             continue; // Fully transparent source
@@ -437,7 +451,7 @@ fn blend_pixels_src_over_scalar(dst: &mut [u8], src: &[u8]) {
 /// Premultiply alpha for a span of pixels (in-place).
 #[inline]
 pub fn premultiply_span(pixels: &mut [u8]) {
-    for chunk in pixels.chunks_exact_mut(4) {
+    for chunk in pixels.as_chunks_mut::<4>().0 {
         let a = u32::from(chunk[3]);
         if a == 255 {
             continue; // Already effectively premultiplied
@@ -457,7 +471,7 @@ pub fn premultiply_span(pixels: &mut [u8]) {
 /// Unpremultiply alpha for a span of pixels (in-place).
 #[inline]
 pub fn unpremultiply_span(pixels: &mut [u8]) {
-    for chunk in pixels.chunks_exact_mut(4) {
+    for chunk in pixels.as_chunks_mut::<4>().0 {
         let a = u32::from(chunk[3]);
         if a == 0 || a == 255 {
             continue;
@@ -491,7 +505,7 @@ mod tests {
         fill_span_solid(&mut dst, color);
 
         // Check all pixels are filled correctly
-        for chunk in dst.chunks_exact(4) {
+        for chunk in dst.as_chunks::<4>().0 {
             assert_eq!(chunk[0], 255); // R
             assert_eq!(chunk[1], 128); // G
             assert_eq!(chunk[2], 64); // B
@@ -523,7 +537,7 @@ mod tests {
         // Premul SrcOver: out = src + round(dst * (255 - 128)).
         // Red: 128 + round(128*127/255)=128+64=192 (increase).
         // Green/Blue: 0 + round(128*127/255)=64 (decrease from 128).
-        for chunk in dst.chunks_exact(4) {
+        for chunk in dst.as_chunks::<4>().0 {
             assert_eq!(chunk[0], 192, "Red premul SrcOver");
             assert_eq!(chunk[1], 64, "Green premul SrcOver");
             assert_eq!(chunk[2], 64, "Blue premul SrcOver");
@@ -538,7 +552,7 @@ mod tests {
         blend_pixels_src_over(&mut dst, &src);
 
         // With alpha=200, result should be mostly source
-        for chunk in dst.chunks_exact(4) {
+        for chunk in dst.as_chunks::<4>().0 {
             assert!(chunk[0] > 150); // Should be close to 200
         }
     }
@@ -591,7 +605,7 @@ mod tests {
             fill_span_solid(&mut dst, color);
 
             // Verify all pixels are blended correctly
-            for (i, chunk) in dst.chunks_exact(4).enumerate() {
+            for (i, chunk) in dst.as_chunks::<4>().0.iter().enumerate() {
                 assert!(
                     chunk[0] > 50 && chunk[0] < 200,
                     "Pixel {} R incorrect: {}",
@@ -616,7 +630,7 @@ mod tests {
         fill_span_blend_scalar(&mut dst_scalar, src);
         fill_span_solid(&mut dst_simd, src);
 
-        for chunk in dst_scalar.chunks_exact(4) {
+        for chunk in dst_scalar.as_chunks::<4>().0 {
             assert_eq!(chunk, &[128, 128, 128, 128], "premul SrcOver over black");
         }
         assert_eq!(dst_scalar, dst_simd, "SIMD and scalar must be bit-exact");
@@ -658,7 +672,7 @@ mod tests {
                 assert_eq!(simd, scalar, "SIMD vs scalar, src {src:?}, len {len}");
 
                 // And against blend_colors used by the per-pixel path.
-                for (i, chunk) in base.chunks_exact(4).enumerate() {
+                for (i, chunk) in base.as_chunks::<4>().0.iter().enumerate() {
                     let dst = Color::from_argb(chunk[3], chunk[0], chunk[1], chunk[2]);
                     let expect = crate::raster::blend_colors_for_test(src, dst, BlendMode::SrcOver);
                     let off = i * 4;
@@ -688,16 +702,17 @@ mod tests {
             // Pad the buffer with guard bytes to catch OOB writes.
             let guard = 8;
             let mut buf = vec![0xABu8; len * 4 + guard * 2];
-            for (i, b) in buf.iter_mut().enumerate() {
-                *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+            // Byte index modulo 256, so the pattern wraps deterministically.
+            for (b, i) in buf.iter_mut().zip((0..=u8::MAX).cycle()) {
+                *b = i.wrapping_mul(7).wrapping_add(3);
             }
             let mut expected = buf.clone();
 
             let span = guard..guard + len * 4;
             unsafe { fill_span_blend_neon(&mut buf[span.clone()], src) };
-            fill_span_blend_scalar(&mut expected[span.clone()], src);
+            fill_span_blend_scalar(&mut expected[span], src);
 
-            assert_eq!(buf, expected, "NEON vs scalar mismatch/OOB at len {}", len);
+            assert_eq!(buf, expected, "NEON vs scalar mismatch/OOB at len {len}");
         }
     }
 }

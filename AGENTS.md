@@ -157,18 +157,19 @@ skia-rs-core (no internal deps)
 skia-rs-path (depends on: core)
     ↓
 skia-rs-paint (depends on: core, path)
+skia-rs-text (depends on: core, path)
+skia-rs-codec (depends on: core, paint)
     ↓
-skia-rs-canvas (depends on: core, path, paint)
+skia-rs-canvas (depends on: core, path, paint; optional: codec, text)
+skia-rs-gpu (depends on: core, path, paint; optional: codec)
+skia-rs-pdf (depends on: core, path, paint)
     ↓
-skia-rs-text (depends on: core, path, paint)
+skia-rs-svg (depends on: core, path, paint, canvas, text, codec)
+skia-rs-skottie (depends on: core, path, paint, canvas)
+skia-rs-ffi (depends on: core, path, paint, canvas, text, codec)
     ↓
-skia-rs-gpu (depends on: core, path, paint, canvas)
-skia-rs-codec (depends on: core)
-skia-rs-svg (depends on: core, path, paint, canvas)
-skia-rs-pdf (depends on: core, path, paint, canvas, text)
-    ↓
-skia-rs-ffi (depends on: all above)
-skia-rs-safe (depends on: all above, re-exports)
+skia-rs-safe (depends on: core, path, paint, canvas; optional: text,
+              codec, svg, pdf, gpu, skottie; re-exports them)
 ```
 
 ## File Organization
@@ -272,7 +273,7 @@ Applies to: `["**/*.rs"]`
 ## Rust Edition & Version
 
 - **Edition**: 2024
-- **MSRV**: 1.85
+- **MSRV**: 1.94
 - All code must compile on stable Rust
 
 ## Naming Conventions

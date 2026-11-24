@@ -37,11 +37,14 @@ pub(crate) const SHADER_KIND_EMPTY: u8 = 11;
 /// Serialize a child shader (recursively).
 ///
 /// Format: [1 byte present] [4 bytes length] [data]
-/// If the shader cannot be serialized, writes 0 for absent.
+/// If the shader cannot be serialized (or its data does not fit the u32
+/// length), writes 0 for absent.
 fn serialize_child_shader(buf: &mut Vec<u8>, shader: &ShaderRef) {
-    if let Some(child_data) = shader.serialize() {
+    let child = shader
+        .serialize()
+        .and_then(|data| Some((u32::try_from(data.len()).ok()?, data)));
+    if let Some((len, child_data)) = child {
         buf.push(1);
-        let len = u32::try_from(child_data.len()).unwrap_or(u32::MAX);
         buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(&child_data);
     } else {
@@ -50,6 +53,7 @@ fn serialize_child_shader(buf: &mut Vec<u8>, shader: &ShaderRef) {
 }
 
 /// Serialize common gradient data (colors, positions, `tile_mode`, flags, `local_matrix`).
+/// `None` if the color count does not fit the format's u32 prefix.
 fn serialize_gradient_common(
     buf: &mut Vec<u8>,
     colors: &[Color4f],
@@ -57,7 +61,7 @@ fn serialize_gradient_common(
     tile_mode: TileMode,
     flags: GradientFlags,
     local_matrix: Option<&Matrix>,
-) {
+) -> Option<()> {
     // Tile mode (1 byte)
     buf.push(tile_mode as u8);
 
@@ -65,7 +69,8 @@ fn serialize_gradient_common(
     buf.extend_from_slice(&flags.bits().to_le_bytes());
 
     // Colors count (4 bytes)
-    let colors_len = u32::try_from(colors.len()).unwrap_or(u32::MAX);
+    // A count that does not fit the u32 prefix cannot be written.
+    let colors_len = u32::try_from(colors.len()).ok()?;
     buf.extend_from_slice(&colors_len.to_le_bytes());
     for color in colors {
         buf.extend_from_slice(&color.r.to_le_bytes());
@@ -87,12 +92,13 @@ fn serialize_gradient_common(
     // Local matrix (1 byte present flag + 36 bytes if present)
     if let Some(matrix) = local_matrix {
         buf.push(1);
-        for i in 0..9 {
-            buf.extend_from_slice(&matrix.values[i].to_le_bytes());
+        for v in &matrix.values {
+            buf.extend_from_slice(&v.to_le_bytes());
         }
     } else {
         buf.push(0);
     }
+    Some(())
 }
 
 // =============================================================================
@@ -252,10 +258,11 @@ fn apply_image_tile(coord: Scalar, size: Scalar, mode: TileMode) -> Scalar {
     }
 }
 
-/// Read a single RGBA8 pixel at integer coordinates.
+/// Read one texel at integer coordinates as a `Color4f`.
 ///
-/// Returns premultiplied Color4f in [0, 1]. For non-RGBA8 color types,
-/// the read is simplified (baseline support).
+/// Returns the texel as stored (premultiplied or not, per `info`'s alpha
+/// type) as a Color4f in [0, 1]; see `premultiply_sampled`. For non-RGBA8
+/// color types, the read is simplified (baseline support).
 #[allow(
     clippy::many_single_char_names,
     reason = "r/g/b/a are the conventional names for color channel components"
@@ -268,13 +275,19 @@ fn read_pixel_rgba8(
 ) -> Color4f {
     use skia_rs_core::color::ColorType;
     let bpp = info.bytes_per_pixel();
-    let row_bytes = info.min_row_bytes();
-    let x = usize::try_from(x).unwrap_or(usize::MAX);
-    let y = usize::try_from(y).unwrap_or(usize::MAX);
-    let offset = y * row_bytes + x * bpp;
-    if offset + bpp > pixels.len() {
+    // Checked: crafted or mismatched sizes (and negative coordinates) give
+    // transparent rather than overflowing; so does a buffer too short for
+    // the requested texel.
+    let offset = (|| {
+        let x = usize::try_from(x).ok()?;
+        let y = usize::try_from(y).ok()?;
+        let row_bytes = usize::try_from(info.width()).ok()?.checked_mul(bpp)?;
+        let offset = y.checked_mul(row_bytes)?.checked_add(x.checked_mul(bpp)?)?;
+        (offset.checked_add(bpp)? <= pixels.len()).then_some(offset)
+    })();
+    let Some(offset) = offset else {
         return Color4f::new(0.0, 0.0, 0.0, 0.0);
-    }
+    };
 
     match info.color_type {
         ColorType::Rgba8888 => {
@@ -291,7 +304,7 @@ fn read_pixel_rgba8(
             let a = f32::from(pixels[offset + 3]) / 255.0;
             Color4f::new(r, g, b, a)
         }
-        ColorType::Rgb888x => {
+        ColorType::Rgb888x | ColorType::Rgb888 => {
             let r = f32::from(pixels[offset]) / 255.0;
             let g = f32::from(pixels[offset + 1]) / 255.0;
             let b = f32::from(pixels[offset + 2]) / 255.0;
@@ -311,10 +324,27 @@ fn read_pixel_rgba8(
     }
 }
 
+/// `color` premultiplied if `info` stores unpremultiplied texels: as
+/// `SkImageShader`, filtering mixes the stored values and the result is
+/// premultiplied after, since `Shader::sample` returns premultiplied color.
+fn premultiply_sampled(info: &skia_rs_core::pixel::ImageInfo, color: Color4f) -> Color4f {
+    if info.alpha_type == skia_rs_core::color::AlphaType::Unpremul {
+        Color4f::new(
+            color.r * color.a,
+            color.g * color.a,
+            color.b * color.a,
+            color.a,
+        )
+    } else {
+        color
+    }
+}
+
 /// Tile mode for shaders.
 ///
 /// Determines how a shader handles coordinates outside its bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum TileMode {
     /// Clamp to edge color.
@@ -394,6 +424,7 @@ pub trait Shader: Send + Sync + std::fmt::Debug {
 
 /// Kind of shader (for debugging/inspection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ShaderKind {
     /// Solid color shader.
     Color,
@@ -627,7 +658,7 @@ impl Shader for LinearGradient {
             self.tile_mode,
             self.flags,
             self.local_matrix.as_ref(),
-        );
+        )?;
 
         Some(buf)
     }
@@ -782,7 +813,7 @@ impl Shader for RadialGradient {
             self.tile_mode,
             self.flags,
             self.local_matrix.as_ref(),
-        );
+        )?;
 
         Some(buf)
     }
@@ -956,7 +987,7 @@ impl Shader for SweepGradient {
             self.tile_mode,
             self.flags,
             self.local_matrix.as_ref(),
-        );
+        )?;
 
         Some(buf)
     }
@@ -1186,7 +1217,7 @@ impl Shader for TwoPointConicalGradient {
             self.tile_mode,
             self.flags,
             self.local_matrix.as_ref(),
-        );
+        )?;
 
         Some(buf)
     }
@@ -1207,7 +1238,8 @@ pub struct ImageShader {
     sampling: SamplingOptions,
     /// Local matrix.
     local_matrix: Option<Matrix>,
-    /// Owned pixel data (RGBA8 premultiplied, row-major).
+    /// Owned pixel data, tightly packed rows in `image_info`'s color type
+    /// (see [`ImageShader::with_pixels`]).
     /// None if the shader was created without pixels (metadata-only).
     pixels: Option<Arc<Vec<u8>>>,
     /// Image info describing pixel layout.
@@ -1216,6 +1248,7 @@ pub struct ImageShader {
 
 /// Sampling options for image shaders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SamplingOptions {
     /// Filter mode.
     pub filter: FilterMode,
@@ -1225,6 +1258,7 @@ pub struct SamplingOptions {
 
 /// Filter mode for image sampling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum FilterMode {
     /// Nearest neighbor sampling.
@@ -1236,6 +1270,7 @@ pub enum FilterMode {
 
 /// Mipmap mode for image sampling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum MipmapMode {
     /// No mipmapping.
@@ -1299,9 +1334,12 @@ impl ImageShader {
 
     /// Create an `ImageShader` with owned pixel data.
     ///
-    /// Pixels are treated as premultiplied RGBA8 in the sRGB color space.
-    /// The `image_info` should describe the width, height, color type, and
-    /// row bytes of the pixel buffer.
+    /// Pixels are read in the sRGB color space as `image_info`'s color type
+    /// (`Rgba8888`, `Bgra8888`, `Rgb888x`, `Rgb888`, `Alpha8` and `Gray8`
+    /// are decoded; other color types sample as transparent), premultiplied
+    /// (texels of an `Unpremul` image are premultiplied when sampled).
+    /// Rows must be tightly packed: row `y` starts at
+    /// `y * width * bytes_per_pixel` (`ImageInfo` has no row stride).
     #[must_use]
     pub const fn with_pixels(
         pixels: Arc<Vec<u8>>,
@@ -1394,7 +1432,7 @@ impl Shader for ImageShader {
                 let ix = floor_to_i32(sx).clamp(0, width - 1);
                 let iy = floor_to_i32(sy).clamp(0, height - 1);
 
-                read_pixel_rgba8(pixels, info, ix, iy)
+                premultiply_sampled(info, read_pixel_rgba8(pixels, info, ix, iy))
             }
             FilterMode::Linear => {
                 // Bilinear filtering: texel centers sit at integer + 0.5, so
@@ -1428,12 +1466,13 @@ impl Shader for ImageShader {
                 let bilerp = |c00: f32, c10: f32, c01: f32, c11: f32| {
                     lerp(lerp(c00, c10, wx), lerp(c01, c11, wx), wy)
                 };
-                Color4f::new(
+                let mixed = Color4f::new(
                     bilerp(c00.r, c10.r, c01.r, c11.r),
                     bilerp(c00.g, c10.g, c01.g, c11.g),
                     bilerp(c00.b, c10.b, c01.b, c11.b),
                     bilerp(c00.a, c10.a, c01.a, c11.a),
-                )
+                );
+                premultiply_sampled(info, mixed)
             }
         }
     }
@@ -1469,8 +1508,8 @@ impl Shader for ImageShader {
         // Local matrix (1 byte present flag + 36 bytes if present)
         if let Some(matrix) = &self.local_matrix {
             buf.push(1);
-            for i in 0..9 {
-                buf.extend_from_slice(&matrix.values[i].to_le_bytes());
+            for v in &matrix.values {
+                buf.extend_from_slice(&v.to_le_bytes());
             }
         } else {
             buf.push(0);
@@ -1489,7 +1528,9 @@ impl Shader for ImageShader {
             buf.push(info.alpha_type as u8);
 
             // Pixel data length + data
-            let pixels_len = u32::try_from(pixels.len()).unwrap_or(u32::MAX);
+            // The format's length prefix is a u32: a larger buffer cannot be
+            // written faithfully.
+            let pixels_len = u32::try_from(pixels.len()).ok()?;
             buf.extend_from_slice(&pixels_len.to_le_bytes());
             buf.extend_from_slice(pixels);
         } else {
@@ -1638,10 +1679,27 @@ impl PerlinNoiseGenerator {
 
     /// Evaluate classic 2D Perlin noise at (x, y). Returns approximately [-1, 1].
     fn noise_2d(&self, x: f32, y: f32) -> f32 {
-        let xi = floor_to_i32(x);
-        let yi = floor_to_i32(y);
-        let xf = x - scalar_from_i32(xi);
-        let yf = y - scalar_from_i32(yi);
+        if !(x.is_finite() && y.is_finite()) {
+            return 0.0;
+        }
+        // The fraction comes from the coordinate itself; only the integer
+        // cell is reduced mod 256 (the lattice repeats every 256 cells).
+        // Results are unchanged for coordinates within i32 range, and the
+        // cell index (and cell + 1) stays small beyond it, where a saturated
+        // cast used to give garbage.
+        let (cell_x, cell_y) = (x.floor(), y.floor());
+        let xf = x - cell_x;
+        let yf = y - cell_y;
+        // Within i32 range the integer mask is exact and cheaper; beyond it
+        // reduce in floating point first.
+        let wrap = |cell: f32| {
+            if cell.abs() < 2_147_483_520.0 {
+                floor_to_i32(cell) & 255
+            } else {
+                floor_to_i32(cell.rem_euclid(256.0))
+            }
+        };
+        let (xi, yi) = (wrap(cell_x), wrap(cell_y));
 
         let u = fade(xf);
         let v = fade(yf);
@@ -1673,6 +1731,11 @@ impl PerlinNoiseGenerator {
         let mut amp = 1.0_f32;
         let mut max_val = 0.0_f32;
         for _ in 0..octaves {
+            // Past ~127 octaves the frequency overflows: the remaining
+            // octaves add nothing finite.
+            if !((x * freq).is_finite() && (y * freq).is_finite()) {
+                break;
+            }
             total = self.noise_2d(x * freq, y * freq).mul_add(amp, total);
             max_val += amp;
             freq *= 2.0;
@@ -1688,6 +1751,11 @@ impl PerlinNoiseGenerator {
         let mut amp = 1.0_f32;
         let mut max_val = 0.0_f32;
         for _ in 0..octaves {
+            // Past ~127 octaves the frequency overflows: the remaining
+            // octaves add nothing finite.
+            if !((x * freq).is_finite() && (y * freq).is_finite()) {
+                break;
+            }
             total = self.noise_2d(x * freq, y * freq).abs().mul_add(amp, total);
             max_val += amp;
             freq *= 2.0;
@@ -1729,6 +1797,7 @@ pub struct PerlinNoiseShader {
 
 /// Type of Perlin noise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum NoiseType {
     /// Fractal noise (smoother).
     FractalNoise,
@@ -1736,8 +1805,21 @@ pub enum NoiseType {
     Turbulence,
 }
 
+/// An octave count kept to 0..=255 (`SkPerlinNoiseShader`'s `kMaxOctaves`),
+/// which bounds the noise work per pixel.
+const fn clamp_octaves(num_octaves: i32) -> i32 {
+    if num_octaves < 0 {
+        0
+    } else if num_octaves > 255 {
+        255
+    } else {
+        num_octaves
+    }
+}
+
 impl PerlinNoiseShader {
-    /// Create a fractal noise shader.
+    /// Create a fractal noise shader. `num_octaves` is kept to 0..=255
+    /// (`SkPerlinNoiseShader`'s `kMaxOctaves`).
     #[must_use]
     pub const fn fractal_noise(
         base_frequency_x: Scalar,
@@ -1749,14 +1831,15 @@ impl PerlinNoiseShader {
             noise_type: NoiseType::FractalNoise,
             base_frequency_x,
             base_frequency_y,
-            num_octaves,
+            num_octaves: clamp_octaves(num_octaves),
             seed,
             tile_size: None,
             generator: std::sync::OnceLock::new(),
         }
     }
 
-    /// Create a turbulence shader.
+    /// Create a turbulence shader. `num_octaves` is kept to 0..=255
+    /// (`SkPerlinNoiseShader`'s `kMaxOctaves`).
     #[must_use]
     pub const fn turbulence(
         base_frequency_x: Scalar,
@@ -1768,14 +1851,17 @@ impl PerlinNoiseShader {
             noise_type: NoiseType::Turbulence,
             base_frequency_x,
             base_frequency_y,
-            num_octaves,
+            num_octaves: clamp_octaves(num_octaves),
             seed,
             tile_size: None,
             generator: std::sync::OnceLock::new(),
         }
     }
 
-    /// Set the tile size for seamless tiling.
+    /// Set the tile size for seamless tiling (Skia's `stitchTiles`).
+    ///
+    /// The size is stored and serialized, but stitching is not implemented:
+    /// noise is drawn unstitched, so tiles can show seams.
     #[must_use]
     pub const fn with_tile_size(mut self, width: i32, height: i32) -> Self {
         self.tile_size = Some((width, height));
@@ -1819,7 +1905,10 @@ impl Shader for PerlinNoiseShader {
     }
 
     fn is_opaque(&self) -> bool {
-        true
+        // As SkPerlinNoiseShader, never: Skia's noise has an alpha channel
+        // (the grayscale baseline here does not, but callers must not treat
+        // src-over as src for it), and with no octaves it is transparent.
+        false
     }
 
     fn shader_kind(&self) -> ShaderKind {
@@ -1832,12 +1921,25 @@ impl Shader for PerlinNoiseShader {
         reason = "seed is only used to deterministically initialize the noise LCG; the float bit pattern is saturated into u32, no core cast helper covers f32->u32 and the exact numeric value carries no meaning beyond reproducibility"
     )]
     fn sample(&self, x: Scalar, y: Scalar) -> Color4f {
+        // SkPerlinNoiseShader::MakeFractalNoise / MakeTurbulence with no
+        // octaves: fractal noise collapses to transparent gray, turbulence
+        // to transparent.
+        if self.num_octaves <= 0 {
+            return match self.noise_type {
+                // kTransparentGray (0.5, 0.5, 0.5, 0.5) unpremultiplied;
+                // sample returns premultiplied color.
+                NoiseType::FractalNoise => Color4f::new(0.25, 0.25, 0.25, 0.5),
+                NoiseType::Turbulence => Color4f::new(0.0, 0.0, 0.0, 0.0),
+            };
+        }
         let generator = self
             .generator
             .get_or_init(|| PerlinNoiseGenerator::new(self.seed as u32));
         let fx = x * self.base_frequency_x;
         let fy = y * self.base_frequency_y;
-        let octaves = u32::try_from(self.num_octaves.max(1)).unwrap_or(1);
+        // 1..=255 here: the constructors and deserialization keep the count
+        // to 0..=255 (clamp_octaves), and 0 returned above.
+        let octaves = u32::try_from(self.num_octaves).unwrap_or(0);
 
         let value = match self.noise_type {
             NoiseType::FractalNoise => {
@@ -1953,8 +2055,8 @@ impl Shader for LocalMatrixShader {
         buf.push(SHADER_KIND_LOCAL_MATRIX);
 
         // Matrix (36 bytes)
-        for i in 0..9 {
-            buf.extend_from_slice(&self.matrix.values[i].to_le_bytes());
+        for v in &self.matrix.values {
+            buf.extend_from_slice(&v.to_le_bytes());
         }
 
         // Inner shader (recursive)
@@ -2076,11 +2178,21 @@ impl Shader for EmptyShader {
 // Deserialization
 // =============================================================================
 
+/// The longest chain of nested shaders [`deserialize_shader`] reads; longer
+/// input is rejected rather than risking stack overflow.
+const MAX_SHADER_DEPTH: usize = 64;
+
 /// Deserialize a shader from bytes.
 ///
-/// Returns `None` if the data is invalid or the shader type is unsupported.
+/// Returns `None` if the data is invalid, the shader type is unsupported,
+/// or child shaders nest deeper than `MAX_SHADER_DEPTH`.
 pub(crate) fn deserialize_shader(bytes: &[u8], offset: &mut usize) -> Option<ShaderRef> {
-    if *offset >= bytes.len() {
+    deserialize_shader_at(bytes, offset, 0)
+}
+
+/// [`deserialize_shader`], `depth` levels into nested child shaders.
+fn deserialize_shader_at(bytes: &[u8], offset: &mut usize, depth: usize) -> Option<ShaderRef> {
+    if depth >= MAX_SHADER_DEPTH || *offset >= bytes.len() {
         return None;
     }
     let kind = bytes[*offset];
@@ -2094,23 +2206,24 @@ pub(crate) fn deserialize_shader(bytes: &[u8], offset: &mut usize) -> Option<Sha
         SHADER_KIND_TWO_POINT_CONICAL => deserialize_two_point_conical(bytes, offset),
         SHADER_KIND_IMAGE => deserialize_image_shader(bytes, offset),
         SHADER_KIND_PERLIN_NOISE => deserialize_perlin_noise(bytes, offset),
-        SHADER_KIND_BLEND => deserialize_blend_shader(bytes, offset),
-        SHADER_KIND_LOCAL_MATRIX => deserialize_local_matrix_shader(bytes, offset),
-        SHADER_KIND_COMPOSE => deserialize_compose_shader(bytes, offset),
+        SHADER_KIND_BLEND => deserialize_blend_shader(bytes, offset, depth),
+        SHADER_KIND_LOCAL_MATRIX => deserialize_local_matrix_shader(bytes, offset, depth),
+        SHADER_KIND_COMPOSE => deserialize_compose_shader(bytes, offset, depth),
         SHADER_KIND_EMPTY => Some(Arc::new(EmptyShader::new())),
         _ => None, // Unknown shader kind
     }
 }
 
-/// Helper to read a child shader (recursively).
-fn deserialize_child_shader(bytes: &[u8], offset: &mut usize) -> Option<ShaderRef> {
+/// Helper to read a child shader (recursively), one level below `depth`.
+fn deserialize_child_shader(bytes: &[u8], offset: &mut usize, depth: usize) -> Option<ShaderRef> {
     if *offset >= bytes.len() {
         return None;
     }
     let present = bytes[*offset];
     *offset += 1;
 
-    if present == 0 {
+    // 0 is absent; anything but 1 is malformed (not a present child).
+    if present != 1 {
         return None;
     }
 
@@ -2126,7 +2239,7 @@ fn deserialize_child_shader(bytes: &[u8], offset: &mut usize) -> Option<ShaderRe
     ]) as usize;
     *offset += 4;
 
-    if *offset + len > bytes.len() {
+    if len > bytes.len() - *offset {
         return None;
     }
 
@@ -2134,7 +2247,7 @@ fn deserialize_child_shader(bytes: &[u8], offset: &mut usize) -> Option<ShaderRe
     *offset += len;
 
     let mut child_offset = 0;
-    deserialize_shader(child_bytes, &mut child_offset)
+    deserialize_shader_at(child_bytes, &mut child_offset, depth + 1)
 }
 
 /// Helper to deserialize common gradient data.
@@ -2191,7 +2304,7 @@ fn deserialize_gradient_common(bytes: &[u8], offset: &mut usize) -> Option<Gradi
     *offset += 4;
 
     // Colors (16 bytes each)
-    if *offset + color_count * 16 > bytes.len() {
+    if color_count.checked_mul(16)? > bytes.len() - *offset {
         return None;
     }
     let mut colors = Vec::with_capacity(color_count);
@@ -2230,8 +2343,11 @@ fn deserialize_gradient_common(bytes: &[u8], offset: &mut usize) -> Option<Gradi
     }
     let positions_present = bytes[*offset];
     *offset += 1;
+    if positions_present > 1 {
+        return None;
+    }
     let positions = if positions_present == 1 {
-        if *offset + color_count * 4 > bytes.len() {
+        if color_count.checked_mul(4)? > bytes.len() - *offset {
             return None;
         }
         let mut pos_vec = Vec::with_capacity(color_count);
@@ -2256,13 +2372,16 @@ fn deserialize_gradient_common(bytes: &[u8], offset: &mut usize) -> Option<Gradi
     }
     let matrix_present = bytes[*offset];
     *offset += 1;
+    if matrix_present > 1 {
+        return None;
+    }
     let local_matrix = if matrix_present == 1 {
         if *offset + 36 > bytes.len() {
             return None;
         }
         let mut m = Matrix::identity();
-        for i in 0..9 {
-            m.values[i] = f32::from_le_bytes([
+        for v in &mut m.values {
+            *v = f32::from_le_bytes([
                 bytes[*offset],
                 bytes[*offset + 1],
                 bytes[*offset + 2],
@@ -2625,13 +2744,16 @@ fn deserialize_image_shader(bytes: &[u8], offset: &mut usize) -> Option<ShaderRe
     }
     let matrix_present = bytes[*offset];
     *offset += 1;
+    if matrix_present > 1 {
+        return None;
+    }
     let local_matrix = if matrix_present == 1 {
         if *offset + 36 > bytes.len() {
             return None;
         }
         let mut m = Matrix::identity();
-        for i in 0..9 {
-            m.values[i] = f32::from_le_bytes([
+        for v in &mut m.values {
+            *v = f32::from_le_bytes([
                 bytes[*offset],
                 bytes[*offset + 1],
                 bytes[*offset + 2],
@@ -2651,9 +2773,13 @@ fn deserialize_image_shader(bytes: &[u8], offset: &mut usize) -> Option<ShaderRe
     let image_present = bytes[*offset];
     *offset += 1;
 
+    if image_present > 1 {
+        return None;
+    }
+
     let (pixels, image_info) = if image_present == 1 {
-        // ImageInfo fields
-        if *offset + 6 > bytes.len() {
+        // ImageInfo fields: width, height (4 each), color and alpha type.
+        if *offset + 10 > bytes.len() {
             return None;
         }
         let width = i32::from_le_bytes([
@@ -2692,6 +2818,7 @@ fn deserialize_image_shader(bytes: &[u8], offset: &mut usize) -> Option<ShaderRe
             20 => skia_rs_core::color::ColorType::R16G16B16A16Unorm,
             21 => skia_rs_core::color::ColorType::Srgba8888,
             22 => skia_rs_core::color::ColorType::R8Unorm2,
+            23 => skia_rs_core::color::ColorType::Rgb888,
             _ => return None,
         };
         let alpha_type = match bytes[*offset + 9] {
@@ -2715,7 +2842,7 @@ fn deserialize_image_shader(bytes: &[u8], offset: &mut usize) -> Option<ShaderRe
         ]) as usize;
         *offset += 4;
 
-        if *offset + pixel_len > bytes.len() {
+        if pixel_len > bytes.len() - *offset {
             return None;
         }
         let pixel_data = bytes[*offset..*offset + pixel_len].to_vec();
@@ -2723,7 +2850,6 @@ fn deserialize_image_shader(bytes: &[u8], offset: &mut usize) -> Option<ShaderRe
 
         let info =
             skia_rs_core::pixel::ImageInfo::new(width, height, color_type, alpha_type).ok()?;
-
         (Some(Arc::new(pixel_data)), Some(info))
     } else {
         (None, None)
@@ -2781,6 +2907,9 @@ fn deserialize_perlin_noise(bytes: &[u8], offset: &mut usize) -> Option<ShaderRe
         bytes[*offset + 3],
     ]);
     *offset += 4;
+    // Bounded to SkPerlinNoiseShader's 0..=kMaxOctaves (255), as drawing
+    // clamps it, so a crafted count cannot run unbounded work.
+    let num_octaves = clamp_octaves(num_octaves);
 
     // Seed (4 bytes)
     if *offset + 4 > bytes.len() {
@@ -2800,6 +2929,9 @@ fn deserialize_perlin_noise(bytes: &[u8], offset: &mut usize) -> Option<ShaderRe
     }
     let tile_present = bytes[*offset];
     *offset += 1;
+    if tile_present > 1 {
+        return None;
+    }
     let tile_size = if tile_present == 1 {
         if *offset + 8 > bytes.len() {
             return None;
@@ -2839,7 +2971,7 @@ fn deserialize_perlin_noise(bytes: &[u8], offset: &mut usize) -> Option<ShaderRe
     Some(Arc::new(shader))
 }
 
-fn deserialize_blend_shader(bytes: &[u8], offset: &mut usize) -> Option<ShaderRef> {
+fn deserialize_blend_shader(bytes: &[u8], offset: &mut usize, depth: usize) -> Option<ShaderRef> {
     // Blend mode (1 byte)
     if *offset >= bytes.len() {
         return None;
@@ -2848,22 +2980,26 @@ fn deserialize_blend_shader(bytes: &[u8], offset: &mut usize) -> Option<ShaderRe
     *offset += 1;
 
     // Src shader (recursive)
-    let src = deserialize_child_shader(bytes, offset)?;
+    let src = deserialize_child_shader(bytes, offset, depth)?;
 
     // Dst shader (recursive)
-    let dst = deserialize_child_shader(bytes, offset)?;
+    let dst = deserialize_child_shader(bytes, offset, depth)?;
 
     Some(Arc::new(BlendShader::new(blend_mode, dst, src)))
 }
 
-fn deserialize_local_matrix_shader(bytes: &[u8], offset: &mut usize) -> Option<ShaderRef> {
+fn deserialize_local_matrix_shader(
+    bytes: &[u8],
+    offset: &mut usize,
+    depth: usize,
+) -> Option<ShaderRef> {
     // Matrix (36 bytes)
     if *offset + 36 > bytes.len() {
         return None;
     }
     let mut matrix = Matrix::identity();
-    for i in 0..9 {
-        matrix.values[i] = f32::from_le_bytes([
+    for v in &mut matrix.values {
+        *v = f32::from_le_bytes([
             bytes[*offset],
             bytes[*offset + 1],
             bytes[*offset + 2],
@@ -2873,12 +3009,12 @@ fn deserialize_local_matrix_shader(bytes: &[u8], offset: &mut usize) -> Option<S
     }
 
     // Inner shader (recursive)
-    let inner = deserialize_child_shader(bytes, offset)?;
+    let inner = deserialize_child_shader(bytes, offset, depth)?;
 
     Some(Arc::new(LocalMatrixShader::new(inner, matrix)))
 }
 
-fn deserialize_compose_shader(bytes: &[u8], offset: &mut usize) -> Option<ShaderRef> {
+fn deserialize_compose_shader(bytes: &[u8], offset: &mut usize, depth: usize) -> Option<ShaderRef> {
     // Blend mode (1 byte)
     if *offset >= bytes.len() {
         return None;
@@ -2887,10 +3023,10 @@ fn deserialize_compose_shader(bytes: &[u8], offset: &mut usize) -> Option<Shader
     *offset += 1;
 
     // Outer shader (recursive)
-    let outer = deserialize_child_shader(bytes, offset)?;
+    let outer = deserialize_child_shader(bytes, offset, depth)?;
 
     // Inner shader (recursive)
-    let inner = deserialize_child_shader(bytes, offset)?;
+    let inner = deserialize_child_shader(bytes, offset, depth)?;
 
     Some(Arc::new(ComposeShader::new(outer, inner, blend_mode)))
 }
@@ -3040,6 +3176,139 @@ pub mod shaders {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_pixel_reads_never_overflow() {
+        // Huge dimensions, a tiny buffer and negative coordinates read as
+        // transparent instead of overflowing.
+        // i32::MAX squared times 4 bytes overflows usize on 32-bit targets
+        // and runs past the buffer everywhere.
+        let info = skia_rs_core::pixel::ImageInfo::new(
+            i32::MAX,
+            i32::MAX,
+            skia_rs_core::color::ColorType::Rgba8888,
+            skia_rs_core::color::AlphaType::Premul,
+        )
+        .unwrap();
+        let clear = Color4f::new(0.0, 0.0, 0.0, 0.0);
+        assert_eq!(
+            read_pixel_rgba8(&[0; 16], &info, i32::MAX - 1, i32::MAX - 1),
+            clear
+        );
+        assert_eq!(read_pixel_rgba8(&[0; 16], &info, -1, 0), clear);
+        // An in-bounds read still lands on the right texel: (1, 0) of a
+        // 2-wide image is bytes 4..8.
+        let small = skia_rs_core::pixel::ImageInfo::new(
+            2,
+            1,
+            skia_rs_core::color::ColorType::Rgba8888,
+            skia_rs_core::color::AlphaType::Premul,
+        )
+        .unwrap();
+        let texel = read_pixel_rgba8(&[0, 0, 0, 0, 255, 0, 0, 255], &small, 1, 0);
+        assert_eq!(texel, Color4f::new(1.0, 0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn rgb888_texels_are_read() {
+        let info = skia_rs_core::pixel::ImageInfo::new(
+            2,
+            1,
+            skia_rs_core::color::ColorType::Rgb888,
+            skia_rs_core::color::AlphaType::Opaque,
+        )
+        .unwrap();
+        // Three bytes per pixel: the second pixel starts at byte 3.
+        let c = read_pixel_rgba8(&[0, 0, 0, 255, 0, 0], &info, 1, 0);
+        assert_eq!(c, Color4f::new(1.0, 0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn unpremultiplied_image_texels_are_premultiplied() {
+        let info = skia_rs_core::pixel::ImageInfo::new(
+            1,
+            1,
+            skia_rs_core::color::ColorType::Rgba8888,
+            skia_rs_core::color::AlphaType::Unpremul,
+        )
+        .unwrap();
+        let c = premultiply_sampled(&info, read_pixel_rgba8(&[255, 0, 0, 128], &info, 0, 0));
+        let half = 128.0 / 255.0;
+        assert!(
+            (c.r - half).abs() < 1e-6 && c.g == 0.0 && (c.a - half).abs() < 1e-6,
+            "{c:?}"
+        );
+        // Linear filtering mixes the stored texels, then premultiplies (as
+        // SkImageShader): transparent red and opaque blue halfway give
+        // (0.5, 0, 0.5, 0.5) premultiplied to (0.25, 0, 0.25, 0.5).
+        let info = skia_rs_core::pixel::ImageInfo::new(
+            2,
+            1,
+            skia_rs_core::color::ColorType::Rgba8888,
+            skia_rs_core::color::AlphaType::Unpremul,
+        )
+        .unwrap();
+        let shader = ImageShader::with_pixels(
+            Arc::new(vec![255, 0, 0, 0, 0, 0, 255, 255]),
+            info,
+            TileMode::Clamp,
+            TileMode::Clamp,
+            SamplingOptions::LINEAR,
+        );
+        let c = shader.sample(1.0, 0.5);
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        assert!(
+            close(c.r, 0.25) && c.g == 0.0 && close(c.b, 0.25) && close(c.a, 0.5),
+            "{c:?}"
+        );
+    }
+
+    #[test]
+    fn perlin_noise_with_many_octaves_stays_finite() {
+        let noise = PerlinNoiseShader::fractal_noise(0.05, 0.05, 255, 0.0);
+        let c = noise.sample(100.0, 100.0);
+        assert!(c.r.is_finite() && (0.0..=1.0).contains(&c.r), "{c:?}");
+        assert!(!noise.is_opaque());
+        assert!(!PerlinNoiseShader::turbulence(0.05, 0.05, 0, 0.0).is_opaque());
+        // The constructors keep the count as a round trip does.
+        assert_eq!(
+            PerlinNoiseShader::turbulence(0.05, 0.05, 300, 0.0).num_octaves(),
+            255
+        );
+        assert_eq!(
+            PerlinNoiseShader::fractal_noise(0.05, 0.05, -1, 0.0).num_octaves(),
+            0
+        );
+    }
+
+    #[test]
+    fn perlin_noise_without_octaves_collapses_like_skia() {
+        let fractal = PerlinNoiseShader::fractal_noise(0.05, 0.05, 0, 0.0);
+        assert_eq!(
+            fractal.sample(3.0, 4.0),
+            Color4f::new(0.25, 0.25, 0.25, 0.5)
+        );
+        let turbulence = PerlinNoiseShader::turbulence(0.05, 0.05, 0, 0.0);
+        assert_eq!(
+            turbulence.sample(3.0, 4.0),
+            Color4f::new(0.0, 0.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn shader_deserialization_bounds_nesting() {
+        let nest = |depth: usize| {
+            let mut shader: ShaderRef = Arc::new(EmptyShader::new());
+            for _ in 0..depth {
+                shader = Arc::new(LocalMatrixShader::new(shader, Matrix::identity()));
+            }
+            shader.serialize().expect("serializes")
+        };
+        let mut offset = 0;
+        assert!(deserialize_shader(&nest(5), &mut offset).is_some());
+        let mut offset = 0;
+        assert!(deserialize_shader(&nest(MAX_SHADER_DEPTH + 5), &mut offset).is_none());
+    }
 
     #[test]
     fn test_color_shader() {

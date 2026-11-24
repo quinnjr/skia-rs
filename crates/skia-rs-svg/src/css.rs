@@ -357,13 +357,13 @@ impl StyleDeclarations {
 
     /// Number of declarations.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.decls.len()
     }
 
     /// Whether there are no declarations.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.decls.is_empty()
     }
 }
@@ -582,13 +582,12 @@ pub fn extract_stylesheets(dom: &SvgDom) -> Stylesheet {
 
 fn extract_stylesheets_from_node(node: &SvgNode, stylesheet: &mut Stylesheet) {
     // Check for style element content
-    if let crate::dom::SvgNodeKind::Unknown(tag) = &node.kind {
-        if tag == "style" {
-            if let Some(content) = node.attributes.get("__text_content") {
-                let parsed = Stylesheet::parse(content);
-                stylesheet.rules.extend(parsed.rules);
-            }
-        }
+    if let crate::dom::SvgNodeKind::Unknown(tag) = &node.kind
+        && tag == "style"
+        && let Some(content) = node.attributes.get("__text_content")
+    {
+        let parsed = Stylesheet::parse(content);
+        stylesheet.rules.extend(parsed.rules);
     }
 
     for child in &node.children {

@@ -137,11 +137,11 @@ pub fn generate_gradient_texture_1d(
     if sorted_stops[0].position > 0.0 {
         sorted_stops.insert(0, GradientStop::new(0.0, sorted_stops[0].color));
     }
-    if let Some(last) = sorted_stops.last() {
-        if last.position < 1.0 {
-            let last_color = last.color;
-            sorted_stops.push(GradientStop::new(1.0, last_color));
-        }
+    if let Some(last) = sorted_stops.last()
+        && last.position < 1.0
+    {
+        let last_color = last.color;
+        sorted_stops.push(GradientStop::new(1.0, last_color));
     }
 
     for x in 0..config.width {

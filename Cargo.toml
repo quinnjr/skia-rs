@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/skia-rs-core",
     "crates/skia-rs-path",
@@ -51,10 +51,8 @@ version = "0.4.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/quinnjr/skia-rs"
-homepage = "https://github.com/quinnjr/skia-rs"
-documentation = "https://docs.rs/skia-rs-safe"
 authors = ["Joseph R. Quinn"]
-rust-version = "1.85"
+rust-version = "1.94"
 keywords = ["graphics", "2d", "skia", "rendering", "canvas"]
 categories = ["graphics", "rendering::graphics-api", "multimedia::images"]
 
@@ -78,7 +76,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Math and geometry
-glam = { version = "0.29", default-features = false, features = ["std"] }
 geo = "0.33"
 
 # GPU backends
@@ -109,21 +106,17 @@ rawloader = "0.37"
 
 # SVG
 roxmltree = "0.20"
-usvg = "0.43"
 
 # PDF
-pdf-writer = "0.12"
 flate2 = "1.0"
 
 # FFI
-libc = "0.2"
 
 # Utilities
 thiserror = "2.0"
 bitflags = "2.6"
 bytemuck = { version = "1.18", features = ["derive"] }
 smallvec = "1.13"
-arrayvec = "0.7"
 parking_lot = "0.12"
 base64 = "0.22"
 
@@ -152,6 +145,14 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# On Windows, napi resolves Node-API symbols from the host process at load
+# time. Inside a plain `cargo test` executable (not node.exe) every lookup
+# fails, and napi-sys prints one "Load Node-API [...] failed" line per symbol
+# when debug assertions are on (~150 lines of noise). The failures are
+# harmless — the unit tests never call into Node-API — so silence them.
+[profile.dev.package.napi-sys]
+debug-assertions = false
 
 # Benchmark profile - optimized but with debug info for profiling
 [profile.bench]

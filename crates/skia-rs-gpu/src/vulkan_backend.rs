@@ -39,7 +39,7 @@ use std::ffi::CString;
 /// `CStr::from_bytes_until_nul`, then copy out an owned `String`.
 fn parse_device_name(name: &[std::os::raw::c_char]) -> String {
     let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(name.as_ptr() as *const u8, name.len()) };
+        unsafe { std::slice::from_raw_parts(name.as_ptr().cast::<u8>(), name.len()) };
     std::ffi::CStr::from_bytes_until_nul(bytes)
         .map(|c| c.to_string_lossy().into_owned())
         .unwrap_or_default()
@@ -116,6 +116,7 @@ impl VulkanVersion {
     };
 
     /// Create a new version.
+    #[must_use]
     pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
         Self {
             major,
@@ -126,13 +127,15 @@ impl VulkanVersion {
 
     /// Convert to Vulkan API version.
     #[cfg(feature = "vulkan")]
-    pub fn to_vk_version(&self) -> u32 {
+    #[must_use]
+    pub const fn to_vk_version(&self) -> u32 {
         vk::make_api_version(0, self.major, self.minor, self.patch)
     }
 
     /// Create from Vulkan API version.
     #[cfg(feature = "vulkan")]
-    pub fn from_vk_version(version: u32) -> Self {
+    #[must_use]
+    pub const fn from_vk_version(version: u32) -> Self {
         Self {
             major: vk::api_version_major(version),
             minor: vk::api_version_minor(version),
@@ -199,6 +202,10 @@ pub struct VulkanPhysicalDeviceInfo {
 
 /// Vulkan queue family information.
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors an independent Vulkan capability/flag bit; keeping them as named fields preserves the 1:1 mapping to the Vulkan structs"
+)]
 pub struct VulkanQueueFamilyInfo {
     /// Queue family index.
     pub index: u32,
@@ -216,6 +223,10 @@ pub struct VulkanQueueFamilyInfo {
 
 /// Vulkan memory type information.
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors an independent Vulkan capability/flag bit; keeping them as named fields preserves the 1:1 mapping to the Vulkan structs"
+)]
 pub struct VulkanMemoryTypeInfo {
     /// Memory type index.
     pub index: u32,
@@ -246,6 +257,10 @@ pub struct VulkanMemoryHeapInfo {
 
 /// Vulkan capabilities and limits.
 #[derive(Debug, Clone, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors an independent Vulkan capability/flag bit; keeping them as named fields preserves the 1:1 mapping to the Vulkan structs"
+)]
 pub struct VulkanCaps {
     /// Base GPU capabilities.
     pub base: GpuCaps,
@@ -315,6 +330,10 @@ pub struct VulkanCaps {
 
 /// Vulkan format support flags.
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors an independent Vulkan capability/flag bit; keeping them as named fields preserves the 1:1 mapping to the Vulkan structs"
+)]
 pub struct VulkanFormatFeatures {
     /// Can be sampled.
     pub sampled: bool,
@@ -338,9 +357,10 @@ pub struct VulkanFormatFeatures {
     pub transfer_dst: bool,
 }
 
-/// Convert TextureFormat to Vulkan format.
+/// Convert `TextureFormat` to Vulkan format.
 #[cfg(feature = "vulkan")]
-pub fn texture_format_to_vk(format: TextureFormat) -> vk::Format {
+#[must_use]
+pub const fn texture_format_to_vk(format: TextureFormat) -> vk::Format {
     match format {
         TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
         TextureFormat::Rgba8UnormSrgb => vk::Format::R8G8B8A8_SRGB,
@@ -355,9 +375,10 @@ pub fn texture_format_to_vk(format: TextureFormat) -> vk::Format {
     }
 }
 
-/// Convert Vulkan format to TextureFormat.
+/// Convert Vulkan format to `TextureFormat`.
 #[cfg(feature = "vulkan")]
-pub fn vk_format_to_texture(format: vk::Format) -> Option<TextureFormat> {
+#[must_use]
+pub const fn vk_format_to_texture(format: vk::Format) -> Option<TextureFormat> {
     match format {
         vk::Format::R8G8B8A8_UNORM => Some(TextureFormat::Rgba8Unorm),
         vk::Format::R8G8B8A8_SRGB => Some(TextureFormat::Rgba8UnormSrgb),
@@ -416,16 +437,35 @@ pub struct VulkanContext {
 #[cfg(feature = "vulkan")]
 impl VulkanContext {
     /// Create a new Vulkan context with default configuration.
+    ///
+    /// # Errors
+    /// See [`Self::with_config`].
     pub fn new() -> GpuResult<Self> {
         Self::with_config(VulkanContextConfig::default())
     }
 
     /// Create a new Vulkan context with custom configuration.
+    ///
+    /// # Errors
+    /// Returns [`GpuError::DeviceCreation`] if the Vulkan loader cannot be
+    /// loaded, instance or device creation fails, no suitable physical device
+    /// or graphics queue exists, or another Vulkan call fails during setup.
+    ///
+    /// # Panics
+    /// Panics if `config.app_name` contains an interior NUL byte.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public constructor takes the config by value (builder-style, like Skia's GrContextOptions); changing to a reference would break callers"
+    )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Vulkan bring-up is one linear sequence (loader, instance, debug messenger, physical device, queues, device); splitting it would thread many intermediate handles through helpers"
+    )]
     pub fn with_config(config: VulkanContextConfig) -> GpuResult<Self> {
         unsafe {
             // Load Vulkan
             let entry = ash::Entry::load()
-                .map_err(|e| GpuError::DeviceCreation(format!("Failed to load Vulkan: {:?}", e)))?;
+                .map_err(|e| GpuError::DeviceCreation(format!("Failed to load Vulkan: {e:?}")))?;
 
             // Create instance
             let app_name = CString::new(config.app_name.as_str()).unwrap();
@@ -467,7 +507,7 @@ impl VulkanContext {
                 .enabled_layer_names(&layer_ptrs);
 
             let instance = entry.create_instance(&create_info, None).map_err(|e| {
-                GpuError::DeviceCreation(format!("Failed to create Vulkan instance: {:?}", e))
+                GpuError::DeviceCreation(format!("Failed to create Vulkan instance: {e:?}"))
             })?;
 
             // Set up debug messenger
@@ -497,7 +537,7 @@ impl VulkanContext {
 
             // Select physical device
             let physical_devices = instance.enumerate_physical_devices().map_err(|e| {
-                GpuError::DeviceCreation(format!("Failed to enumerate devices: {:?}", e))
+                GpuError::DeviceCreation(format!("Failed to enumerate devices: {e:?}"))
             })?;
 
             if physical_devices.is_empty() {
@@ -533,19 +573,20 @@ impl VulkanContext {
             let mut transfer_family = None;
             let mut compute_family = None;
 
-            for (i, family) in queue_families.iter().enumerate() {
+            // Vulkan reports queue family counts as u32, so indices always fit.
+            for (i, family) in (0u32..).zip(queue_families.iter()) {
                 if family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
-                    graphics_family = Some(i as u32);
+                    graphics_family = Some(i);
                 }
                 if family.queue_flags.contains(vk::QueueFlags::TRANSFER)
                     && !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
                 {
-                    transfer_family = Some(i as u32);
+                    transfer_family = Some(i);
                 }
                 if family.queue_flags.contains(vk::QueueFlags::COMPUTE)
                     && !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
                 {
-                    compute_family = Some(i as u32);
+                    compute_family = Some(i);
                 }
             }
 
@@ -597,9 +638,7 @@ impl VulkanContext {
 
             let device = instance
                 .create_device(physical_device, &device_create_info, None)
-                .map_err(|e| {
-                    GpuError::DeviceCreation(format!("Failed to create device: {:?}", e))
-                })?;
+                .map_err(|e| GpuError::DeviceCreation(format!("Failed to create device: {e:?}")))?;
 
             // Get queues
             let graphics_queue = device.get_device_queue(graphics_queue_family, 0);
@@ -614,7 +653,7 @@ impl VulkanContext {
             let graphics_command_pool = device
                 .create_command_pool(&graphics_pool_info, None)
                 .map_err(|e| {
-                    GpuError::ResourceCreation(format!("Failed to create command pool: {:?}", e))
+                    GpuError::ResourceCreation(format!("Failed to create command pool: {e:?}"))
                 })?;
 
             let transfer_pool_info = vk::CommandPoolCreateInfo::default()
@@ -624,7 +663,7 @@ impl VulkanContext {
             let transfer_command_pool = device
                 .create_command_pool(&transfer_pool_info, None)
                 .map_err(|e| {
-                    GpuError::ResourceCreation(format!("Failed to create command pool: {:?}", e))
+                    GpuError::ResourceCreation(format!("Failed to create command pool: {e:?}"))
                 })?;
 
             // Build adapter info.
@@ -761,14 +800,17 @@ impl VulkanContext {
             return -1; // Not suitable
         }
 
-        // Bonus for higher max texture size
-        score += (props.limits.max_image_dimension2_d / 1024) as i32;
+        // Bonus for higher max texture size. u32::MAX / 1024 always fits in
+        // an i32, but saturate anyway so the score can never overflow.
+        score = score.saturating_add(
+            i32::try_from(props.limits.max_image_dimension2_d / 1024).unwrap_or(i32::MAX),
+        );
 
         score
     }
 
     /// Get maximum sample count from sample count flags.
-    fn get_max_sample_count(flags: vk::SampleCountFlags) -> u32 {
+    const fn get_max_sample_count(flags: vk::SampleCountFlags) -> u32 {
         if flags.contains(vk::SampleCountFlags::TYPE_64) {
             64
         } else if flags.contains(vk::SampleCountFlags::TYPE_32) {
@@ -787,51 +829,61 @@ impl VulkanContext {
     }
 
     /// Get the Vulkan device.
-    pub fn device(&self) -> &ash::Device {
+    #[must_use]
+    pub const fn device(&self) -> &ash::Device {
         &self.device
     }
 
     /// Get the physical device.
-    pub fn physical_device(&self) -> vk::PhysicalDevice {
+    #[must_use]
+    pub const fn physical_device(&self) -> vk::PhysicalDevice {
         self.physical_device
     }
 
     /// Get the Vulkan instance.
-    pub fn instance(&self) -> &ash::Instance {
+    #[must_use]
+    pub const fn instance(&self) -> &ash::Instance {
         &self.instance
     }
 
     /// Get the graphics queue.
-    pub fn graphics_queue(&self) -> vk::Queue {
+    #[must_use]
+    pub const fn graphics_queue(&self) -> vk::Queue {
         self.graphics_queue
     }
 
     /// Get the graphics queue family index.
-    pub fn graphics_queue_family(&self) -> u32 {
+    #[must_use]
+    pub const fn graphics_queue_family(&self) -> u32 {
         self.graphics_queue_family
     }
 
     /// Get the transfer queue.
-    pub fn transfer_queue(&self) -> vk::Queue {
+    #[must_use]
+    pub const fn transfer_queue(&self) -> vk::Queue {
         self.transfer_queue
     }
 
     /// Get the compute queue.
-    pub fn compute_queue(&self) -> vk::Queue {
+    #[must_use]
+    pub const fn compute_queue(&self) -> vk::Queue {
         self.compute_queue
     }
 
     /// Get the graphics command pool.
-    pub fn graphics_command_pool(&self) -> vk::CommandPool {
+    #[must_use]
+    pub const fn graphics_command_pool(&self) -> vk::CommandPool {
         self.graphics_command_pool
     }
 
     /// Get Vulkan-specific capabilities.
-    pub fn vulkan_caps(&self) -> &VulkanCaps {
+    #[must_use]
+    pub const fn vulkan_caps(&self) -> &VulkanCaps {
         &self.caps
     }
 
     /// Query format features.
+    #[must_use]
     pub fn query_format_features(&self, format: TextureFormat) -> VulkanFormatFeatures {
         unsafe {
             let vk_format = texture_format_to_vk(format);
@@ -860,11 +912,14 @@ impl VulkanContext {
     }
 
     /// Wait for device idle.
+    ///
+    /// # Errors
+    /// Returns an error if `vkDeviceWaitIdle` fails (e.g. device lost).
     pub fn wait_idle(&self) -> GpuResult<()> {
         unsafe {
             self.device
                 .device_wait_idle()
-                .map_err(|e| GpuError::OperationFailed(format!("Wait idle failed: {:?}", e)))
+                .map_err(|e| GpuError::OperationFailed(format!("Wait idle failed: {e:?}")))
         }
     }
 }
@@ -901,6 +956,7 @@ impl GpuContext for VulkanContext {
 /// side-by-side; use ash for driver-direct work, use the returned context
 /// for the command-buffer / pipeline-descriptor replay path.
 ///
+/// # Errors
 /// Returns `Err(GpuError::DeviceCreation)` on systems without a usable
 /// Vulkan loader (missing ICD, no physical device, etc.).
 #[cfg(all(feature = "vulkan", feature = "wgpu-backend"))]
@@ -918,6 +974,10 @@ impl VulkanContext {
     /// device that can consume `CommandBuffer` and `RenderPipelineDescriptor`.
     /// The existing ash handles on `self` remain valid for any caller-driven
     /// native work.
+    ///
+    /// # Errors
+    /// Returns [`GpuError::DeviceCreation`] if wgpu cannot find a Vulkan
+    /// adapter (see [`new_vulkan_wgpu_context`]).
     pub fn new_wgpu_executor(
         &self,
     ) -> GpuResult<(
@@ -984,7 +1044,7 @@ unsafe extern "system" fn vulkan_debug_callback(
         _ => "UNKNOWN",
     };
 
-    eprintln!("[Vulkan {} {}] {}", severity, msg_type, message);
+    eprintln!("[Vulkan {severity} {msg_type}] {message}");
 
     vk::FALSE
 }
@@ -1000,10 +1060,10 @@ mod tests {
         // fixed-size array like Vulkan's device_name field.
         let mut arr = [0 as std::os::raw::c_char; 256];
         for (i, b) in b"NVIDIA RTX".iter().enumerate() {
-            arr[i] = *b as std::os::raw::c_char;
+            arr[i] = std::os::raw::c_char::from_ne_bytes([*b]);
         }
         // Trailing bytes after the NUL are garbage and must be ignored.
-        arr[64] = b'X' as std::os::raw::c_char;
+        arr[64] = std::os::raw::c_char::from_ne_bytes(*b"X");
         assert_eq!(parse_device_name(&arr), "NVIDIA RTX");
 
         // An all-zero array parses to an empty string, not a panic.
@@ -1011,7 +1071,7 @@ mod tests {
         assert_eq!(parse_device_name(&zeros), "");
 
         // An array with no NUL at all does not panic (returns default).
-        let no_nul = [b'A' as std::os::raw::c_char; 4];
+        let no_nul = [std::os::raw::c_char::from_ne_bytes(*b"A"); 4];
         assert_eq!(parse_device_name(&no_nul), "");
     }
 
@@ -1021,7 +1081,7 @@ mod tests {
         assert_eq!(v.major, 1);
         assert_eq!(v.minor, 2);
         assert_eq!(v.patch, 3);
-        assert_eq!(format!("{}", v), "1.2.3");
+        assert_eq!(format!("{v}"), "1.2.3");
     }
 
     #[test]
@@ -1059,7 +1119,7 @@ mod tests {
             Err(GpuError::DeviceCreation(_)) => {
                 // Expected on headless CI or non-Vulkan hosts.
             }
-            Err(other) => panic!("unexpected error kind: {:?}", other),
+            Err(other) => panic!("unexpected error kind: {other:?}"),
         }
     }
 }

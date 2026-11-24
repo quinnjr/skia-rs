@@ -454,25 +454,26 @@ impl ShaderDebugger {
                 // Extract GLSL uniforms
                 for (idx, line) in source.lines().enumerate() {
                     let line = line.trim();
-                    if line.starts_with("uniform ") {
-                        if let Some(name) = Self::extract_glsl_uniform_name(line) {
-                            bindings.push(ShaderBinding {
-                                name,
-                                location: u32_from_usize(idx),
-                                binding_type: BindingType::UniformBuffer,
-                                group: 0,
-                            });
-                        }
+                    if line.starts_with("uniform ")
+                        && let Some(name) = Self::extract_glsl_uniform_name(line)
+                    {
+                        bindings.push(ShaderBinding {
+                            name,
+                            location: u32_from_usize(idx),
+                            binding_type: BindingType::UniformBuffer,
+                            group: 0,
+                        });
                     }
                 }
             }
             ShaderLanguage::Wgsl => {
                 // Extract WGSL bindings
                 for line in source.lines() {
-                    if line.contains("@group") && line.contains("@binding") {
-                        if let Some(binding) = Self::parse_wgsl_binding(line) {
-                            bindings.push(binding);
-                        }
+                    if line.contains("@group")
+                        && line.contains("@binding")
+                        && let Some(binding) = Self::parse_wgsl_binding(line)
+                    {
+                        bindings.push(binding);
                     }
                 }
             }

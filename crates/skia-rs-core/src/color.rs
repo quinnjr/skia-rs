@@ -31,6 +31,7 @@ use bytemuck::{Pod, Zeroable};
 ///
 /// Equivalent to Skia's `SkColor`. Format is 0xAARRGGBB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(transparent)]
 pub struct Color(pub u32);
 
@@ -857,6 +858,7 @@ pub const COLOR_MAGENTA: Color = Color::MAGENTA;
 /// Equivalent to Skia's `SkColor4f`. Components are typically in [0, 1] range
 /// but can exceed this for HDR content.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(C)]
 pub struct Color4f {
     /// Red component.
@@ -1012,6 +1014,7 @@ impl From<Color4f> for Color {
 ///
 /// Equivalent to Skia's `SkAlphaType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum AlphaType {
     /// Alpha is unknown or unspecified.
@@ -1042,6 +1045,7 @@ impl AlphaType {
 ///
 /// Equivalent to Skia's `SkColorType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum ColorType {
     /// Unknown or invalid.
@@ -1166,6 +1170,7 @@ impl ColorType {
 ///
 /// Equivalent to Skia's `SkColorSpace`.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ColorSpace {
     /// The transfer function (gamma curve).
     pub transfer_fn: TransferFunction,
@@ -1230,6 +1235,7 @@ impl ColorSpace {
 
 /// Transfer function (gamma curve) for a color space.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TransferFunction {
     /// Linear (gamma = 1.0).
     Linear,
@@ -1262,6 +1268,7 @@ pub enum TransferFunction {
 
 /// Color gamut (primaries and white point).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ColorGamut {
     /// sRGB / Rec. 709.
     Srgb,
@@ -2167,6 +2174,7 @@ pub fn mix_colors(color1: Color, color2: Color, t: Scalar) -> Color {
 bitflags! {
     /// Flags describing color filter properties.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     pub struct ColorFilterFlags: u32 {
         /// Filter produces only alpha output.
         const ALPHA_UNCHANGED = 1 << 0;

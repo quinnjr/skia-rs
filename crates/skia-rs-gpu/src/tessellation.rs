@@ -3,6 +3,15 @@
 //! This module provides algorithms for converting vector paths into triangle meshes
 //! suitable for GPU rendering.
 
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+#![allow(
+    clippy::manual_midpoint,
+    reason = "hot flattening/tessellation loops port Skia's SkScalarAve, (a + b) * 0.5, which stays in f32; f32::midpoint widens to f64 and gives the same result unless a + b overflows f32 (|coords| > ~1.7e38)"
+)]
+
 use crate::cast_util::{scalar_from_u32, scalar_from_usize, u32_from_usize};
 use skia_rs_core::{Matrix, Point, Rect, Scalar};
 use skia_rs_path::{Path, PathElement};
@@ -75,13 +84,13 @@ impl TessMesh {
 
     /// Check if empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.vertices.is_empty() || self.indices.is_empty()
     }
 
     /// Number of triangles.
     #[must_use]
-    pub fn triangle_count(&self) -> usize {
+    pub const fn triangle_count(&self) -> usize {
         self.indices.len() / 3
     }
 
@@ -785,7 +794,7 @@ fn left_normal(dir: Point) -> Point {
     Point::new(-dir.y, dir.x)
 }
 #[inline]
-fn offset(p: Point, dir: Point, amt: Scalar) -> Point {
+const fn offset(p: Point, dir: Point, amt: Scalar) -> Point {
     Point::new(dir.x.mul_add(amt, p.x), dir.y.mul_add(amt, p.y))
 }
 

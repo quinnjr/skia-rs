@@ -10,7 +10,7 @@ This project adheres to the [Rust Code of Conduct](https://www.rust-lang.org/pol
 
 ### Prerequisites
 
-- Rust 1.85 or later (stable)
+- Rust 1.94 or later (stable)
 - Git
 - For fuzzing: Rust nightly and cargo-fuzz
 

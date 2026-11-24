@@ -145,10 +145,10 @@ impl<'a> SvgPathParser<'a> {
         let mut has_exp = false;
 
         // Handle sign
-        if let Some(c) = self.peek() {
-            if c == '+' || c == '-' {
-                self.advance();
-            }
+        if let Some(c) = self.peek()
+            && (c == '+' || c == '-')
+        {
+            self.advance();
         }
 
         // Parse digits and decimal point
@@ -162,10 +162,10 @@ impl<'a> SvgPathParser<'a> {
                 has_exp = true;
                 self.advance();
                 // Handle exponent sign
-                if let Some(next) = self.peek() {
-                    if next == '+' || next == '-' {
-                        self.advance();
-                    }
+                if let Some(next) = self.peek()
+                    && (next == '+' || next == '-')
+                {
+                    self.advance();
                 }
             } else {
                 break;

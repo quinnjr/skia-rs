@@ -412,13 +412,13 @@ impl GlyphBatch {
 
     /// Check if batch is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.instances.is_empty()
     }
 
     /// Get number of glyphs in batch.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.instances.len()
     }
 
