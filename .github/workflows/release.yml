@@ -15,7 +15,11 @@ jobs:
   # ==========================================================================
   validate:
     name: Validate Release
-    runs-on: ubuntu-latest
+    # Pinned: on the newer ubuntu-latest image, libaom 3.11 (built for the
+    # codec-avif feature by `--all-features`) rejects the installed nasm
+    # ("Unsupported nasm: multipass optimization not supported"), since its
+    # check greps `nasm -hf` output for "-Ox".
+    runs-on: ubuntu-24.04
     steps:
       # Test fixtures (fonts, images) are stored in Git LFS; without this the
       # checkout leaves LFS pointer files and `include_bytes!` embeds the
