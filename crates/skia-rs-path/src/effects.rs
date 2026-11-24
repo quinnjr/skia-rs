@@ -1151,14 +1151,31 @@ impl DiscreteEffect {
         let fill_factor = if do_fill { 3.0 } else { 2.0 };
         for (elements, closed, measure, length) in &measured {
             if self.seg_length * fill_factor > *length {
-                // Too short to mangle: the contour as is (getSegment, which
-                // ends a closed contour with its closing line, unclosed).
-                append_elements(&mut builder, elements);
-                if *closed {
-                    let start = match elements.first() {
-                        Some(PathElement::Move(p)) => *p,
-                        _ => Point::zero(),
+                // Too short to mangle: the contour as getSegment(0, length)
+                // gives it: unclosed, ending a closed contour with its
+                // closing line, and without zero-length segments (the
+                // measure skips them).
+                let start = match elements.first() {
+                    Some(PathElement::Move(p)) => *p,
+                    _ => Point::zero(),
+                };
+                let mut last = start;
+                for &element in elements {
+                    let (moves, end) = match element {
+                        PathElement::Move(p) => (true, p),
+                        PathElement::Line(p) => (p != last, p),
+                        PathElement::Quad(c, p) | PathElement::Conic(c, p, _) => {
+                            (c != last || p != last, p)
+                        }
+                        PathElement::Cubic(c1, c2, p) => (c1 != last || c2 != last || p != last, p),
+                        PathElement::Close => (false, last),
                     };
+                    if moves {
+                        append_elements(&mut builder, &[element]);
+                        last = end;
+                    }
+                }
+                if *closed && last != start {
                     builder.line_to(start.x, start.y);
                 }
                 continue;
@@ -3213,6 +3230,33 @@ mod tests {
                 "{k}: {p:?}"
             );
         }
+    }
+
+    #[test]
+    fn discrete_short_contours_have_no_zero_length_segments() {
+        // Too short to jitter: copied as getSegment gives it, with no
+        // repeated point (no zero-length segment) and one closing line.
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0)
+            .line_to(4.0, 0.0)
+            .line_to(4.0, 0.0)
+            .line_to(0.0, 4.0)
+            .line_to(0.0, 0.0)
+            .close();
+        // Perimeter 4 + 4 + 5.66 = 13.66 < 2 * 7: too short to jitter.
+        let out = DiscreteEffect::new(7.0, 1.0, 0)
+            .unwrap()
+            .apply(&b.build())
+            .unwrap();
+        assert_eq!(
+            out.points(),
+            &[
+                Point::new(0.0, 0.0),
+                Point::new(4.0, 0.0),
+                Point::new(0.0, 4.0),
+                Point::new(0.0, 0.0)
+            ]
+        );
     }
 
     #[test]
