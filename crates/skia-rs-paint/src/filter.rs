@@ -543,16 +543,17 @@ fn displaced_sample(coord: i32, disp: Scalar) -> i32 {
 /// map pixel: the channel is unpremultiplied, then `scale * (c / 255 - 0.5)`
 /// (so the full channel range moves by at most `scale / 2`).
 fn displacement_offset(map_px: &[u8], channel: usize, scale: Scalar) -> Scalar {
-    let alpha = u32::from(map_px[3]);
+    // Unpremultiplied in floating point, as Skia's shader does (no rounding
+    // back to a byte).
+    let alpha = f32::from(map_px[3]) / 255.0;
     let value = if channel == 3 {
         alpha
+    } else if alpha > 0.0 {
+        (f32::from(map_px[channel]) / 255.0 / alpha).min(1.0)
     } else {
-        (u32::from(map_px[channel]) * 255 + alpha / 2)
-            .checked_div(alpha)
-            .map_or(0, |v| v.min(255))
+        0.0
     };
-    let value = u8::try_from(value).unwrap_or(u8::MAX);
-    scale * (f32::from(value) / 255.0 - 0.5)
+    scale * (value - 0.5)
 }
 
 /// The bounds an optional `input` filter produces from `src` (`src` itself
@@ -3378,6 +3379,9 @@ mod tests {
         assert!((displacement_offset(&[0, 0, 0, 255], 0, 20.0) + 10.0).abs() < 1e-5);
         // R 255 at 50% alpha is stored as 128: still the full +scale/2.
         assert!((displacement_offset(&[128, 0, 0, 128], 0, 20.0) - 10.0).abs() < 1e-5);
+        // Premul R 100 at alpha 200 is exactly 0.5: no move at any scale
+        // (rounding it to a byte first would give 128 / 255).
+        assert!(displacement_offset(&[100, 0, 0, 200], 0, 300.0).abs() < 1e-4);
     }
 
     #[test]
