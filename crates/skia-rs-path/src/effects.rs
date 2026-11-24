@@ -1461,17 +1461,14 @@ fn append_trim_segment(builder: &mut PathBuilder, segment: &Path, requires_move:
 }
 
 /// One contour, closed (`SkTrimPE`'s `contour_count == 1 &&
-/// isLastContourClosed()`).
+/// isLastContourClosed()`). As in Skia, the contours counted are those the
+/// path measure keeps: zero-length ones do not count.
 fn is_single_closed_contour(path: &Path) -> bool {
-    let mut moves = 0;
-    let mut last_closed = false;
-    for elem in path {
-        if matches!(elem, PathElement::Move(_)) {
-            moves += 1;
-        }
-        last_closed = matches!(elem, PathElement::Close);
-    }
-    moves == 1 && last_closed
+    let last_closed = path
+        .iter()
+        .last()
+        .is_some_and(|elem| matches!(elem, PathElement::Close));
+    last_closed && crate::measure::PathMeasure::new(path).contour_count() == 1
 }
 
 // =============================================================================
@@ -3183,6 +3180,26 @@ mod tests {
         let mut b = PathBuilder::new();
         b.move_to(-1e7, 50.0).line_to(1e7, 50.0);
         assert!(dash.filter_path(&b.build(), &mut rec).is_none());
+    }
+
+    #[test]
+    fn inverted_trim_ignores_zero_length_contours() {
+        // A zero-length contour before the shape does not count: the shape
+        // is the one closed contour, so the tail joins its head (one move).
+        let mut b = PathBuilder::new();
+        b.move_to(0.0, 0.0)
+            .close()
+            .move_to(10.0, 10.0)
+            .line_to(20.0, 10.0)
+            .line_to(20.0, 20.0)
+            .close();
+        let trim = TrimEffect::new(0.25, 0.75, TrimMode::Inverted).unwrap();
+        let out = trim.apply(&b.build()).unwrap();
+        let moves = out
+            .iter()
+            .filter(|e| matches!(e, PathElement::Move(_)))
+            .count();
+        assert_eq!(moves, 1, "{out:?}");
     }
 
     #[test]
