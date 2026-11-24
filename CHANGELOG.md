@@ -25,6 +25,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `StrokeRec::set_stroke_style` maps a NaN or infinite width to `Fill`
   (Skia keeps an infinite width as a stroke), so a `Stroke` width is
   always finite and positive.
+- `Canvas::draw_round_rect` with a radius <= 0 (or NaN) draws, and
+  records, a plain rect, like `SkCanvas::drawRoundRect`; a round rect that
+  is really a rect or an oval draws as `draw_rect` / `draw_oval`.
+  `RecordingCanvas::draw_round_rect` (picture recording) likewise records
+  `DrawCommand::DrawRect` for such radii instead of `DrawRoundRect`.
+- `RecordingCanvas::restore` drops a restore with no matching save, like
+  `SkRecorder`, so it no longer appears in the commands or
+  `approximate_op_count`.
+- **Breaking**: `DisplacementMapImageFilter` keeps a signed scale per
+  device axis, so it maps exactly under non-uniform scales, mirrors,
+  quarter turns and axis swaps (ties round as Skia's: in device space for
+  scale-translate matrices, and as in its rotated layer otherwise; see
+  `ImageFilter::map_params`). Its serialized form (inside
+  `Paint::serialize`) now has two scales (x and y) and a flip byte instead
+  of one scale, and `Paint::deserialize` reads displacement maps back when
+  their inputs are kinds it reads (blur, drop shadow, morphology, offset,
+  compose, merge, displacement); others are still dropped. A non-finite
+  scale displaces nothing. The filter's `Debug` output shows `axis_scale`
+  and `axis_flips` instead of `scale`. `Paint::deserialize` drops an image
+  filter or shader chain longer than 64 levels (the rest of the paint
+  still loads; crafted input could overflow the stack), and checks lengths
+  without overflow.
 - `MergeImageFilter`, `BlendImageFilter` and `ArithmeticImageFilter` now
   apply (they were no-ops): each input runs on the source and the results
   are merged (src-over), blended with the mode, or combined arithmetically,
@@ -32,6 +54,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TrimEffect::new` (and the C API's trim constructor) pins `start` and
   `end` to [0, 1] like `SkTrimPathEffect::Make`; only non-finite values
   give `None` (out-of-range values used to).
+- Image shaders premultiply an `Unpremul` image's samples (after linear
+  filtering mixes the stored texels, as `SkImageShader`; `Shader::sample`
+  returns premultiplied color, and they were returned as stored), decode `Rgb888` and read it back from
+  `Paint::deserialize`, and read huge or mismatched dimensions as
+  transparent instead of overflowing. Rows must be tightly packed (now
+  documented). Image shaders, and paint or filter sections, too large for
+  the serialized form's u32 length are written as absent or not at all
+  (their lengths used to saturate, misaligning everything after them).
+- Image filters' `apply` filters only the `width` x `height` image at
+  the start of the buffer (any other length used to panic: now a
+  shorter buffer is left alone and a longer one's tail is kept), and huge
+  offsets no longer overflow.
+- `DisplacementMapImageFilter`'s `filter_bounds` and `input_bounds` round
+  the rect out to whole pixels and outset by `ceil(|scale| / 2)`, as
+  Skia's `outsetByMaxDisplacement` does in layer space (they outset by
+  `|scale| / 2` exactly, which could clip a displaced pixel at a
+  fractional edge); bounds are now pixel-aligned even for scale 0.
+- Deserialization rejects a present/absent flag other than 0 or 1 in
+  paint sections, image-filter inputs and shaders (such a flag used to
+  read as absent, or as present, and misalign what followed).
+- `PerlinNoiseShader::is_opaque` is always false, as Skia's (it was true
+  unconditionally).
+- Perlin noise shaders use at most 255 octaves (`SkPerlinNoiseShader`'s
+  `kMaxOctaves`), and with 0 draw as Skia does: fractal noise as
+  transparent gray, turbulence as transparent (a negative count draws the
+  same; Skia gives no shader). The constructors and `Paint::deserialize`
+  keep the octave count to 0..=255, so a shader reads back as built
+  (Skia's factory gives no shader outside that range). Many octaves no
+  longer overflow the noise lattice.
 - **Breaking**: the C API's `sk_canvas_save_layer` returns `int32_t`
   (was `uint32_t`), the same type and value as `sk_canvas_save`.
 - **Breaking**: the C API's `sk_surface_lock_canvas` now holds a reference
@@ -51,14 +102,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to 9x the device area (Skia downsamples larger layers; past that the
   layer is cut to the device outset by its size).
   As in Skia, the filter's parameters are mapped from local space into the
-  layer (sigmas, offsets and radii scale and rotate with the matrix) via the
-  new `ImageFilter::map_params` / `map_image_filter`. Filters run on
+  layer (sigmas, offsets and radii scale and rotate with the matrix) via
+  the new `ImageFilter::map_params` / `map_image_filter`. Filters run on
   device-space layer pixels; Skia's decomposition of the matrix
   (`decomposeCTM`) is not implemented. `ImageFilter::map_params` lists the
-  cases that match Skia exactly (most filters under scale/translate and
-  quarter turns; convolution, lighting and displacement under fewer). Blur and drop-shadow sigmas are clamped to 532, like
-  `SkBlurImageFilter`'s `kMaxSigma`. New `Canvas::layer_bounds`, `layer_bounds_within`, `layer_paint` and
-  `composite_layer_pixels`.
+  cases that match Skia exactly: most filters under scale/translate and
+  quarter turns; displacement maps also under non-uniform scales and
+  mirrors; matrix convolution under quarter turns and mirrors at unit
+  scale only; lighting under translate, scale and quarter turns. Blur and
+  drop-shadow sigmas are clamped to 532, like `SkBlurImageFilter`'s
+  `kMaxSigma`. New `Canvas::layer_bounds`, `layer_bounds_within`,
+  `layer_paint` and `composite_layer_pixels`.
 - **Breaking**: `DrawCommand::SaveLayer` has a `flags` field, so recorded
   layers keep `INIT_WITH_PREVIOUS` on playback.
 - **Breaking**: new `DrawCommand::DrawVertices` variant, so recorded
