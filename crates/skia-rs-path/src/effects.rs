@@ -1173,6 +1173,23 @@ impl DiscreteEffect {
         builder.line_to(moved.x, moved.y);
     }
 
+    /// Adds `steps` jittered points along a curve evaluated by `eval` at
+    /// t = i / steps (the last, t = 1, only with `include_end`).
+    fn jitter_curve(
+        &self,
+        builder: &mut PathBuilder,
+        steps: i32,
+        include_end: bool,
+        seed: &mut u32,
+        eval: impl Fn(Scalar) -> Point,
+    ) {
+        let last = if include_end { steps } else { steps - 1 };
+        for i in 1..=last {
+            let t = scalar_from_i32(i) / scalar_from_i32(steps);
+            self.jitter_to(builder, eval(t), seed);
+        }
+    }
+
     /// `point` moved by a random offset of up to `deviation` per axis.
     fn jittered(&self, point: Point, seed: &mut u32) -> Point {
         let dx = Self::random(*seed) * self.deviation;
@@ -1205,6 +1222,11 @@ impl PathEffect for DiscreteEffect {
 
         let elements: Vec<PathElement> = path.iter().collect();
         for (index, &element) in elements.iter().enumerate() {
+            // A segment ending at the contour start just before a close: the
+            // start is already emitted (jittered) by the move, so its end
+            // point is not emitted again.
+            let closes_next = matches!(elements.get(index + 1), Some(PathElement::Close));
+            let include_end = |end: Point| !(closes_next && end == contour_start);
             match element {
                 PathElement::Move(p) => {
                     let moved = self.jittered(p, &mut seed);
@@ -1217,17 +1239,12 @@ impl PathEffect for DiscreteEffect {
                     let length = current_pos.distance(&end);
                     let num_segments =
                         take_segments(ceil_to_i32(length / self.seg_length), &mut contour_budget);
-                    // A last line back to the start, then a close: the start
-                    // is already emitted (jittered) by the move, so it is
-                    // not emitted again.
-                    let returns_to_start = end == contour_start
-                        && matches!(elements.get(index + 1), Some(PathElement::Close));
                     self.jitter_line(
                         &mut builder,
                         current_pos,
                         end,
                         num_segments,
-                        !returns_to_start,
+                        include_end(end),
                         &mut seed,
                     );
                     current_pos = end;
@@ -1262,12 +1279,11 @@ impl PathEffect for DiscreteEffect {
                         &mut contour_budget,
                     );
 
-                    for i in 1..=steps {
-                        let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                        let p = quadratic_point(current_pos, ctrl, end, t);
-
-                        self.jitter_to(&mut builder, p, &mut seed);
-                    }
+                    let from = current_pos;
+                    self.jitter_curve(&mut builder, steps, include_end(end), &mut seed, |t| {
+                        let current_pos = from;
+                        quadratic_point(current_pos, ctrl, end, t)
+                    });
                     current_pos = end;
                 }
                 PathElement::Conic(ctrl, end, w) => {
@@ -1277,12 +1293,11 @@ impl PathEffect for DiscreteEffect {
                         &mut contour_budget,
                     );
 
-                    for i in 1..=steps {
-                        let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                        let p = conic_eval(current_pos, ctrl, end, w, t);
-
-                        self.jitter_to(&mut builder, p, &mut seed);
-                    }
+                    let from = current_pos;
+                    self.jitter_curve(&mut builder, steps, include_end(end), &mut seed, |t| {
+                        let current_pos = from;
+                        conic_eval(current_pos, ctrl, end, w, t)
+                    });
                     current_pos = end;
                 }
                 PathElement::Cubic(ctrl1, ctrl2, end) => {
@@ -1292,12 +1307,11 @@ impl PathEffect for DiscreteEffect {
                         &mut contour_budget,
                     );
 
-                    for i in 1..=steps {
-                        let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                        let p = cubic_point(current_pos, ctrl1, ctrl2, end, t);
-
-                        self.jitter_to(&mut builder, p, &mut seed);
-                    }
+                    let from = current_pos;
+                    self.jitter_curve(&mut builder, steps, include_end(end), &mut seed, |t| {
+                        let current_pos = from;
+                        cubic_point(current_pos, ctrl1, ctrl2, end, t)
+                    });
                     current_pos = end;
                 }
             }
@@ -1694,7 +1708,10 @@ pub enum Path1DStyle {
 
 /// 1D path effect that stamps a path along another path.
 ///
-/// Corresponds to Skia's `SkPath1DPathEffect`.
+/// Corresponds to Skia's `SkPath1DPathEffect`. As in Skia, more than
+/// 100,000 stamps on one contour fails the effect. Past about four million
+/// emitted points in total (a guard Skia lacks), further stamps are dropped
+/// rather than failing, since a failed effect draws the source filled.
 #[derive(Debug, Clone)]
 pub struct Path1DEffect {
     /// The path to stamp.
@@ -1975,7 +1992,11 @@ impl PathEffect for Path1DEffect {
 
 /// 2D path effect that tiles a path in a 2D pattern.
 ///
-/// Corresponds to Skia's `SkPath2DPathEffect`.
+/// Corresponds to Skia's `SkPath2DPathEffect`. Unlike Skia, the output is
+/// bounded against pathological lattices: past 2^16 lattice rows or about
+/// two million emitted points, stamps are dropped evenly across the
+/// covered rows rather than failing, since a failed effect draws the
+/// source filled.
 #[derive(Debug, Clone)]
 pub struct Path2DEffect {
     /// The transformation matrix for the tile.
@@ -2394,7 +2415,10 @@ fn lattice_spans(
 
 /// 2D line effect that fills a region with parallel lines.
 ///
-/// Corresponds to Skia's `SkLine2DPathEffect`.
+/// Corresponds to Skia's `SkLine2DPathEffect`. Unlike Skia, the output is
+/// bounded against pathological lattices: past 2^16 lattice rows, or about
+/// a million lines, the hatch is thinned evenly (every n-th line) rather
+/// than failing, since a failed effect draws the source filled.
 #[derive(Debug, Clone, Copy)]
 pub struct Line2DEffect {
     /// Line width.
@@ -3223,6 +3247,26 @@ mod tests {
         let mut b = PathBuilder::new();
         b.move_to(-1e7, 50.0).line_to(1e7, 50.0);
         assert!(dash.filter_path(&b.build(), &mut rec).is_none());
+    }
+
+    #[test]
+    fn discrete_emits_a_curve_closed_start_once() {
+        // add_circle ends on a conic back to its start, then closes: the start
+        // is emitted once (by the move), with no doubled copy.
+        let mut b = PathBuilder::new();
+        b.add_circle(50.0, 50.0, 40.0);
+        let path = b.build();
+        let start = path.points()[0];
+        let out = DiscreteEffect::new(20.0, 3.0, 0)
+            .unwrap()
+            .apply(&path)
+            .unwrap();
+        let near_start = out
+            .points()
+            .iter()
+            .filter(|p| (p.x - start.x).hypot(p.y - start.y) < 8.0)
+            .count();
+        assert_eq!(near_start, 1, "{:?}", out.points());
     }
 
     #[test]
