@@ -308,10 +308,14 @@ impl StandardGms {
                     std::f32::consts::PI * 2.0 * i as f32 / 5.0 - std::f32::consts::PI / 2.0;
                 let angle_inner = angle_outer + std::f32::consts::PI / 5.0;
 
-                let px = outer.mul_add(angle_outer.cos(), cx);
-                let py = outer.mul_add(angle_outer.sin(), cy);
-                let ix = inner.mul_add(angle_inner.cos(), cx);
-                let iy = inner.mul_add(angle_inner.sin(), cy);
+                // Unfused, as Skia's own drawing of this star computes it.
+                #[allow(clippy::suboptimal_flops, reason = "match Skia's unfused rounding")]
+                let (px, py, ix, iy) = (
+                    cx + outer * angle_outer.cos(),
+                    cy + outer * angle_outer.sin(),
+                    cx + inner * angle_inner.cos(),
+                    cy + inner * angle_inner.sin(),
+                );
 
                 if i == 0 {
                     builder.move_to(px, py);
