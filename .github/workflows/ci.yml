@@ -443,8 +443,11 @@ jobs:
         run: |
           echo "# Backend Conformance Report" > $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Backend | OS | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|---------|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "Image comparison against the references runs for raster on Ubuntu;" >> $GITHUB_STEP_SUMMARY
+          echo "every row's conformance test gates the job (overall: ${{ needs.conformance.result }})." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend | OS | Image comparison |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----|------------------|" >> $GITHUB_STEP_SUMMARY
 
           for dir in all-results/conformance-*/; do
             if [ -d "$dir" ]; then
@@ -454,8 +457,9 @@ jobs:
 
               report="$dir/conformance_results/report.txt"
               if [ "$backend" != "raster" ] || [ "$os" != "ubuntu-latest" ]; then
-                # Images are generated for raster and compared on Ubuntu only.
-                status="➖ Not compared (raster on Ubuntu only)"
+                # Images are compared for raster on Ubuntu only; this row's
+                # conformance test still gates the job (overall result above).
+                status="➖ Not compared here (see overall result)"
               elif [ ! -f "$report" ]; then
                 status="⚠️ No results"
               elif grep -q '^FAIL ' "$report"; then
