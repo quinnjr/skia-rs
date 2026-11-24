@@ -2165,7 +2165,16 @@ pub unsafe extern "C" fn sk_canvas_save_layer(
     })
 }
 
-/// Restore the most recently saved matrix and clip.
+/// Restore the most recently saved matrix and clip, like `SkCanvas::restore`.
+///
+/// If that save was a [`sk_canvas_save_layer`], its
+/// offscreen layer is composited into the layer or surface below, through
+/// the outer clip, with the layer paint's alpha, blend mode, color filter
+/// and image filter. Does nothing when there is no save to restore.
+///
+/// # Safety
+/// `canvas` must be null or a canvas from [`sk_surface_lock_canvas`] that
+/// has not been released.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_canvas_restore(canvas: *mut sk_canvas_t) {
     catch_panic_void(|| {

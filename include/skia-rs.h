@@ -861,7 +861,16 @@ int32_t sk_canvas_save_layer(struct sk_canvas_t *canvas,
                              const struct sk_rect_t *bounds,
                              const sk_paint_t *paint);
 
-// Restore the most recently saved matrix and clip.
+// Restore the most recently saved matrix and clip, like `SkCanvas::restore`.
+//
+// If that save was a [`sk_canvas_save_layer`], its
+// offscreen layer is composited into the layer or surface below, through
+// the outer clip, with the layer paint's alpha, blend mode, color filter
+// and image filter. Does nothing when there is no save to restore.
+//
+// # Safety
+// `canvas` must be null or a canvas from [`sk_surface_lock_canvas`] that
+// has not been released.
 void sk_canvas_restore(struct sk_canvas_t *canvas);
 
 // Concatenate a matrix onto the canvas's current transform.
