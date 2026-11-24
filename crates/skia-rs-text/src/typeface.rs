@@ -247,14 +247,16 @@ fn next_typeface_id() -> u32 {
 /// as permanent for that candidate.
 fn is_transient(error: &std::io::Error) -> bool {
     use std::io::ErrorKind;
-    // Too many open files: EMFILE/ENFILE, or Windows'
-    // ERROR_TOO_MANY_OPEN_FILES.
+    // Too many open files (EMFILE/ENFILE; Windows'
+    // ERROR_TOO_MANY_OPEN_FILES), and on Windows a file briefly held by
+    // another process (ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, e.g.
+    // antivirus or a font install), which std leaves uncategorized.
     #[cfg(unix)]
-    const TOO_MANY_OPEN_FILES: &[i32] = &[23, 24];
+    const TRANSIENT_OS_ERRORS: &[i32] = &[23, 24];
     #[cfg(windows)]
-    const TOO_MANY_OPEN_FILES: &[i32] = &[4];
+    const TRANSIENT_OS_ERRORS: &[i32] = &[4, 32, 33];
     #[cfg(not(any(unix, windows)))]
-    const TOO_MANY_OPEN_FILES: &[i32] = &[];
+    const TRANSIENT_OS_ERRORS: &[i32] = &[];
     matches!(
         error.kind(),
         ErrorKind::Interrupted
@@ -264,7 +266,7 @@ fn is_transient(error: &std::io::Error) -> bool {
             | ErrorKind::OutOfMemory
     ) || error
         .raw_os_error()
-        .is_some_and(|code| TOO_MANY_OPEN_FILES.contains(&code))
+        .is_some_and(|code| TRANSIENT_OS_ERRORS.contains(&code))
 }
 
 /// Well-known locations of each platform's default sans-serif font, in order
@@ -606,7 +608,12 @@ mod tests {
         #[cfg(unix)]
         assert!(super::is_transient(&Error::from_raw_os_error(24)));
         #[cfg(windows)]
-        assert!(super::is_transient(&Error::from_raw_os_error(4)));
+        for code in [4, 32, 33] {
+            assert!(
+                super::is_transient(&Error::from_raw_os_error(code)),
+                "{code}"
+            );
+        }
         assert!(!super::is_transient(&Error::from(ErrorKind::NotFound)));
         assert!(!super::is_transient(&Error::from(
             ErrorKind::PermissionDenied
