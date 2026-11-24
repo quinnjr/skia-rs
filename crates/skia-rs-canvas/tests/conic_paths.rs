@@ -2488,3 +2488,30 @@ fn zero_sweep_arcs_are_not_recorded() {
     );
     assert!(cmds.is_empty(), "{cmds:?}");
 }
+
+#[test]
+fn hinted_layers_keep_the_spread_of_a_wrapped_filter() {
+    // A layer filter wrapping a blur (here an identity offset) spreads past
+    // a bounds hint like a bare blur does, up to the clip.
+    use skia_rs_canvas::SaveLayerRec;
+    use skia_rs_paint::{BlurImageFilter, OffsetImageFilter, TileMode};
+    use std::sync::Arc;
+
+    let blur = Arc::new(BlurImageFilter::new(5.0, 5.0, TileMode::Decal));
+    let mut paint = Paint::new();
+    paint.set_image_filter(Some(Arc::new(OffsetImageFilter::new(0.0, 0.0, Some(blur)))));
+    let bounds = Rect::new(40.0, 40.0, 60.0, 60.0);
+    let mut buffer = PixelBuffer::new(SIZE, SIZE);
+    {
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.save_layer(&SaveLayerRec {
+            bounds: Some(&bounds),
+            paint: Some(&paint),
+            ..SaveLayerRec::default()
+        });
+        canvas.draw_rect(&bounds, &white(Style::Fill));
+        canvas.restore();
+    }
+    let alpha = buffer.get_pixel(64, 50).map_or(0, |c| c.alpha());
+    assert!(alpha > 0, "the blur's halo reaches past the hint");
+}
