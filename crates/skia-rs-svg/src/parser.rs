@@ -197,9 +197,12 @@ fn build_node(
             let given = |k: &str| attrs.get(k).is_some_and(|v| is_length(v));
             let rx = given("rx").then(|| hlen("rx", "0")).filter(|r| *r >= 0.0);
             let ry = given("ry").then(|| vlen("ry", "0")).filter(|r| *r >= 0.0);
+            // An auto radius copies the other *length*, resolved against its
+            // own axis (rx="10%" gives ry = 10% of the height).
             let (rx, ry) = match (rx, ry) {
                 (Some(rx), Some(ry)) => (rx, ry),
-                (Some(r), None) | (None, Some(r)) => (r, r),
+                (Some(rx), None) => (rx, vlen("rx", "0")),
+                (None, Some(ry)) => (hlen("ry", "0"), ry),
                 (None, None) => (0.0, 0.0),
             };
             SvgNode::new(SvgNodeKind::Rect(SvgRect {

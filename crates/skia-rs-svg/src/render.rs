@@ -1094,6 +1094,26 @@ mod tests {
     }
 
     #[test]
+    fn auto_radius_resolves_a_percentage_on_its_own_axis() {
+        // rx="10%" in a 200x100 viewport: rx = 20, and auto ry copies the
+        // length, so ry = 10% of the height = 10 (not 20).
+        let svg = r#"<svg width="200" height="100" xmlns="http://www.w3.org/2000/svg">
+            <rect width="150" height="80" rx="10%"/>
+        </svg>"#;
+        let doc = crate::parser::parse_svg(svg).unwrap();
+        let rect = doc
+            .root
+            .children
+            .iter()
+            .find_map(|n| match &n.kind {
+                crate::dom::SvgNodeKind::Rect(r) => Some(*r),
+                _ => None,
+            })
+            .expect("a rect");
+        assert_eq!((rect.rx, rect.ry), (20.0, 10.0));
+    }
+
+    #[test]
     fn rects_with_negative_size_are_not_drawn() {
         let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
             <rect x="50" y="10" width="-40" height="40" rx="5" fill="red"/>
