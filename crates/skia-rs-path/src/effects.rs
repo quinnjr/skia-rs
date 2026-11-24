@@ -1144,6 +1144,39 @@ fn conic_length(p0: Point, p1: Point, p2: Point, w: Scalar) -> Scalar {
     length
 }
 
+impl DiscreteEffect {
+    /// Adds `from`-`to` split into `segments` jittered points (the last,
+    /// `to` itself, only with `include_end`).
+    fn jitter_line(
+        &self,
+        builder: &mut PathBuilder,
+        from: Point,
+        to: Point,
+        segments: i32,
+        include_end: bool,
+        seed: &mut u32,
+    ) {
+        let last = if include_end { segments } else { segments - 1 };
+        for i in 1..=last {
+            let t = scalar_from_i32(i) / scalar_from_i32(segments);
+            let point = Point::new(
+                crate::measure::lerp(from.x, to.x, t),
+                crate::measure::lerp(from.y, to.y, t),
+            );
+            self.jitter_to(builder, point, seed);
+        }
+    }
+
+    /// Adds a line to `point` moved by a random offset of up to `deviation`.
+    fn jitter_to(&self, builder: &mut PathBuilder, point: Point, seed: &mut u32) {
+        let dx = Self::random(*seed) * self.deviation;
+        *seed = seed.wrapping_add(1);
+        let dy = Self::random(*seed) * self.deviation;
+        *seed = seed.wrapping_add(1);
+        builder.line_to(point.x + dx, point.y + dy);
+    }
+}
+
 impl PathEffect for DiscreteEffect {
     fn apply(&self, path: &Path) -> Option<Path> {
         if path.is_empty() {
@@ -1152,6 +1185,7 @@ impl PathEffect for DiscreteEffect {
 
         let mut builder = PathBuilder::new();
         let mut current_pos = Point::zero();
+        let mut contour_start = Point::zero();
         let mut seed = self.seed;
         // SkDiscretePathEffect caps each contour at kMaxReasonableIterations
         // segments, so a long contour or a tiny segment length cannot
@@ -1172,29 +1206,44 @@ impl PathEffect for DiscreteEffect {
                     seed = seed.wrapping_add(1);
                     builder.move_to(p.x + dx, p.y + dy);
                     current_pos = p;
+                    contour_start = p;
                     contour_budget = MAX_DISCRETE_SEGMENTS;
                 }
                 PathElement::Line(end) => {
                     let length = current_pos.distance(&end);
                     let num_segments =
                         take_segments(ceil_to_i32(length / self.seg_length), &mut contour_budget);
-
-                    for i in 1..=num_segments {
-                        let t = scalar_from_i32(i) / scalar_from_i32(num_segments);
-                        let x = crate::measure::lerp(current_pos.x, end.x, t);
-                        let y = crate::measure::lerp(current_pos.y, end.y, t);
-
-                        let dx = Self::random(seed) * self.deviation;
-                        seed = seed.wrapping_add(1);
-                        let dy = Self::random(seed) * self.deviation;
-                        seed = seed.wrapping_add(1);
-
-                        builder.line_to(x + dx, y + dy);
-                    }
+                    self.jitter_line(
+                        &mut builder,
+                        current_pos,
+                        end,
+                        num_segments,
+                        true,
+                        &mut seed,
+                    );
                     current_pos = end;
                 }
                 PathElement::Close => {
+                    // Skia measures a closed contour with its closing edge,
+                    // so that edge is jittered too: its inner points here,
+                    // the close then joining back to the (jittered) start.
+                    let length = current_pos.distance(&contour_start);
+                    if length > 0.0 {
+                        let num_segments = take_segments(
+                            ceil_to_i32(length / self.seg_length),
+                            &mut contour_budget,
+                        );
+                        self.jitter_line(
+                            &mut builder,
+                            current_pos,
+                            contour_start,
+                            num_segments,
+                            false,
+                            &mut seed,
+                        );
+                    }
                     builder.close();
+                    current_pos = contour_start;
                 }
                 // For curves, subdivide into lines first
                 PathElement::Quad(ctrl, end) => {
@@ -1208,12 +1257,7 @@ impl PathEffect for DiscreteEffect {
                         let t = scalar_from_i32(i) / scalar_from_i32(steps);
                         let p = quadratic_point(current_pos, ctrl, end, t);
 
-                        let dx = Self::random(seed) * self.deviation;
-                        seed = seed.wrapping_add(1);
-                        let dy = Self::random(seed) * self.deviation;
-                        seed = seed.wrapping_add(1);
-
-                        builder.line_to(p.x + dx, p.y + dy);
+                        self.jitter_to(&mut builder, p, &mut seed);
                     }
                     current_pos = end;
                 }
@@ -1228,12 +1272,7 @@ impl PathEffect for DiscreteEffect {
                         let t = scalar_from_i32(i) / scalar_from_i32(steps);
                         let p = conic_eval(current_pos, ctrl, end, w, t);
 
-                        let dx = Self::random(seed) * self.deviation;
-                        seed = seed.wrapping_add(1);
-                        let dy = Self::random(seed) * self.deviation;
-                        seed = seed.wrapping_add(1);
-
-                        builder.line_to(p.x + dx, p.y + dy);
+                        self.jitter_to(&mut builder, p, &mut seed);
                     }
                     current_pos = end;
                 }
@@ -1248,12 +1287,7 @@ impl PathEffect for DiscreteEffect {
                         let t = scalar_from_i32(i) / scalar_from_i32(steps);
                         let p = cubic_point(current_pos, ctrl1, ctrl2, end, t);
 
-                        let dx = Self::random(seed) * self.deviation;
-                        seed = seed.wrapping_add(1);
-                        let dy = Self::random(seed) * self.deviation;
-                        seed = seed.wrapping_add(1);
-
-                        builder.line_to(p.x + dx, p.y + dy);
+                        self.jitter_to(&mut builder, p, &mut seed);
                     }
                     current_pos = end;
                 }
@@ -3174,6 +3208,26 @@ mod tests {
         let mut b = PathBuilder::new();
         b.move_to(-1e7, 50.0).line_to(1e7, 50.0);
         assert!(dash.filter_path(&b.build(), &mut rec).is_none());
+    }
+
+    #[test]
+    fn discrete_jitters_the_closing_edge() {
+        // A closed rect's left side is its implicit closing edge: like the
+        // other three, it is subdivided and jittered (as Skia measures it).
+        let mut b = PathBuilder::new();
+        b.add_rect(&skia_rs_core::Rect::from_xywh(0.0, 0.0, 100.0, 100.0));
+        let out = DiscreteEffect::new(5.0, 3.0, 0)
+            .unwrap()
+            .apply(&b.build())
+            .unwrap();
+        let left_inner: Vec<Point> = out
+            .points()
+            .iter()
+            .copied()
+            .filter(|p| p.x.abs() <= 3.5 && p.y > 10.0 && p.y < 90.0)
+            .collect();
+        assert!(left_inner.len() >= 10, "subdivided: {left_inner:?}");
+        assert!(left_inner.iter().any(|p| p.x != 0.0), "jittered");
     }
 
     #[test]
