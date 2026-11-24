@@ -1215,14 +1215,23 @@ impl DiscreteEffect {
     ) -> Option<Point> {
         let (pos, tangent) = measure.get_pos_tan_in_contour(0, distance)?;
         let scale = rand.next_s_scalar1() * self.deviation;
-        let normal = Point::new(tangent.y, -tangent.x);
-        let length = normal.x.hypot(normal.y);
-        if length > 0.0 {
-            let k = scale / length;
-            Some(Point::new(
-                normal.x.mul_add(k, pos.x),
-                normal.y.mul_add(k, pos.y),
-            ))
+        // SkPoint::setLength scales in double precision, stores the result
+        // as float, and Perterb then adds it to the point (unfused).
+        let (nx, ny) = (f64::from(tangent.y), f64::from(-tangent.x));
+        #[allow(
+            clippy::imprecise_flops,
+            clippy::suboptimal_flops,
+            reason = "SkPoint::setLength computes sqrt(x*x + y*y) unfused"
+        )]
+        let magnitude = (nx * nx + ny * ny).sqrt();
+        if magnitude > 0.0 {
+            let dscale = f64::from(scale) / magnitude;
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "SkPoint::setLength stores its double result as float"
+            )]
+            let (mx, my) = ((nx * dscale) as Scalar, (ny * dscale) as Scalar);
+            Some(Point::new(pos.x + mx, pos.y + my))
         } else {
             Some(pos)
         }
