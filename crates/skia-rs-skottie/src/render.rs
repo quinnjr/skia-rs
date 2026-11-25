@@ -196,16 +196,15 @@ impl<'a> RenderContext<'a> {
         if let Some(mode) = layer
             .matte_mode
             .filter(|m| *m != crate::layers::MatteMode::None)
+            && let Some(source) = resolve_matte_source(layer, siblings)
         {
-            if let Some(source) = resolve_matte_source(layer, siblings) {
-                // Always composite through the matte, even when the source
-                // is not visible at this frame: per sksg::MaskEffect, an
-                // empty mask layer means zero coverage — the consumer is
-                // masked out entirely (or fully shown, for inverted modes)
-                // rather than rendered unmasked.
-                self.render_matte_composite(layer, source, mode, frame, assets, siblings);
-                return;
-            }
+            // Always composite through the matte, even when the source
+            // is not visible at this frame: per sksg::MaskEffect, an
+            // empty mask layer means zero coverage — the consumer is
+            // masked out entirely (or fully shown, for inverted modes)
+            // rather than rendered unmasked.
+            self.render_matte_composite(layer, source, mode, frame, assets, siblings);
+            return;
         }
 
         self.render_layer_content(layer, frame, assets, siblings);
@@ -234,10 +233,10 @@ impl<'a> RenderContext<'a> {
 
         // Apply masks: Add unions, Subtract subtracts, Intersect
         // intersects (see `mask::build_clip`).
-        if layer.has_masks() {
-            if let Some(clip) = mask::build_clip(&layer.masks, frame, self.bounds) {
-                self.clip_path(&clip);
-            }
+        if layer.has_masks()
+            && let Some(clip) = mask::build_clip(&layer.masks, frame, self.bounds)
+        {
+            self.clip_path(&clip);
         }
 
         // Render content
@@ -637,7 +636,8 @@ fn apply_trim(paths: Vec<Path>, trim: &TrimPathShape, frame: Scalar) -> Vec<Path
 /// `inverted`, the *complement* interval (`[0,start] U [stop,1]`) is kept
 /// instead (`SkTrimPathEffect::Mode::kInverted`).
 fn trim_path(path: &Path, start: Scalar, stop: Scalar, inverted: bool) -> Path {
-    if !inverted && start <= 0.0 && stop >= 1.0 {
+    // No effect (SkTrimPathEffect::Make returns null): the source as is.
+    if (!inverted && start <= 0.0 && stop >= 1.0) || (inverted && start >= stop) {
         return path.clone();
     }
     if !inverted && start >= stop {
@@ -647,22 +647,18 @@ fn trim_path(path: &Path, start: Scalar, stop: Scalar, inverted: bool) -> Path {
     let measure = PathMeasure::new(path);
     let len = measure.length();
     if len <= 0.0 {
-        return path.clone();
+        // SkTrimPathEffect adds nothing for a zero-length source (not even a
+        // capped dot), as TrimEffect does.
+        return Path::default();
     }
 
     if inverted {
-        let mut builder = skia_rs_path::PathBuilder::new();
-        if start > 0.0 {
-            if let Some(seg) = measure.get_segment(0.0, start * len) {
-                builder.add_path(&seg);
-            }
-        }
-        if stop < 1.0 {
-            if let Some(seg) = measure.get_segment(stop * len, len) {
-                builder.add_path(&seg);
-            }
-        }
-        builder.build()
+        // SkTrimPathEffect's inverted mode (tail first, closed contours kept
+        // continuous), as Skottie uses it.
+        use skia_rs_path::PathEffect;
+        skia_rs_path::TrimEffect::new(start, stop, skia_rs_path::TrimMode::Inverted)
+            .and_then(|trim| trim.apply(path))
+            .unwrap_or_else(|| path.clone())
     } else {
         measure
             .get_segment(start * len, stop * len)
@@ -673,9 +669,14 @@ fn trim_path(path: &Path, start: Scalar, stop: Scalar, inverted: bool) -> Path {
 /// Apply a stroke's dash pattern (if any) to a path, splitting it into
 /// dash segments via Task 2's `DashEffect`.
 fn apply_dash(path: &Path, stroke: &StrokeShape, frame: Scalar) -> Path {
-    let Some(intervals) = stroke.dash_intervals_at(frame) else {
+    let Some(mut intervals) = stroke.dash_intervals_at(frame) else {
         return path.clone();
     };
+    // Lottie allows an odd dash count; Skottie repeats it to an even one
+    // before SkDashPathEffect::Make, which rejects odd counts.
+    if intervals.len() % 2 == 1 {
+        intervals.extend_from_within(..);
+    }
     let phase = stroke.dash_offset_at(frame);
     skia_rs_path::DashEffect::new(intervals, phase).map_or_else(
         || path.clone(),
@@ -817,6 +818,18 @@ impl Canvas for SkiaCanvas<'_, '_> {
     reason = "tests assert exact keyframe/interpolation output values, not tolerances"
 )]
 mod tests {
+    #[test]
+    fn trimming_a_zero_length_shape_draws_nothing() {
+        let mut b = skia_rs_path::PathBuilder::new();
+        b.move_to(5.0, 5.0).line_to(5.0, 5.0);
+        let dot = b.build();
+        assert!(super::trim_path(&dot, 0.25, 0.75, false).is_empty());
+        assert!(super::trim_path(&dot, 0.25, 0.75, true).is_empty());
+        // A no-op trim keeps it (its cap still draws a dot).
+        assert!(!super::trim_path(&dot, 0.0, 1.0, false).is_empty());
+        assert!(!super::trim_path(&dot, 0.75, 0.25, true).is_empty());
+    }
+
     use super::*;
 
     struct MockCanvas {

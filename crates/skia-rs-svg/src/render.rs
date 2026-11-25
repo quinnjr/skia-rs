@@ -327,7 +327,7 @@ fn dom_has_inline_styles(node: &SvgNode) -> bool {
 /// True when a node draws a single atomic shape and has no descendants —
 /// the condition under which `opacity` can be applied as paint alpha rather
 /// than an offscreen layer (`SkSVGRenderContext::applyOpacity`, kLeaf).
-fn is_leaf_shape(node: &SvgNode) -> bool {
+const fn is_leaf_shape(node: &SvgNode) -> bool {
     node.children.is_empty()
         && matches!(
             node.kind,
@@ -368,16 +368,14 @@ fn render_node(
 
     // clip-path reference applied before drawing the node contents.
     let clip_ref = node.attributes.get("clip-path").cloned();
-    if let Some(href) = clip_ref.as_deref() {
-        if let Some(id) = extract_url_id(href) {
-            if let Some(clip_node) = ctx.lookup(id) {
-                if let SvgNodeKind::ClipPath(_) = &clip_node.kind {
-                    let path = build_clip_path(clip_node);
-                    if !path.is_empty() {
-                        canvas.clip_path(&path, ClipOp::Intersect, true);
-                    }
-                }
-            }
+    if let Some(href) = clip_ref.as_deref()
+        && let Some(id) = extract_url_id(href)
+        && let Some(clip_node) = ctx.lookup(id)
+        && let SvgNodeKind::ClipPath(_) = &clip_node.kind
+    {
+        let path = build_clip_path(clip_node);
+        if !path.is_empty() {
+            canvas.clip_path(&path, ClipOp::Intersect, true);
         }
     }
 
@@ -444,14 +442,17 @@ fn render_node(
     };
 
     match &node.kind {
-        SvgNodeKind::Rect(rect) => {
+        // SVG does not render a rect with a non-positive width or height.
+        SvgNodeKind::Rect(rect) if rect.width > 0.0 && rect.height > 0.0 => {
             let r = Rect::from_xywh(rect.x, rect.y, rect.width, rect.height);
-            if rect.rx > 0.0 || rect.ry > 0.0 {
+            let (rx, ry) = rect_radii(rect);
+            // SkRRect::MakeRectXY: a radius <= 0 gives square corners.
+            if rx > 0.0 && ry > 0.0 {
                 if let Some(paint) = &fill_paint {
-                    canvas.draw_round_rect(&r, rect.rx, rect.ry, paint);
+                    canvas.draw_round_rect(&r, rx, ry, paint);
                 }
                 if let Some(paint) = &stroke_paint {
-                    canvas.draw_round_rect(&r, rect.rx, rect.ry, paint);
+                    canvas.draw_round_rect(&r, rx, ry, paint);
                 }
             } else {
                 if let Some(paint) = &fill_paint {
@@ -487,20 +488,13 @@ fn render_node(
         }
         SvgNodeKind::Line(line) => {
             if let Some(paint) = &stroke_paint {
-                // `draw_line` does not run path effects; route dashed strokes
-                // through a path so stroke-dasharray takes effect.
-                if paint.path_effect().is_some() {
-                    let mut b = PathBuilder::new();
-                    b.move_to(line.x1, line.y1);
-                    b.line_to(line.x2, line.y2);
-                    canvas.draw_path(&b.build(), paint);
-                } else {
-                    canvas.draw_line(
-                        Point::new(line.x1, line.y1),
-                        Point::new(line.x2, line.y2),
-                        paint,
-                    );
-                }
+                // `draw_line` applies the paint's path effect, so
+                // stroke-dasharray needs no special handling here.
+                canvas.draw_line(
+                    Point::new(line.x1, line.y1),
+                    Point::new(line.x2, line.y2),
+                    paint,
+                );
             }
         }
         SvgNodeKind::Polyline(points) => {
@@ -529,7 +523,9 @@ fn render_node(
             }
         }
         SvgNodeKind::Polygon(points) => {
-            if points.len() >= 3 {
+            // Two points still make a closed polygon (SkSVGPoly strokes it
+            // out and back); its fill covers no area.
+            if points.len() >= 2 {
                 let mut builder = PathBuilder::new();
                 builder.move_to(points[0].x, points[0].y);
                 for p in &points[1..] {
@@ -564,10 +560,10 @@ fn render_node(
             render_image(img, canvas, opacity);
         }
         SvgNodeKind::Use(href) => {
-            if depth < MAX_USE_DEPTH {
-                if let Some(referenced) = ctx.lookup(href) {
-                    render_node(referenced, canvas, ctx, &state, depth + 1);
-                }
+            if depth < MAX_USE_DEPTH
+                && let Some(referenced) = ctx.lookup(href)
+            {
+                render_node(referenced, canvas, ctx, &state, depth + 1);
             }
         }
         SvgNodeKind::Group | SvgNodeKind::Svg => {
@@ -575,7 +571,9 @@ fn render_node(
                 render_node(child, canvas, ctx, &state, depth);
             }
         }
-        SvgNodeKind::Defs
+        // (A rect reaching here has a non-positive size: nothing to draw.)
+        SvgNodeKind::Rect(_)
+        | SvgNodeKind::Defs
         | SvgNodeKind::ClipPath(_)
         | SvgNodeKind::LinearGradient(_)
         | SvgNodeKind::RadialGradient(_) => {
@@ -601,7 +599,13 @@ fn render_node(
 /// `None` when dashing is disabled.
 fn build_dash_effect(state: &PresentationState) -> Option<PathEffectRef> {
     let intervals = state.dash_array.as_ref()?;
-    let dash = DashEffect::new(intervals.clone(), state.dash_offset)?;
+    // SVG repeats an odd stroke-dasharray to make it even (as SkSVG does
+    // before SkDashPathEffect::Make, which rejects odd counts).
+    let mut intervals = intervals.clone();
+    if intervals.len() % 2 == 1 {
+        intervals.extend_from_within(..);
+    }
+    let dash = DashEffect::new(intervals, state.dash_offset)?;
     Some(Arc::new(dash) as PathEffectRef)
 }
 
@@ -643,11 +647,19 @@ fn build_clip_path(clip_node: &SvgNode) -> Path {
 fn add_node_geometry(node: &SvgNode, builder: &mut PathBuilder, parent: &Matrix) {
     let m = parent.concat(&node.transform);
     let shape: Option<Path> = match &node.kind {
-        SvgNodeKind::Rect(rect) => {
+        // A rect with a non-positive size adds nothing; otherwise the same
+        // rounded corners as when it is drawn.
+        SvgNodeKind::Rect(rect) => (rect.width > 0.0 && rect.height > 0.0).then(|| {
+            let r = Rect::from_xywh(rect.x, rect.y, rect.width, rect.height);
+            let (rx, ry) = rect_radii(rect);
             let mut b = PathBuilder::new();
-            b.add_rect(&Rect::from_xywh(rect.x, rect.y, rect.width, rect.height));
-            Some(b.build())
-        }
+            if rx > 0.0 && ry > 0.0 {
+                b.add_round_rect(&r, rx, ry);
+            } else {
+                b.add_rect(&r);
+            }
+            b.build()
+        }),
         SvgNodeKind::Circle(c) => {
             let mut b = PathBuilder::new();
             b.add_oval(&Rect::from_xywh(
@@ -1003,6 +1015,15 @@ pub fn render_svg_string(svg: &str, width: i32, height: i32) -> Option<Surface> 
     Some(surface)
 }
 
+/// A rect's corner radii as drawn: each clamped to half the matching side,
+/// as SVG specifies.
+fn rect_radii(rect: &crate::dom::SvgRect) -> (Scalar, Scalar) {
+    (
+        rect.rx.min(rect.width / 2.0),
+        rect.ry.min(rect.height / 2.0),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1025,6 +1046,131 @@ mod tests {
             pixels[off + 1],
             pixels[off + 2],
         ))
+    }
+
+    #[test]
+    fn rect_with_only_rx_rounds_both_radii() {
+        // ry missing is "auto": it takes rx, so the corner is rounded and
+        // the corner pixel keeps the white background.
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="80" height="80" rx="20" fill="red"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = |x: i32, y: i32| pixel_at(&surface, x, y).map_or(0, |c| c.green());
+        assert!(green(11, 11) > 200, "rounded corner left unfilled");
+        assert!(green(50, 50) < 50, "interior filled");
+    }
+
+    #[test]
+    fn rect_radius_auto_keyword_counts_as_missing() {
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="80" height="80" rx="auto" ry="20" fill="red"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = pixel_at(&surface, 11, 11).map_or(0, |c| c.green());
+        assert!(green > 200, "rx=auto takes ry: the corner is rounded");
+    }
+
+    #[test]
+    fn rect_radius_with_a_spaced_unit_counts_as_missing() {
+        // "5 px" is not a length (it would read as 0): rx takes ry.
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="80" height="80" rx="5 px" ry="20" fill="red"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = pixel_at(&surface, 11, 11).map_or(0, |c| c.green());
+        assert!(green > 200, "the corner is rounded");
+    }
+
+    #[test]
+    fn rect_radius_with_a_spaced_percent_is_a_length() {
+        // "5 %" reads as 5% (as width="50 %" does), so rx is given: 5% of
+        // 100 = 5 against ry 20, a corner much less round than auto (20).
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="80" height="80" rx="5 %" ry="20" fill="red"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = pixel_at(&surface, 13, 13).map_or(0, |c| c.green());
+        assert!(green < 50, "rx = 5: (13, 13) is inside the shallow corner");
+    }
+
+    #[test]
+    fn auto_radius_takes_the_other_resolved_radius() {
+        // SkSVGRect's ResolveOptionalRadii: rx="10%" in a 200x100 viewport
+        // resolves on the width (20), and the auto ry takes that value.
+        let svg = r#"<svg width="200" height="100" xmlns="http://www.w3.org/2000/svg">
+            <rect width="150" height="80" rx="10%"/>
+        </svg>"#;
+        let doc = crate::parser::parse_svg(svg).unwrap();
+        let rect = doc
+            .root
+            .children
+            .iter()
+            .find_map(|n| match &n.kind {
+                crate::dom::SvgNodeKind::Rect(r) => Some(*r),
+                _ => None,
+            })
+            .expect("a rect");
+        assert_eq!((rect.rx, rect.ry), (20.0, 20.0));
+    }
+
+    #[test]
+    fn a_negative_rect_radius_gives_square_corners() {
+        // A given negative ry is kept, not auto: SkRRect::MakeRectXY then
+        // draws square corners, so the corner pixel is filled.
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="80" height="80" rx="10" ry="-5" fill="red"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = pixel_at(&surface, 11, 11).map_or(255, |c| c.green());
+        assert!(green < 50, "square corner: (11, 11) is filled");
+    }
+
+    #[test]
+    fn rects_with_negative_size_are_not_drawn() {
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <rect x="50" y="10" width="-40" height="40" rx="5" fill="red"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = pixel_at(&surface, 30, 30).map_or(0, |c| c.green());
+        assert!(green > 200, "nothing drawn");
+    }
+
+    #[test]
+    fn rounded_clip_rects_clip_with_their_corners() {
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <clipPath id="c"><rect width="100" height="100" rx="50"/></clipPath>
+            <rect width="100" height="100" fill="red" clip-path="url(#c)"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = |x: i32, y: i32| pixel_at(&surface, x, y).map_or(0, |c| c.green());
+        assert!(green(3, 3) > 200, "the corner is clipped away");
+        assert!(green(50, 50) < 50, "the middle is drawn");
+    }
+
+    #[test]
+    fn two_point_polygons_are_stroked() {
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <polygon points="10,10 90,90" fill="none" stroke="red" stroke-width="6"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        let green = pixel_at(&surface, 50, 50).map_or(255, |c| c.green());
+        assert!(green < 50, "the diagonal is stroked");
+    }
+
+    #[test]
+    fn odd_stroke_dasharray_repeats_like_svg() {
+        // stroke-dasharray="10" is [10, 10] in SVG: dash 0..10, gap 10..20.
+        let svg = r#"<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+            <line x1="0" y1="50" x2="100" y2="50" stroke="red" stroke-width="4"
+                  stroke-dasharray="10"/>
+        </svg>"#;
+        let surface = render_svg_string(svg, 100, 100).expect("renders");
+        // The background is white: a red dash has no green, a gap keeps it.
+        let green = |x: i32| pixel_at(&surface, x, 50).map_or(0, |c| c.green());
+        assert!(green(5) < 50, "dash at x = 5");
+        assert!(green(15) > 200, "gap at x = 15");
+        assert!(green(25) < 50, "dash at x = 25");
     }
 
     #[test]

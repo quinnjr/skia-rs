@@ -432,10 +432,7 @@ impl Paragraph {
             this.lines.push(line);
             *content_width = 0.0;
             *y += line_height;
-            if max_lines > 0 && this.lines.len() >= max_lines {
-                return true;
-            }
-            false
+            max_lines > 0 && this.lines.len() >= max_lines
         };
 
         for cluster in clusters {
@@ -671,7 +668,7 @@ impl Paragraph {
 
     /// Get the number of lines.
     #[must_use]
-    pub fn line_count(&self) -> usize {
+    pub const fn line_count(&self) -> usize {
         self.lines.len()
     }
 
@@ -926,7 +923,7 @@ mod tests {
     #[test]
     fn test_line_breaker() {
         let breaker = LineBreaker::new("Hello world");
-        assert!(!breaker.breaks().is_empty());
+        assert_ne!(breaker.breaks(), []);
     }
 
     #[test]

@@ -689,12 +689,10 @@ impl Image {
     /// converted via [`skia_rs_core::convert_pixels`] before filtering and
     /// the returned image reports `Rgba8888/Premul`.
     ///
-    /// Multi-input filters (such as [`skia_rs_paint::MergeImageFilter`] and
-    /// [`skia_rs_paint::DisplacementMapImageFilter`]'s displacement input)
-    /// cannot be expressed through the single-buffer `apply(pixels)` API and
-    /// will return the unfiltered copy — the paint crate's filter trait has
-    /// a documented limitation there that will be lifted when the
-    /// multi-input API lands.
+    /// Filters with several inputs (such as
+    /// [`skia_rs_paint::MergeImageFilter`] or
+    /// [`skia_rs_paint::DisplacementMapImageFilter`]) run each input on a copy
+    /// of the image and combine the results.
     ///
     /// Returns `None` if pixel extraction or conversion fails.
     pub fn make_with_filter(&self, filter: &dyn skia_rs_paint::ImageFilter) -> Option<Self> {
@@ -944,6 +942,10 @@ fn resample_linear(
 
                 let top = c00.mul_add(1.0 - tx, c01 * tx);
                 let bot = c10.mul_add(1.0 - tx, c11 * tx);
+                #[allow(
+                    clippy::suboptimal_flops,
+                    reason = "the vertical lerp as originally written (unfused)"
+                )]
                 let v = top * (1.0 - ty) + bot * ty;
 
                 new_pixels[dst_offset + i] = skia_rs_core::cast::f32_to_u8_sat(v);

@@ -13,6 +13,7 @@ const STROKE_FLATTEN_TOLERANCE: Scalar = 0.25;
 
 /// Stroke cap style for stroke-to-fill conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum StrokeCap {
     /// Flat cap - no extension beyond the endpoint.
@@ -26,6 +27,7 @@ pub enum StrokeCap {
 
 /// Stroke join style for stroke-to-fill conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum StrokeJoin {
     /// Miter join - sharp corners.
@@ -199,6 +201,42 @@ fn seg_normal(a: Point, b: Point) -> Point {
     }
 }
 
+/// The offset points wrapping around `vertex` at a 180-degree turn (incoming
+/// normal `n1`, outgoing `n2` = -`n1`): a semicircle for round joins, else
+/// a straight bevel (a miter is past any limit at 180 degrees).
+fn fold_wrap(
+    vertex: Point,
+    n1: Point,
+    n2: Point,
+    half_width: Scalar,
+    join: StrokeJoin,
+) -> Vec<Point> {
+    if join == StrokeJoin::Round {
+        // Sweep from n1 through the incoming direction (n1 turned -90
+        // degrees) to n2 = -n1.
+        let start = n1.y.atan2(n1.x);
+        (0..=8_u8)
+            .map(|k| {
+                let a = start - std::f32::consts::PI * Scalar::from(k) / 8.0;
+                Point::new(
+                    a.cos().mul_add(half_width, vertex.x),
+                    a.sin().mul_add(half_width, vertex.y),
+                )
+            })
+            .collect()
+    } else {
+        vec![
+            Point::new(
+                n1.x.mul_add(half_width, vertex.x),
+                n1.y.mul_add(half_width, vertex.y),
+            ),
+            Point::new(
+                n2.x.mul_add(half_width, vertex.x),
+                n2.y.mul_add(half_width, vertex.y),
+            ),
+        ]
+    }
+}
 /// Append the offset points for the join at `vertex` between incoming normal
 /// `n1` and outgoing normal `n2` to the `left` (+normal) and `right` (-normal)
 /// offset rings.
@@ -215,15 +253,15 @@ fn add_join(
     let avg_len = avg.length();
 
     if avg_len <= 0.001 {
-        // Nearly opposite normals (180-degree turn): use the incoming normal.
-        left.push(Point::new(
-            n1.x.mul_add(half_width, vertex.x),
-            n1.y.mul_add(half_width, vertex.y),
-        ));
-        right.push(Point::new(
-            n1.x.mul_add(-half_width, vertex.x),
-            n1.y.mul_add(-half_width, vertex.y),
-        ));
+        // A 180-degree turn: the stroke wraps around the vertex, as Skia's
+        // joiner draws on the outer side (a semicircle for round joins; a
+        // miter is past any limit here, so it bevels straight across). Both
+        // rings get the wrap, the right one reversed, so a contour folding
+        // back on itself (e.g. a closed two-point polygon) fills instead of
+        // its two rings cancelling.
+        let wrap = fold_wrap(vertex, n1, n2, half_width, params.join);
+        left.extend(wrap.iter().copied());
+        right.extend(wrap.iter().rev().copied());
         return;
     }
 

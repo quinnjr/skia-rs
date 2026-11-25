@@ -4,6 +4,17 @@ use crate::flatten::{flatten_conic_adaptive, flatten_cubic_adaptive, flatten_qua
 use crate::{Path, PathElement};
 use skia_rs_core::{Matrix, Point, Scalar};
 
+/// `a + (b - a) * t`, unfused like Skia's interpolation (`mul_add` rounds
+/// once and differs from Skia in the last bit).
+#[inline]
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "unfused like Skia; mul_add rounds differently"
+)]
+pub(crate) fn lerp(a: Scalar, b: Scalar, t: Scalar) -> Scalar {
+    (b - a) * t + a
+}
+
 /// Tolerance used when flattening curves for length measurement.
 const FLATTEN_TOLERANCE: Scalar = 0.25;
 
@@ -53,7 +64,7 @@ impl PathMeasure {
     /// Get the number of contours.
     #[inline]
     #[must_use]
-    pub fn contour_count(&self) -> usize {
+    pub const fn contour_count(&self) -> usize {
         self.contour_lengths.len()
     }
 
@@ -82,9 +93,60 @@ impl PathMeasure {
             0.0
         };
         Some(Point::new(
-            (seg.end.x - seg.start.x).mul_add(t, seg.start.x),
-            (seg.end.y - seg.start.y).mul_add(t, seg.start.y),
+            lerp(seg.start.x, seg.end.x, t),
+            lerp(seg.start.y, seg.end.y, t),
         ))
+    }
+
+    /// Position and unit tangent at `distance` along contour `index` alone
+    /// (pinned to `[0, contour length]`), like `SkContourMeasure::getPosTan`
+    /// on that contour. `None` for a NaN distance or a missing contour.
+    ///
+    /// # Examples
+    /// ```
+    /// use skia_rs_path::{PathBuilder, PathMeasure};
+    ///
+    /// let mut b = PathBuilder::new();
+    /// b.move_to(0.0, 0.0).line_to(10.0, 0.0); // contour 0
+    /// b.move_to(0.0, 5.0).line_to(0.0, 25.0); // contour 1
+    /// let measure = PathMeasure::new(&b.build());
+    ///
+    /// // Distances are measured within the contour, from its start.
+    /// let (pos, tangent) = measure.get_pos_tan_in_contour(1, 5.0).unwrap();
+    /// assert_eq!((pos.x, pos.y), (0.0, 10.0));
+    /// assert_eq!((tangent.x, tangent.y), (0.0, 1.0));
+    ///
+    /// // Past the end is pinned to it; a missing contour is `None`.
+    /// let (end, _) = measure.get_pos_tan_in_contour(0, 99.0).unwrap();
+    /// assert_eq!((end.x, end.y), (10.0, 0.0));
+    /// assert!(measure.get_pos_tan_in_contour(2, 0.0).is_none());
+    /// ```
+    #[must_use]
+    pub fn get_pos_tan_in_contour(&self, index: usize, distance: Scalar) -> Option<(Point, Point)> {
+        let contour = self.contours.get(index)?;
+        if distance.is_nan() || contour.length <= 0.0 {
+            return None;
+        }
+        let offset = distance.clamp(0.0, contour.length);
+        let seg = Self::segment_at(contour, offset);
+        let seg_start_cum = seg.cumulative - seg.length;
+        let t = if seg.length > 0.0 {
+            ((offset - seg_start_cum) / seg.length).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (dx, dy) = (seg.end.x - seg.start.x, seg.end.y - seg.start.y);
+        let pos = Point::new(
+            lerp(seg.start.x, seg.end.x, t),
+            lerp(seg.start.y, seg.end.y, t),
+        );
+        let len = dx.hypot(dy);
+        let tangent = if len > 0.0 {
+            Point::new(dx / len, dy / len)
+        } else {
+            Point::new(1.0, 0.0)
+        };
+        Some((pos, tangent))
     }
 
     /// Get the tangent (unit direction vector) at a distance along the path.
@@ -183,8 +245,8 @@ impl PathMeasure {
                     1.0
                 };
                 let p = Point::new(
-                    (seg.end.x - seg.start.x).mul_add(t1, seg.start.x),
-                    (seg.end.y - seg.start.y).mul_add(t1, seg.start.y),
+                    lerp(seg.start.x, seg.end.x, t1),
+                    lerp(seg.start.y, seg.end.y, t1),
                 );
                 builder.line_to(p.x, p.y);
             }
@@ -251,12 +313,12 @@ impl PathMeasure {
         for elem in path {
             match elem {
                 PathElement::Move(p) => {
-                    if let Some(c) = current_contour.take() {
-                        if c.length > 0.0 {
-                            self.contour_lengths.push(c.length);
-                            self.total_length += c.length;
-                            self.contours.push(c);
-                        }
+                    if let Some(c) = current_contour.take()
+                        && c.length > 0.0
+                    {
+                        self.contour_lengths.push(c.length);
+                        self.total_length += c.length;
+                        self.contours.push(c);
                     }
                     current_contour = Some(Contour {
                         segments: Vec::new(),
@@ -328,22 +390,22 @@ impl PathMeasure {
                     current_pt = end;
                 }
                 PathElement::Close => {
-                    if let Some(c) = current_contour.as_mut() {
-                        if current_pt != contour_start {
-                            push_segment(c, current_pt, contour_start);
-                        }
+                    if let Some(c) = current_contour.as_mut()
+                        && current_pt != contour_start
+                    {
+                        push_segment(c, current_pt, contour_start);
                     }
                     current_pt = contour_start;
                 }
             }
         }
 
-        if let Some(c) = current_contour.take() {
-            if c.length > 0.0 {
-                self.contour_lengths.push(c.length);
-                self.total_length += c.length;
-                self.contours.push(c);
-            }
+        if let Some(c) = current_contour.take()
+            && c.length > 0.0
+        {
+            self.contour_lengths.push(c.length);
+            self.total_length += c.length;
+            self.contours.push(c);
         }
     }
 }
@@ -357,8 +419,8 @@ fn interpolate_at(contour: &Contour, offset: Scalar) -> Point {
         0.0
     };
     Point::new(
-        (seg.end.x - seg.start.x).mul_add(t, seg.start.x),
-        (seg.end.y - seg.start.y).mul_add(t, seg.start.y),
+        lerp(seg.start.x, seg.end.x, t),
+        lerp(seg.start.y, seg.end.y, t),
     )
 }
 

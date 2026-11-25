@@ -5,7 +5,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/skia-rs-path"
 authors.workspace = true
 rust-version.workspace = true
@@ -16,15 +15,17 @@ readme = "README.md"
 [features]
 default = ["std"]
 std = ["skia-rs-core/std"]
-serde = ["dep:serde", "skia-rs-core/serde"]
+serde = ["dep:serde", "dep:thiserror", "skia-rs-core/serde"]
 
 [dependencies]
 skia-rs-core = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
 geo = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

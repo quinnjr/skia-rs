@@ -633,14 +633,14 @@ impl Font {
         // Glyph 0 (.notdef) is a real glyph: it carries an `hmtx` advance
         // like any other and Skia advances the pen by it (a tofu box takes
         // up space). Do not special-case it to zero.
-        if let Some(data) = self.typeface.font_data() {
-            if let Ok(face) = ttf_parser::Face::parse(data, 0) {
-                let upem = face.units_per_em();
-                if upem > 0 {
-                    if let Some(adv) = face.glyph_hor_advance(ttf_parser::GlyphId(glyph)) {
-                        return Scalar::from(adv) * self.size / Scalar::from(upem) * self.scale_x;
-                    }
-                }
+        if let Some(data) = self.typeface.font_data()
+            && let Ok(face) = ttf_parser::Face::parse(data, 0)
+        {
+            let upem = face.units_per_em();
+            if upem > 0
+                && let Some(adv) = face.glyph_hor_advance(ttf_parser::GlyphId(glyph))
+            {
+                return Scalar::from(adv) * self.size / Scalar::from(upem) * self.scale_x;
             }
         }
         self.size * 0.5 * self.scale_x
@@ -666,22 +666,22 @@ impl Font {
     pub fn glyph_bounds(&self, glyph: u16) -> skia_rs_core::Rect {
         // Glyph 0 (.notdef) has a real outline (the tofu box) and real
         // bounds; treat it like any other glyph.
-        if let Some(data) = self.typeface.font_data() {
-            if let Ok(face) = ttf_parser::Face::parse(data, 0) {
-                let upem = face.units_per_em();
-                if upem > 0 {
-                    if let Some(bbox) = face.glyph_bounding_box(ttf_parser::GlyphId(glyph)) {
-                        let scale = self.size / Scalar::from(upem);
-                        let left = Scalar::from(bbox.x_min) * scale * self.scale_x;
-                        let right = Scalar::from(bbox.x_max) * scale * self.scale_x;
-                        let top = -Scalar::from(bbox.y_max) * scale;
-                        let bottom = -Scalar::from(bbox.y_min) * scale;
-                        return skia_rs_core::Rect::new(left, top, right, bottom);
-                    }
-                    // No outline — still report a zero-sized rect rather
-                    // than the old ascent×descent approximation.
-                    return skia_rs_core::Rect::EMPTY;
+        if let Some(data) = self.typeface.font_data()
+            && let Ok(face) = ttf_parser::Face::parse(data, 0)
+        {
+            let upem = face.units_per_em();
+            if upem > 0 {
+                if let Some(bbox) = face.glyph_bounding_box(ttf_parser::GlyphId(glyph)) {
+                    let scale = self.size / Scalar::from(upem);
+                    let left = Scalar::from(bbox.x_min) * scale * self.scale_x;
+                    let right = Scalar::from(bbox.x_max) * scale * self.scale_x;
+                    let top = -Scalar::from(bbox.y_max) * scale;
+                    let bottom = -Scalar::from(bbox.y_min) * scale;
+                    return skia_rs_core::Rect::new(left, top, right, bottom);
                 }
+                // No outline — still report a zero-sized rect rather
+                // than the old ascent×descent approximation.
+                return skia_rs_core::Rect::EMPTY;
             }
         }
 
@@ -1155,7 +1155,7 @@ fn path_band_intercepts(path: &skia_rs_path::Path, y_top: Scalar, y_bottom: Scal
     // segment endpoints that lie inside the band together with
     // intersections with each band edge. A conservative bound is to use
     // every segment that touches the band and emit its min/max x.
-    let mut xs: Vec<Scalar> = Vec::new();
+    let mut intervals: Vec<(Scalar, Scalar)> = Vec::new();
     for &(a, b) in &segments {
         let seg_top = a.y.min(b.y);
         let seg_bot = a.y.max(b.y);
@@ -1185,24 +1185,24 @@ fn path_band_intercepts(path: &skia_rs_path::Path, y_top: Scalar, y_bottom: Scal
         }
         let x0 = (b.x - a.x).mul_add(t0, a.x);
         let x1 = (b.x - a.x).mul_add(t1, a.x);
-        xs.push(x0.min(x1));
-        xs.push(x0.max(x1));
+        intervals.push((x0.min(x1), x0.max(x1)));
     }
 
-    if xs.is_empty() {
-        return xs;
+    if intervals.is_empty() {
+        return Vec::new();
     }
 
     // Merge into non-overlapping intervals so callers can consume them
     // as [enter_1, exit_1, enter_2, exit_2, …] pairs. Each pair of
-    // xs[2k], xs[2k+1] represents a contiguous range of x where the
-    // outline occupies the band.
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mut merged: Vec<Scalar> = Vec::with_capacity(xs.len());
-    let mut iter = xs.chunks_exact(2);
+    // merged[2k], merged[2k+1] represents a contiguous range of x where
+    // the outline occupies the band. Intervals are sorted by their start
+    // and kept as pairs: sorting the flat endpoint list instead would
+    // re-pair endpoints of different intervals and open false gaps inside
+    // overlapping ranges (e.g. [0,10] and [2,3] became (0,2), (3,10)).
+    intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<Scalar> = Vec::with_capacity(intervals.len() * 2);
     let mut cur: Option<(Scalar, Scalar)> = None;
-    for pair in &mut iter {
-        let (lo, hi) = (pair[0], pair[1]);
+    for (lo, hi) in intervals {
         cur = match cur {
             Some((a, b)) if lo <= b + tolerance => Some((a, b.max(hi))),
             Some((a, b)) => {
@@ -1226,6 +1226,11 @@ fn path_band_intercepts(path: &skia_rs_path::Path, y_top: Scalar, y_bottom: Scal
 #[allow(
     clippy::similar_names,
     reason = "midx/midy are the natural names for a chord midpoint's x/y in curve-flattening math"
+)]
+#[allow(
+    clippy::suboptimal_flops,
+    clippy::manual_midpoint,
+    reason = "de Casteljau subdivision as Skia writes it: (a + b) * 0.5 and unfused products, so flattening matches Skia's rounding"
 )]
 fn flatten_quad(
     p0: skia_rs_core::Point,
@@ -1254,6 +1259,11 @@ fn flatten_quad(
 }
 
 /// Recursively subdivide a cubic bezier into chord approximations.
+#[allow(
+    clippy::suboptimal_flops,
+    clippy::manual_midpoint,
+    reason = "de Casteljau subdivision as Skia writes it: (a + b) * 0.5 and unfused products, so flattening matches Skia's rounding"
+)]
 fn flatten_cubic(
     p0: skia_rs_core::Point,
     p1: skia_rs_core::Point,
@@ -2073,6 +2083,32 @@ impl<'a> ttf_parser::colr::Painter<'a> for ColorLayerWalker {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn band_intercepts_merge_overlapping_intervals_without_false_gaps() {
+        // Two edges crossing the band [0, 10]: one spans x in [0, 10], the
+        // other x in [2, 3] (contained). Sorting the flat endpoint list used
+        // to re-pair them as (0, 2) and (3, 10), opening a false gap at 2..3.
+        let mut b = skia_rs_path::PathBuilder::new();
+        b.move_to(0.0, 0.0).line_to(10.0, 10.0);
+        b.move_to(2.0, 0.0).line_to(3.0, 10.0);
+        let path = b.build();
+
+        assert_eq!(path_band_intercepts(&path, 0.0, 10.0), vec![0.0, 10.0]);
+    }
+
+    #[test]
+    fn band_intercepts_keep_disjoint_intervals_separate() {
+        let mut b = skia_rs_path::PathBuilder::new();
+        b.move_to(0.0, 0.0).line_to(1.0, 10.0);
+        b.move_to(5.0, 0.0).line_to(6.0, 10.0);
+        let path = b.build();
+
+        assert_eq!(
+            path_band_intercepts(&path, 0.0, 10.0),
+            vec![0.0, 1.0, 5.0, 6.0]
+        );
+    }
 
     #[test]
     fn test_font_default() {

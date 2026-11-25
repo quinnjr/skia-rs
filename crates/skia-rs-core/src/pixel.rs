@@ -55,6 +55,11 @@ pub enum PixelError {
 ///
 /// Equivalent to Skia's `SkImageInfo`.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "ImageInfoData")
+)]
 pub struct ImageInfo {
     /// Image dimensions.
     pub dimensions: ISize,
@@ -64,6 +69,53 @@ pub struct ImageInfo {
     pub alpha_type: AlphaType,
     /// Color space (optional).
     pub color_space: Option<ColorSpace>,
+}
+
+/// The serialized fields of an [`ImageInfo`], validated through
+/// [`ImageInfo::new`] when deserializing (negative dimensions are rejected).
+///
+/// Deserializing is stricter than `ImageInfo::new` (which, like
+/// `SkImageInfo::Make`, does not bound sizes): it also enforces
+/// `SkImageInfo`'s `kMaxDimension` and a byte size that fits `isize`, so
+/// untrusted data cannot overflow the size computations. An info built
+/// past those limits serializes but does not load back.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct ImageInfoData {
+    dimensions: ISize,
+    color_type: ColorType,
+    alpha_type: AlphaType,
+    color_space: Option<ColorSpace>,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<ImageInfoData> for ImageInfo {
+    type Error = PixelError;
+
+    fn try_from(data: ImageInfoData) -> Result<Self, Self::Error> {
+        // SkImageInfo's validity limit (kMaxDimension = SK_MaxS32 >> 2), and
+        // a byte size that fits, so min_row_bytes / compute_byte_size
+        // cannot overflow on untrusted input.
+        const MAX_DIMENSION: i32 = i32::MAX >> 2;
+        let (width, height) = (data.dimensions.width, data.dimensions.height);
+        let bpp = data.color_type.bytes_per_pixel();
+        let bytes = usize::try_from(width.max(0))
+            .ok()
+            .and_then(|w| w.checked_mul(bpp))
+            .and_then(|row| row.checked_mul(usize::try_from(height.max(0)).ok()?))
+            .filter(|&total| isize::try_from(total).is_ok());
+        if width > MAX_DIMENSION || height > MAX_DIMENSION || bytes.is_none() {
+            return Err(PixelError::InvalidDimensions { width, height });
+        }
+        let mut info = Self::new(
+            data.dimensions.width,
+            data.dimensions.height,
+            data.color_type,
+            data.alpha_type,
+        )?;
+        info.color_space = data.color_space;
+        Ok(info)
+    }
 }
 
 impl ImageInfo {
@@ -557,7 +609,7 @@ impl Bitmap {
     /// Returns true if the bitmap has no pixels.
     #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.pixels.is_empty()
     }
 
@@ -622,6 +674,7 @@ impl Default for Bitmap {
 bitflags! {
     /// Surface properties flags.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     pub struct SurfacePropsFlags: u32 {
         /// Use device-independent fonts.
         const USE_DEVICE_INDEPENDENT_FONTS = 1 << 0;
@@ -630,6 +683,7 @@ bitflags! {
 
 /// Pixel geometry for LCD text rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum PixelGeometry {
     /// Unknown pixel geometry.
@@ -647,6 +701,7 @@ pub enum PixelGeometry {
 
 /// Properties of a surface (for text rendering hints).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SurfaceProps {
     /// Flags.
     pub flags: SurfacePropsFlags,
@@ -863,7 +918,11 @@ fn convert_row(
 
         // Gray8 -> RGBA8888
         (Gray8, Rgba8888) => {
-            for (&gray, out) in src.iter().zip(dst.chunks_exact_mut(4)).take(width) {
+            for (&gray, out) in src
+                .iter()
+                .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                .take(width)
+            {
                 out[0] = gray;
                 out[1] = gray;
                 out[2] = gray;
@@ -873,7 +932,13 @@ fn convert_row(
 
         // RGBA8888 -> Gray8 (luminance)
         (Rgba8888, Gray8) => {
-            for (chunk, out) in src.chunks_exact(4).zip(dst.iter_mut()).take(width) {
+            for (chunk, out) in src
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(dst.iter_mut())
+                .take(width)
+            {
                 let r = f32::from(chunk[0]);
                 let g = f32::from(chunk[1]);
                 let b = f32::from(chunk[2]);
@@ -885,7 +950,11 @@ fn convert_row(
 
         // Alpha8 -> RGBA8888 (white with alpha)
         (Alpha8, Rgba8888) => {
-            for (&alpha, out) in src.iter().zip(dst.chunks_exact_mut(4)).take(width) {
+            for (&alpha, out) in src
+                .iter()
+                .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                .take(width)
+            {
                 out[0] = 255;
                 out[1] = 255;
                 out[2] = 255;
@@ -1417,7 +1486,7 @@ fn unpremultiply_in_place_f32(row: &mut [u8], width: usize) {
 /// RGBA and BGRA formats.
 #[inline]
 pub fn swizzle_rb_in_place(pixels: &mut [u8]) {
-    for chunk in pixels.chunks_exact_mut(4) {
+    for chunk in pixels.as_chunks_mut::<4>().0 {
         chunk.swap(0, 2);
     }
 }
@@ -1427,7 +1496,7 @@ pub fn swizzle_rb_in_place(pixels: &mut [u8]) {
 /// Uses Skia's rounded `SkUnPreMultiply::ApplyScale` semantics (round to
 /// nearest), matching the rounding already used by `premultiply_in_place`.
 pub fn unpremultiply_in_place(pixels: &mut [u8]) {
-    for chunk in pixels.chunks_exact_mut(4) {
+    for chunk in pixels.as_chunks_mut::<4>().0 {
         let a = chunk[3];
         if a == 0 {
             chunk[0] = 0;
@@ -1447,7 +1516,7 @@ pub fn unpremultiply_in_place(pixels: &mut [u8]) {
 /// Uses Skia's rounded `SkMulDiv255Round` semantics (round to nearest), so
 /// e.g. `r=3, a=128` yields 2, not 1.
 pub fn premultiply_in_place(pixels: &mut [u8]) {
-    for chunk in pixels.chunks_exact_mut(4) {
+    for chunk in pixels.as_chunks_mut::<4>().0 {
         let a = u32::from(chunk[3]);
         if a == 0 {
             chunk[0] = 0;

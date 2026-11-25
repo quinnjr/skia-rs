@@ -46,12 +46,18 @@ fn text_rendering_main() {
     // Clear with a light background
     canvas.clear(Color::from_rgb(250, 250, 252));
 
-    // Create a default typeface
-    let typeface = Arc::new(Typeface::default_typeface());
+    // Load the platform's default sans-serif font. `Typeface::default_typeface()`
+    // is a data-less placeholder that measures text but draws no glyphs, so
+    // only fall back to it when no system font is installed.
+    let typeface = Arc::new(Typeface::system_default().unwrap_or_else(|| {
+        eprintln!("warning: no system sans-serif font found; text will be measured but not drawn");
+        Typeface::default_typeface()
+    }));
+    println!("Using typeface: {}", typeface.family_name());
 
     // Title
     {
-        let font = Font::new(typeface, 48.0);
+        let font = Font::new(Arc::clone(&typeface), 48.0);
         let mut paint = Paint::new();
         paint.set_anti_alias(true);
         paint.set_color32(Color::from_rgb(30, 30, 50));
@@ -65,7 +71,7 @@ fn text_rendering_main() {
 
     // Subtitle
     {
-        let font = Font::from_size(24.0);
+        let font = Font::new(Arc::clone(&typeface), 24.0);
         let mut paint = Paint::new();
         paint.set_anti_alias(true);
         paint.set_color32(Color::from_rgb(100, 100, 120));
@@ -86,7 +92,7 @@ fn text_rendering_main() {
         let mut y = 180.0;
 
         for size in sizes {
-            let font = Font::from_size(size);
+            let font = Font::new(Arc::clone(&typeface), size);
             paint.set_color32(Color::from_rgb(50, 50, 70));
 
             let text = format!("Font size: {size:.0}pt - The quick brown fox jumps");
@@ -100,7 +106,7 @@ fn text_rendering_main() {
 
     // Colored text
     {
-        let font = Font::from_size(28.0);
+        let font = Font::new(Arc::clone(&typeface), 28.0);
         let mut paint = Paint::new();
         paint.set_anti_alias(true);
         paint.set_style(Style::Fill);
@@ -127,7 +133,7 @@ fn text_rendering_main() {
 
     // Bold emulation (using embolden)
     {
-        let mut font = Font::from_size(24.0);
+        let mut font = Font::new(Arc::clone(&typeface), 24.0);
         font.set_embolden(true);
         let mut paint = Paint::new();
         paint.set_anti_alias(true);
@@ -141,7 +147,7 @@ fn text_rendering_main() {
 
     // Text with background box
     {
-        let font = Font::from_size(20.0);
+        let font = Font::new(Arc::clone(&typeface), 20.0);
 
         // Draw background box
         let mut bg_paint = Paint::new();
@@ -170,14 +176,22 @@ fn text_rendering_main() {
     {
         let mut builder = TextBlobBuilder::new();
 
-        let normal_font = Font::from_size(22.0);
-        let mut bold_font = Font::from_size(22.0);
+        let normal_font = Font::new(Arc::clone(&typeface), 22.0);
+        let mut bold_font = Font::new(Arc::clone(&typeface), 22.0);
         bold_font.set_embolden(true);
 
         // Add runs to the builder
-        builder.add_text("Normal text ", &normal_font, Point::new(0.0, 0.0));
-        builder.add_text("BOLD ", &bold_font, Point::new(130.0, 0.0));
-        builder.add_text("inline.", &normal_font, Point::new(200.0, 0.0));
+        // Lay the runs out end to end using their measured advances.
+        let runs = [
+            ("Normal text ", &normal_font),
+            ("BOLD ", &bold_font),
+            ("inline.", &normal_font),
+        ];
+        let mut x = 0.0;
+        for (text, font) in runs {
+            builder.add_text(text, font, Point::new(x, 0.0));
+            x += font.measure_text(text);
+        }
 
         if let Some(blob) = builder.build() {
             let mut paint = Paint::new();
@@ -192,17 +206,17 @@ fn text_rendering_main() {
 
     // Footer
     {
-        let small_font = Font::from_size(14.0);
+        let small_font = Font::new(Arc::clone(&typeface), 14.0);
         let mut paint = Paint::new();
         paint.set_anti_alias(true);
         paint.set_color32(Color::from_rgb(150, 150, 160));
         paint.set_style(Style::Fill);
 
-        let blob = TextBlob::from_text(
-            "skia-rs v0.1.0 - Pure Rust 2D Graphics",
-            &small_font,
-            Point::zero(),
+        let footer = format!(
+            "skia-rs v{} - Pure Rust 2D Graphics",
+            env!("CARGO_PKG_VERSION")
         );
+        let blob = TextBlob::from_text(&footer, &small_font, Point::zero());
         canvas.draw_text_blob(&blob, 50.0, 590.0, &paint);
     }
 

@@ -479,20 +479,20 @@ impl<'a> PdfCanvas<'a> {
         // emitted (see `PdfFontManager::register_truetype_cid` and
         // `PdfDocument::write_to`) even though live text can't yet be
         // drawn through it.
-        if let Some(font) = self.fonts.get(font_idx) {
-            if matches!(
+        if let Some(font) = self.fonts.get(font_idx)
+            && matches!(
                 font.font_type,
                 PdfFontType::Type0 | PdfFontType::OpenTypeCff
-            ) {
-                return Err(PdfError::Unsupported(format!(
-                    "draw_text_with_font: font {font_idx} is a Type0/CID font (registered via \
+            )
+        {
+            return Err(PdfError::Unsupported(format!(
+                "draw_text_with_font: font {font_idx} is a Type0/CID font (registered via \
                      register_truetype_cid, encoded /Identity-H); live per-glyph CID text \
                      drawing is not yet implemented, so drawing through this font would \
                      silently emit invalid 1-byte codes against a 2-byte CID encoding. \
                      Register the text as a simple TrueType font \
                      (PdfFontManager::register_truetype) instead."
-                )));
-            }
+            )));
         }
 
         self.used_fonts.insert(font_idx);
@@ -996,7 +996,7 @@ mod tests {
             canvas.finish()
         };
 
-        assert!(!page.used_ext_gstates.is_empty());
+        assert_ne!(page.used_ext_gstates, [] as [usize; 0]);
         let content = String::from_utf8(page.content).unwrap();
         assert!(
             content.contains("/GS1 gs"),

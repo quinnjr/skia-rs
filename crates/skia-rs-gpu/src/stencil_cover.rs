@@ -3,6 +3,11 @@
 //! This module implements the stencil-then-cover technique for GPU rendering
 //! of complex paths with correct winding rule handling.
 
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+
 use crate::tessellation::{TessIndex, TessMesh, TessVertex};
 use skia_rs_core::cast::scalar_from_i32;
 use skia_rs_core::{Point, Rect, Scalar};
@@ -262,10 +267,10 @@ fn tessellate_path_for_stencil(path: &Path) -> TessMesh {
     // must contribute to the stencil winding count.
     let close_contour =
         |mesh: &mut TessMesh, prev: &mut Option<TessIndex>, start: &mut Option<TessIndex>| {
-            if let (Some(last), Some(first)) = (*prev, *start) {
-                if last != first {
-                    mesh.add_triangle(origin_idx, last, first);
-                }
+            if let (Some(last), Some(first)) = (*prev, *start)
+                && last != first
+            {
+                mesh.add_triangle(origin_idx, last, first);
             }
             *prev = None;
             *start = None;

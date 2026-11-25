@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Path fill type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum FillType {
     /// Non-zero winding rule.
@@ -43,6 +44,7 @@ impl FillType {
 
 /// Path verb (command type).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum Verb {
     /// Move to a point.
@@ -75,6 +77,7 @@ impl Verb {
 
 /// Path direction (clockwise or counter-clockwise).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum PathDirection {
     /// Clockwise direction.
@@ -86,6 +89,7 @@ pub enum PathDirection {
 
 /// Path convexity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum PathConvexity {
     /// Unknown convexity.
@@ -366,8 +370,7 @@ impl Path {
         }
 
         let bounds = self.bounds();
-        let cx = f32::midpoint(bounds.left, bounds.right);
-        let cy = f32::midpoint(bounds.top, bounds.bottom);
+        let Point { x: cx, y: cy } = bounds.center();
         if bounds.right - bounds.left <= 0.0 || bounds.bottom - bounds.top <= 0.0 {
             return false;
         }
@@ -1568,6 +1571,7 @@ mod convex {
 
 /// A path element from iteration.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PathElement {
     /// Move to point.
     Move(Point),

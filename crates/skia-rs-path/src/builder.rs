@@ -1,15 +1,16 @@
 //! Path builder for constructing paths.
 
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+
 use crate::{FillType, Path, Verb};
 use skia_rs_core::cast::{ceil_to_i32, scalar_from_i32};
 use skia_rs_core::{Point, Rect, Scalar};
 
 /// sqrt(2)/2, the conic weight for a 90-degree circular arc.
 const OVAL_CONIC_WEIGHT: Scalar = std::f32::consts::FRAC_1_SQRT_2;
-
-/// Cubic-bezier control-point factor approximating a circular arc with a
-/// rounded-rect corner radius (Skia's `SK_ScalarRoot2Over2` derived constant).
-const ROUND_RECT_KAPPA: Scalar = 0.552_284_8;
 
 /// Builder for constructing paths.
 #[derive(Debug, Clone, Default)]
@@ -84,7 +85,16 @@ impl PathBuilder {
     }
 
     /// Conic curve (weighted quadratic).
+    ///
+    /// Like `SkPath::conicTo`, unusable weights degrade to lines: a weight
+    /// that is not positive (or is NaN) adds a line to the end point, an
+    /// infinite weight adds lines through the control point, and a weight
+    /// of exactly 1 adds a quad.
     #[inline]
+    #[allow(
+        clippy::float_cmp,
+        reason = "SkPath::conicTo tests for exactly 1 (a plain quad)"
+    )]
     pub fn conic_to(
         &mut self,
         x1: Scalar,
@@ -93,6 +103,16 @@ impl PathBuilder {
         y2: Scalar,
         w: Scalar,
     ) -> &mut Self {
+        if w.is_nan() || w <= 0.0 {
+            return self.line_to(x2, y2);
+        }
+        if !w.is_finite() {
+            self.line_to(x1, y1);
+            return self.line_to(x2, y2);
+        }
+        if w == 1.0 {
+            return self.quad_to(x1, y1, x2, y2);
+        }
         self.ensure_move();
         self.path.verbs.push(Verb::Conic);
         self.path.points.push(Point::new(x1, y1));
@@ -127,10 +147,10 @@ impl PathBuilder {
     /// A repeated `close()` is a no-op (upstream `SkPathBuilder::close`).
     #[inline]
     pub fn close(&mut self) -> &mut Self {
-        if let Some(&last) = self.path.verbs.last() {
-            if last != Verb::Close {
-                self.path.verbs.push(Verb::Close);
-            }
+        if let Some(&last) = self.path.verbs.last()
+            && last != Verb::Close
+        {
+            self.path.verbs.push(Verb::Close);
         }
         self
     }
@@ -173,55 +193,91 @@ impl PathBuilder {
         ))
     }
 
-    /// Add a rounded rectangle.
+    /// Add a rounded rectangle, like Skia's
+    /// `SkPath::addRoundRect(rect, rx, ry, SkPathDirection::kCW)`:
+    /// `SkRRect::setRectXY` followed by `addRRect` with its default start
+    /// index 6.
+    ///
+    /// - Negative radii add nothing.
+    /// - Non-finite radii are treated as zero.
+    /// - Radii larger than half the rect are scaled down together, clamped
+    ///   to the half-dimensions, and kept circular if they were equal.
+    /// - With zero radii (or an empty rect) the result is a rectangle
+    ///   starting at the bottom-left corner (`addRect` start index 3).
+    /// - When the radii cover the whole rect the result is an oval starting
+    ///   at the left-middle point (`addOval` start index 3).
+    /// - Otherwise the contour starts at `(left, bottom - ry)`.
+    ///
+    /// All contours run clockwise and corners are exact quarter-ellipse
+    /// conics (weight `sqrt(2)/2`), so dashes and trims line up with Skia.
     pub fn add_round_rect(&mut self, rect: &Rect, rx: Scalar, ry: Scalar) -> &mut Self {
-        if rx <= 0.0 || ry <= 0.0 {
-            return self.add_rect(rect);
+        const W: Scalar = std::f32::consts::FRAC_1_SQRT_2;
+
+        if rx < 0.0 || ry < 0.0 {
+            return self;
         }
 
-        let rx = rx.min(rect.width() / 2.0);
-        let ry = ry.min(rect.height() / 2.0);
+        // SkRRect::setRectXY: initializeRect turns a non-finite rect into the
+        // empty rrect at the origin; otherwise it works on the sorted rect.
+        let finite = [rect.left, rect.top, rect.right, rect.bottom]
+            .iter()
+            .all(|v| v.is_finite());
+        let rect = if finite { *rect } else { Rect::EMPTY };
+        let (l, r) = (rect.left.min(rect.right), rect.left.max(rect.right));
+        let (t, b) = (rect.top.min(rect.bottom), rect.top.max(rect.bottom));
+        let (width, height) = (r - l, b - t);
+        let (half_w, half_h) = (f32::midpoint(-l, r), f32::midpoint(-t, b));
+        let (mut rx, mut ry) = if rx.is_finite() && ry.is_finite() {
+            (rx, ry)
+        } else {
+            (0.0, 0.0)
+        };
+        #[allow(
+            clippy::float_cmp,
+            reason = "SkRRect::setRectXY's exact wasCircular test"
+        )]
+        let was_circular = rx == ry;
+        if width < rx + rx || height < ry + ry {
+            let scale = (width / (rx + rx)).min(height / (ry + ry));
+            rx = (rx * scale).min(half_w);
+            ry = (ry * scale).min(half_h);
+            if was_circular {
+                rx = rx.min(ry);
+                ry = rx;
+            }
+        }
 
-        let kx = rx * ROUND_RECT_KAPPA;
-        let ky = ry * ROUND_RECT_KAPPA;
+        if rx <= 0.0 || ry <= 0.0 || width <= 0.0 || height <= 0.0 {
+            // Rect-type rrect: addRect with start index (6 + 1) / 2 = 3.
+            return self
+                .move_to(l, b)
+                .line_to(l, t)
+                .line_to(r, t)
+                .line_to(r, b)
+                .close();
+        }
 
-        self.move_to(rect.left + rx, rect.top)
-            .line_to(rect.right - rx, rect.top)
-            .cubic_to(
-                rect.right - rx + kx,
-                rect.top,
-                rect.right,
-                rect.top + ry - ky,
-                rect.right,
-                rect.top + ry,
-            )
-            .line_to(rect.right, rect.bottom - ry)
-            .cubic_to(
-                rect.right,
-                rect.bottom - ry + ky,
-                rect.right - rx + kx,
-                rect.bottom,
-                rect.right - rx,
-                rect.bottom,
-            )
-            .line_to(rect.left + rx, rect.bottom)
-            .cubic_to(
-                rect.left + rx - kx,
-                rect.bottom,
-                rect.left,
-                rect.bottom - ry + ky,
-                rect.left,
-                rect.bottom - ry,
-            )
-            .line_to(rect.left, rect.top + ry)
-            .cubic_to(
-                rect.left,
-                rect.top + ry - ky,
-                rect.left + rx - kx,
-                rect.top,
-                rect.left + rx,
-                rect.top,
-            )
+        if rx >= half_w && ry >= half_h {
+            // Oval-type rrect: addOval with start index 6 / 2 = 3.
+            let (cx, cy) = (f32::midpoint(l, r), f32::midpoint(t, b));
+            return self
+                .move_to(l, cy)
+                .conic_to(l, t, cx, t, W)
+                .conic_to(r, t, r, cy, W)
+                .conic_to(r, b, cx, b, W)
+                .conic_to(l, b, l, cy, W)
+                .close();
+        }
+
+        self.move_to(l, b - ry)
+            .line_to(l, t + ry)
+            .conic_to(l, t, l + rx, t, W)
+            .line_to(r - rx, t)
+            .conic_to(r, t, r, t + ry, W)
+            .line_to(r, b - ry)
+            .conic_to(r, b, r - rx, b, W)
+            .line_to(l + rx, b)
+            .conic_to(l, b, l, b - ry, W)
             .close()
     }
 
@@ -420,10 +476,10 @@ impl PathBuilder {
     /// After a `close()`, the current point returns to the subpath's initial
     /// (last move) point, matching Skia's `case 'Z': c = first`.
     pub fn current_point(&self) -> Point {
-        if self.path.verbs.last() == Some(&Verb::Close) {
-            if let Some(mv) = self.last_move {
-                return mv;
-            }
+        if self.path.verbs.last() == Some(&Verb::Close)
+            && let Some(mv) = self.last_move
+        {
+            return mv;
         }
         self.path.points.last().copied().unwrap_or(Point::zero())
     }
@@ -552,7 +608,14 @@ impl PathBuilder {
     ) {
         // Based on W3C SVG arc implementation notes
         let phi_rad = phi.to_radians();
-        let (sin_phi, cos_phi) = phi_rad.sin_cos();
+        // The same (snapped) sin/cos as the rotation applied below, like
+        // SkPath::arcTo's single setRotate matrix: mixing snapped and
+        // unsnapped values misses the endpoint for tiny rotations.
+        let rotation = skia_rs_core::Matrix::rotate(phi_rad);
+        let (sin_phi, cos_phi) = (
+            rotation.values[skia_rs_core::Matrix::SKEW_Y],
+            rotation.values[skia_rs_core::Matrix::SCALE_X],
+        );
 
         // Step 1: Compute (x1', y1')
         let dx = (x1 - x2) / 2.0;
@@ -626,8 +689,162 @@ fn angle_between(ux: Scalar, uy: Scalar, vx: Scalar, vy: Scalar) -> Scalar {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn svg_arcs_with_tiny_rotations_end_at_their_endpoint() {
+        // The ellipse center and the emitted rotation must use the same
+        // (snapped) sin/cos, as SkPath::arcTo's single matrix does.
+        let mut b = super::PathBuilder::new();
+        b.move_to(0.0, 0.0)
+            .arc_to(10_000.0, 5_000.0, 0.01, false, true, 3_000.0, 1_000.0);
+        let path = b.build();
+        let last = *path.points().last().unwrap();
+        assert!(
+            (last.x - 3_000.0).abs() < 0.05 && (last.y - 1_000.0).abs() < 0.05,
+            "ends at {last:?}"
+        );
+    }
+
     use super::*;
-    use crate::Verb;
+    use crate::{PathElement, Verb};
+
+    #[test]
+    fn conic_to_degrades_unusable_weights_like_skia() {
+        let verbs = |w: Scalar| {
+            let mut b = PathBuilder::new();
+            b.move_to(0.0, 0.0).conic_to(50.0, 0.0, 100.0, 100.0, w);
+            b.build().verbs().to_vec()
+        };
+        // SkPath::conicTo: !(w > 0) -> lineTo(end); infinite -> two lines;
+        // exactly 1 -> quadTo; anything else stays a conic.
+        assert_eq!(verbs(-1.0), [Verb::Move, Verb::Line]);
+        assert_eq!(verbs(0.0), [Verb::Move, Verb::Line]);
+        assert_eq!(verbs(Scalar::NAN), [Verb::Move, Verb::Line]);
+        assert_eq!(
+            verbs(Scalar::INFINITY),
+            [Verb::Move, Verb::Line, Verb::Line]
+        );
+        assert_eq!(verbs(1.0), [Verb::Move, Verb::Quad]);
+        assert_eq!(verbs(0.5), [Verb::Move, Verb::Conic]);
+    }
+
+    #[test]
+    fn add_round_rect_matches_skia_add_rrect_contour() {
+        // SkPath::addRRect(rrect, kCW) starts at index 6, (left, bottom - ry),
+        // runs up the left edge, and alternates line / conic corner.
+        let mut b = PathBuilder::new();
+        b.add_round_rect(&Rect::from_xywh(10.0, 10.0, 100.0, 50.0), 10.0, 8.0);
+        let path = b.build();
+
+        let elements: Vec<PathElement> = path.iter().collect();
+        assert_eq!(elements[0], PathElement::Move(Point::new(10.0, 52.0)));
+        assert_eq!(elements[1], PathElement::Line(Point::new(10.0, 18.0)));
+        let w = std::f32::consts::FRAC_1_SQRT_2;
+        assert_eq!(
+            elements[2],
+            PathElement::Conic(Point::new(10.0, 10.0), Point::new(20.0, 10.0), w)
+        );
+        let verbs: Vec<Verb> = path.verbs().to_vec();
+        assert_eq!(
+            verbs,
+            [
+                Verb::Move,
+                Verb::Line,
+                Verb::Conic,
+                Verb::Line,
+                Verb::Conic,
+                Verb::Line,
+                Verb::Conic,
+                Verb::Line,
+                Verb::Conic,
+                Verb::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn add_round_rect_with_full_radii_is_an_oval_from_the_left() {
+        // An oval-type rrect becomes addOval(start index 3): four conics from
+        // the left-middle point, clockwise, with no zero-length edges.
+        let mut b = PathBuilder::new();
+        b.add_round_rect(&Rect::from_xywh(0.0, 0.0, 40.0, 40.0), 20.0, 20.0);
+        let path = b.build();
+        assert_eq!(
+            path.iter().next(),
+            Some(PathElement::Move(Point::new(0.0, 20.0)))
+        );
+        assert_eq!(
+            path.verbs(),
+            [
+                Verb::Move,
+                Verb::Conic,
+                Verb::Conic,
+                Verb::Conic,
+                Verb::Conic,
+                Verb::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn add_round_rect_handles_degenerate_radii_like_skia() {
+        let rect = Rect::from_xywh(0.0, 0.0, 40.0, 20.0);
+        let first = |rx: Scalar, ry: Scalar| {
+            let mut b = PathBuilder::new();
+            b.add_round_rect(&rect, rx, ry);
+            b.build().iter().next()
+        };
+
+        // Negative radii add nothing (SkPath::addRoundRect).
+        assert_eq!(first(-1.0, 5.0), None);
+
+        // A non-finite rect becomes Skia's empty rrect at the origin
+        // (SkRRect::initializeRect) instead of NaN/inf-derived geometry.
+        for bad in [
+            Rect::new(Scalar::NAN, 0.0, 10.0, 10.0),
+            Rect::new(0.0, 0.0, Scalar::INFINITY, 10.0),
+        ] {
+            let mut b = PathBuilder::new();
+            b.add_round_rect(&bad, 2.0, 2.0);
+            let path = b.build();
+            assert!(
+                path.iter().all(|e| match e {
+                    PathElement::Move(p) | PathElement::Line(p) => p == Point::zero(),
+                    _ => true,
+                }),
+                "non-finite rect must collapse to the origin: {bad:?}"
+            );
+        }
+
+        // Non-finite radii become 0: a rect from the bottom-left corner,
+        // with finite coordinates.
+        for (rx, ry) in [
+            (Scalar::INFINITY, 5.0),
+            (Scalar::NAN, 5.0),
+            (5.0, Scalar::INFINITY),
+        ] {
+            let mut b = PathBuilder::new();
+            b.add_round_rect(&rect, rx, ry);
+            let path = b.build();
+            assert_eq!(
+                path.iter().next(),
+                Some(PathElement::Move(Point::new(0.0, 20.0))),
+                "rx={rx} ry={ry}"
+            );
+            assert!(path.bounds().left.is_finite() && path.bounds().right.is_finite());
+            assert_eq!(path.verbs()[1..4], [Verb::Line, Verb::Line, Verb::Line]);
+        }
+    }
+
+    #[test]
+    fn add_round_rect_scales_oversized_radii_uniformly() {
+        // SkRRect::setRectXY scales both radii by the same factor: a 40x20
+        // rect with radii (40, 40) gets min(40/80, 20/80) = 0.25 -> (10, 10).
+        let mut b = PathBuilder::new();
+        b.add_round_rect(&Rect::from_xywh(0.0, 0.0, 40.0, 20.0), 40.0, 40.0);
+        let path = b.build();
+        let first = path.iter().next();
+        assert_eq!(first, Some(PathElement::Move(Point::new(0.0, 10.0))));
+    }
 
     #[test]
     fn test_line_after_close_injects_move() {

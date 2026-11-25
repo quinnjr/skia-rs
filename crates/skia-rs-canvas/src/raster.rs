@@ -23,13 +23,18 @@
 //! - **Region-based clip**: Complex clips composed of multiple rectangles
 //! - **Anti-aliased clip**: Smooth clip edges using coverage masks
 
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+
 use skia_rs_core::premultiply_color;
 use skia_rs_core::{Color, Color4f, IRect, Matrix, Point, Rect, Region, Scalar};
 use skia_rs_paint::{BlendMode, Paint, Style};
 use skia_rs_path::PathBuilder;
 
 use crate::simd::mul_div_255_round;
-use skia_rs_path::{FillType, Path, PathElement};
+use skia_rs_path::{FillType, Path, PathElement, Verb};
 
 use crate::clip::ClipStack;
 
@@ -80,7 +85,7 @@ impl PixelBuffer {
 
         // Create a 4-byte pattern and fill using chunks
         let pattern = [r, g, b, a];
-        for chunk in self.pixels.chunks_exact_mut(4) {
+        for chunk in self.pixels.as_chunks_mut::<4>().0 {
             chunk.copy_from_slice(&pattern);
         }
     }
@@ -164,13 +169,48 @@ impl PixelBuffer {
             return;
         }
 
-        // `src` is premultiplied: coverage attenuates all four channels.
         let cov = skia_rs_core::cast::f32_to_u8_sat(coverage.min(1.0) * 255.0);
-        let src_with_coverage = apply_coverage(src, cov);
+        self.blend_pixel_coverage(x, y, src, cov, blend_mode);
+    }
 
+    /// Blend `src` (premultiplied) into the pixel with partial `coverage`
+    /// (0-255), the way Skia's blitters do: `lerp(dst, blend(src, dst),
+    /// coverage)`. For `SrcOver` that equals blending the coverage-scaled
+    /// source, which is the fast path kept here; other modes (`Src`,
+    /// `Clear`, ...) must lerp, or partially covered pixels would be
+    /// replaced instead of blended toward.
+    pub fn blend_pixel_coverage(
+        &mut self,
+        x: i32,
+        y: i32,
+        src: Color,
+        coverage: u8,
+        blend_mode: BlendMode,
+    ) {
+        if x < 0 || x >= self.width || y < 0 || y >= self.height || coverage == 0 {
+            return;
+        }
+        if coverage == 255 {
+            self.blend_pixel(x, y, src, blend_mode);
+            return;
+        }
         let dst = self.get_pixel(x, y).unwrap_or(Color::from_argb(0, 0, 0, 0));
-        let blended = blend_colors(src_with_coverage, dst, blend_mode);
-        self.set_pixel(x, y, blended);
+        let result = if blend_mode == BlendMode::SrcOver {
+            blend_colors(apply_coverage(src, coverage), dst, blend_mode)
+        } else {
+            let full = blend_colors(src, dst, blend_mode);
+            let lerp = |from: u8, to: u8| {
+                let (from, to, cov) = (u32::from(from), u32::from(to), u32::from(coverage));
+                u8::try_from((from * (255 - cov) + to * cov + 127) / 255).unwrap_or(u8::MAX)
+            };
+            Color::from_argb(
+                lerp(dst.alpha(), full.alpha()),
+                lerp(dst.red(), full.red()),
+                lerp(dst.green(), full.green()),
+                lerp(dst.blue(), full.blue()),
+            )
+        };
+        self.set_pixel(x, y, result);
     }
 }
 
@@ -365,6 +405,12 @@ impl<'a> Rasterizer<'a> {
         self.use_advanced_clip = false;
     }
 
+    /// Takes the clip stack back out (leaving an empty one), for a caller
+    /// that lent it with [`set_clip_stack`](Self::set_clip_stack).
+    pub const fn take_clip_stack(&mut self) -> ClipStack {
+        std::mem::replace(&mut self.clip_stack, ClipStack::new(&Rect::EMPTY))
+    }
+
     /// Set the clip stack (advanced mode).
     pub fn set_clip_stack(&mut self, clip_stack: ClipStack) {
         self.clip_stack = clip_stack;
@@ -423,7 +469,12 @@ impl<'a> Rasterizer<'a> {
     #[inline]
     fn get_clip_coverage(&self, x: i32, y: i32) -> u8 {
         use skia_rs_core::cast::scalar_from_i32;
-        let (dx, dy) = (x + self.origin.0, y + self.origin.1);
+        // Saturating: callers may pass saturated indices for far-off
+        // geometry, and a layer's origin must not overflow them.
+        let (dx, dy) = (
+            x.saturating_add(self.origin.0),
+            y.saturating_add(self.origin.1),
+        );
         if self.use_advanced_clip {
             self.clip_stack.get_coverage(dx, dy)
         } else if self
@@ -521,8 +572,9 @@ impl<'a> Rasterizer<'a> {
         } else {
             mul_div_255_round(u32::from(coverage), u32::from(clip_cov))
         };
-        let c = apply_coverage(source_color_at(source, x, y), combined);
-        self.buffer.blend_pixel(x, y, c, blend_mode);
+        let color = source_color_at(source, x, y);
+        self.buffer
+            .blend_pixel_coverage(x, y, color, combined, blend_mode);
     }
 
     /// Blend a full-coverage horizontal span `[x0, x1)` at row `y` through
@@ -573,27 +625,75 @@ impl<'a> Rasterizer<'a> {
         reason = "point/paint mirrors SkCanvas::drawPoint's (SkPoint, SkPaint) parameter names"
     )]
     pub fn draw_point(&mut self, point: Point, paint: &Paint) {
-        use skia_rs_core::cast::round_to_i32;
-        let transformed = self.matrix.map_point(point);
-        let x = round_to_i32(transformed.x);
-        let y = round_to_i32(transformed.y);
-
-        let coverage = self.get_clip_coverage(x, y);
-        if coverage > 0 {
-            let color = premultiply_color(paint.color32());
-            if coverage == 255 {
-                self.buffer.blend_pixel(x, y, color, paint.blend_mode());
-            } else {
-                // Apply clip coverage to the premultiplied color (all channels).
-                let adjusted_color = apply_coverage(color, coverage);
-                self.buffer
-                    .blend_pixel(x, y, adjusted_color, paint.blend_mode());
+        use skia_rs_core::cast::floor_to_i32;
+        // Under perspective, a point at or behind the w plane maps to a
+        // flipped position: draw nothing, as for lines (clip_to_w_plane).
+        if clip_to_w_plane(&self.matrix, point, point).is_none() {
+            return;
+        }
+        let device = self.matrix.map_point(point);
+        // Points off the device (beyond the 1-px AA square) draw nothing,
+        // and must not reach the pixel indexing with saturated values.
+        let (w, h) = (
+            skia_rs_core::cast::scalar_from_i32(self.buffer.width),
+            skia_rs_core::cast::scalar_from_i32(self.buffer.height),
+        );
+        if !(device.x > -2.0 && device.x < w + 2.0 && device.y > -2.0 && device.y < h + 2.0) {
+            return;
+        }
+        let source = self.make_source(paint);
+        let blend_mode = paint.blend_mode();
+        if !paint.is_anti_alias() {
+            // The pixel containing the point (bw_pt_hair_proc floors).
+            let (x, y) = (floor_to_i32(device.x), floor_to_i32(device.y));
+            self.blit_pixel_cov(x, y, 255, &source, blend_mode);
+            return;
+        }
+        // aa_square_proc: an anti-aliased 1x1 square centered on the point,
+        // covering up to four pixels by area.
+        let (left, top) = (device.x - 0.5, device.y - 0.5);
+        let (x0, y0) = (floor_to_i32(left), floor_to_i32(top));
+        let (fx, fy) = (left - left.floor(), top - top.floor());
+        for (dy, wy) in [(0, 1.0 - fy), (1, fy)] {
+            for (dx, wx) in [(0, 1.0 - fx), (1, fx)] {
+                let coverage = skia_rs_core::cast::f32_to_u8_sat((wx * wy * 255.0).round());
+                self.blit_pixel_cov(
+                    x0.saturating_add(dx),
+                    y0.saturating_add(dy),
+                    coverage,
+                    &source,
+                    blend_mode,
+                );
             }
         }
     }
 
-    /// Draw a line using Bresenham's algorithm (aliased) or Wu's algorithm (anti-aliased).
+    /// Draw a line segment.
+    ///
+    /// Matches `SkCanvas::drawLine`, which is `drawPoints(kLines_PointMode)`:
+    /// the segment is always stroked (the paint's style is ignored) using
+    /// the paint's stroke width, cap and join. A stroke width of zero is a
+    /// hairline, drawn with Bresenham's algorithm (aliased) or Wu's
+    /// algorithm (anti-aliased).
+    ///
+    /// A hairline (width 0) ignores the stroke cap, like Skia's
+    /// `drawLine`/`drawPoints`, which blit hairlines through `PtProcRec`'s
+    /// `bw_line_hair_proc` / `aa_line_hair_proc` (`SkScan::HairLine`).
+    /// Only hairline *paths* extend their ends for caps (`hair_path`).
     pub fn draw_line(&mut self, p0: Point, p1: Point, paint: &Paint) {
+        // SkCanvas::drawPoints quick-rejects non-finite points.
+        if ![p0.x, p0.y, p1.x, p1.y].iter().all(|v| v.is_finite()) {
+            return;
+        }
+        if paint.stroke_width() > 0.0 {
+            let mut b = PathBuilder::new();
+            b.move_to(p0.x, p0.y).line_to(p1.x, p1.y);
+            let mut stroke = paint.clone();
+            stroke.set_style(Style::Stroke);
+            self.draw_path(&b.build(), &stroke);
+            return;
+        }
+
         if paint.is_anti_alias() {
             self.draw_line_aa(p0, p1, paint);
         } else {
@@ -601,65 +701,82 @@ impl<'a> Rasterizer<'a> {
         }
     }
 
-    /// Draw line without anti-aliasing (Bresenham).
+    /// Draw an aliased hairline, as Skia's `SkScan::HairLine` does.
+    ///
+    /// Along the major axis the span is half-open, `[round(a0), round(a1))`
+    /// (`SkFDot6Round`), so joined segments do not overlap at shared
+    /// vertices and a hairline shorter than a pixel draws nothing. Along the
+    /// minor axis a DDA is sampled at each pixel's center and floored
+    /// (`horiline` / `vertline`).
     fn draw_line_aliased(&mut self, p0: Point, p1: Point, paint: &Paint) {
-        use skia_rs_core::cast::round_to_i32;
-        let t0 = self.matrix.map_point(p0);
-        let t1 = self.matrix.map_point(p1);
+        use skia_rs_core::cast::{floor_to_i32, scalar_from_i32};
 
-        let mut x0 = round_to_i32(t0.x);
-        let mut y0 = round_to_i32(t0.y);
-        let x1 = round_to_i32(t1.x);
-        let y1 = round_to_i32(t1.y);
-
-        let dx = (x1 - x0).abs();
-        let dy = -(y1 - y0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
-
-        let color = premultiply_color(paint.color32());
+        let Some((mut start, mut end)) = self.device_segment(p0, p1) else {
+            return;
+        };
+        let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
-
-        loop {
-            let coverage = self.get_clip_coverage(x0, y0);
-            if coverage > 0 {
-                if coverage == 255 {
-                    self.buffer.blend_pixel(x0, y0, color, blend_mode);
-                } else {
-                    let adjusted = apply_coverage(color, coverage);
-                    self.buffer.blend_pixel(x0, y0, adjusted, blend_mode);
-                }
-            }
-
-            if x0 == x1 && y0 == y1 {
-                break;
-            }
-
-            let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x0 += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y0 += sy;
-            }
+        let horizontal = (end.x - start.x).abs() > (end.y - start.y).abs();
+        if !horizontal {
+            // Treat the mostly-vertical case as horizontal with x and y
+            // swapped, swapping back when plotting.
+            std::mem::swap(&mut start.x, &mut start.y);
+            std::mem::swap(&mut end.x, &mut end.y);
+        }
+        if start.x > end.x {
+            std::mem::swap(&mut start, &mut end);
+        }
+        let round = |v: Scalar| floor_to_i32(v + 0.5);
+        let (first, past_last) = (round(start.x), round(end.x));
+        if first >= past_last {
+            return; // too short to draw
+        }
+        // Only walk the part of the major axis inside the device (Skia clips
+        // the line before HairLineRgn), so far-off lines cost nothing.
+        let extent = if horizontal {
+            self.buffer.width
+        } else {
+            self.buffer.height
+        };
+        let (first, past_last) = (first.max(0), past_last.min(extent));
+        if first >= past_last {
+            return;
+        }
+        let slope = (end.y - start.y) / (end.x - start.x);
+        // Minor-axis value at the center of the first pixel.
+        let mut minor = slope * (scalar_from_i32(first) + 0.5 - start.x) + start.y;
+        for major in first..past_last {
+            let row = floor_to_i32(minor);
+            let (x, y) = if horizontal {
+                (major, row)
+            } else {
+                (row, major)
+            };
+            self.blit_pixel_cov(x, y, 255, &source, blend_mode);
+            minor += slope;
         }
     }
 
     /// Draw line with anti-aliasing using Wu's algorithm.
     fn draw_line_aa(&mut self, p0: Point, p1: Point, paint: &Paint) {
-        use skia_rs_core::cast::floor_to_i32;
-        let t0 = self.matrix.map_point(p0);
-        let t1 = self.matrix.map_point(p1);
+        use skia_rs_core::cast::{floor_to_i32, scalar_from_i32};
+        // Fractional part in [0, 1) for negative values too
+        // (`f32::fract` is negative below zero, which the half-pixel
+        // shift below produces near the top/left edges).
+        let fpart = |v: Scalar| v - v.floor();
+        // Wu's algorithm assumes pixel i is centered at i; Skia's pixel
+        // centers are at i + 0.5. Shift by half a pixel so a line at
+        // y = 50.5 lands entirely on row 50 (SkScan_Antihair).
+        let Some((t0, t1)) = self.device_segment(p0, p1) else {
+            return;
+        };
 
-        let mut x0 = t0.x;
-        let mut y0 = t0.y;
-        let mut x1 = t1.x;
-        let mut y1 = t1.y;
+        let mut x0 = t0.x - 0.5;
+        let mut y0 = t0.y - 0.5;
+        let mut x1 = t1.x - 0.5;
+        let mut y1 = t1.y - 0.5;
 
-        let color = premultiply_color(paint.color32());
+        let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
 
         let steep = (y1 - y0).abs() > (x1 - x0).abs();
@@ -676,63 +793,138 @@ impl<'a> Rasterizer<'a> {
 
         let dx = x1 - x0;
         let dy = y1 - y0;
-        let gradient = if dx.abs() < 0.0001 { 1.0 } else { dy / dx };
+        // dx >= 0 after the swap; a zero extent is handled by the
+        // single-column branch below.
+        let gradient = if dx > 0.0 { dy / dx } else { 0.0 };
+
+        // A segment inside one column along the major axis covers it once,
+        // by its length (as Skia's anti-hairline does for sub-pixel
+        // segments); plotting both endpoints there would blend it twice.
+        let (first_column, last_column) = (floor_to_i32(x0 + 0.5), floor_to_i32(x1 + 0.5));
+        if first_column == last_column {
+            let column = first_column;
+            let y_mid = f32::midpoint(y0, y1);
+            self.plot_wu_endpoint(steep, column, y_mid, dx.min(1.0), &source, blend_mode);
+            return;
+        }
 
         // Handle first endpoint
-        let xend = x0.round();
+        // Round half up, so endpoints are translation-consistent across
+        // zero (`f32::round` rounds half away from zero).
+        let xend = (x0 + 0.5).floor();
         let yend = y0 + gradient * (xend - x0);
-        let xgap = 1.0 - (x0 + 0.5).fract();
+        let xgap = 1.0 - fpart(x0 + 0.5);
         let xpxl1 = floor_to_i32(xend);
-        let ypxl1 = floor_to_i32(yend);
 
-        if steep {
-            self.plot_aa(ypxl1, xpxl1, (1.0 - yend.fract()) * xgap, color, blend_mode);
-            self.plot_aa(ypxl1 + 1, xpxl1, yend.fract() * xgap, color, blend_mode);
-        } else {
-            self.plot_aa(xpxl1, ypxl1, (1.0 - yend.fract()) * xgap, color, blend_mode);
-            self.plot_aa(xpxl1, ypxl1 + 1, yend.fract() * xgap, color, blend_mode);
-        }
+        self.plot_wu_endpoint(steep, xpxl1, yend, xgap, &source, blend_mode);
 
         let mut intery = yend + gradient;
 
         // Handle second endpoint
-        let xend = x1.round();
+        let xend = (x1 + 0.5).floor();
         let yend = y1 + gradient * (xend - x1);
-        let xgap = (x1 + 0.5).fract();
+        let xgap = fpart(x1 + 0.5);
         let xpxl2 = floor_to_i32(xend);
-        let ypxl2 = floor_to_i32(yend);
 
-        if steep {
-            self.plot_aa(ypxl2, xpxl2, (1.0 - yend.fract()) * xgap, color, blend_mode);
-            self.plot_aa(ypxl2 + 1, xpxl2, yend.fract() * xgap, color, blend_mode);
+        self.plot_wu_endpoint(steep, xpxl2, yend, xgap, &source, blend_mode);
+
+        // Main loop, limited to the device along the major axis.
+        let extent = if steep {
+            self.buffer.height
         } else {
-            self.plot_aa(xpxl2, ypxl2, (1.0 - yend.fract()) * xgap, color, blend_mode);
-            self.plot_aa(xpxl2, ypxl2 + 1, yend.fract() * xgap, color, blend_mode);
-        }
-
-        // Main loop
+            self.buffer.width
+        };
+        let (first, past_last) = (xpxl1.saturating_add(1).max(0), xpxl2.min(extent));
+        // Re-base `intery` to `first` (in floating point: the integer gap
+        // can exceed i32 for far-off lines).
+        intery += gradient * (scalar_from_i32(first) - scalar_from_i32(xpxl1) - 1.0);
         if steep {
-            for x in (xpxl1 + 1)..xpxl2 {
+            for x in first..past_last {
                 let y = floor_to_i32(intery);
-                self.plot_aa(y, x, 1.0 - intery.fract(), color, blend_mode);
-                self.plot_aa(y + 1, x, intery.fract(), color, blend_mode);
+                self.plot_aa(y, x, 1.0 - fpart(intery), &source, blend_mode);
+                self.plot_aa(y.saturating_add(1), x, fpart(intery), &source, blend_mode);
                 intery += gradient;
             }
         } else {
-            for x in (xpxl1 + 1)..xpxl2 {
+            for x in first..past_last {
                 let y = floor_to_i32(intery);
-                self.plot_aa(x, y, 1.0 - intery.fract(), color, blend_mode);
-                self.plot_aa(x, y + 1, intery.fract(), color, blend_mode);
+                self.plot_aa(x, y, 1.0 - fpart(intery), &source, blend_mode);
+                self.plot_aa(x, y.saturating_add(1), fpart(intery), &source, blend_mode);
                 intery += gradient;
             }
         }
     }
 
+    /// The buffer as a device-space rect.
+    const fn device_rect(&self) -> Rect {
+        use skia_rs_core::cast::scalar_from_i32;
+        Rect::new(
+            0.0,
+            0.0,
+            scalar_from_i32(self.buffer.width),
+            scalar_from_i32(self.buffer.height),
+        )
+    }
+
+    /// The hairline `p0`-`p1` mapped to device space and clipped to the
+    /// device (outset by two pixels, so clipped ends stay off-device), as
+    /// Skia clips lines before rasterizing them (`SkLineClipper`). This
+    /// keeps far-off endpoints from saturating pixel indices or losing f32
+    /// precision. `None` when the segment misses the device or is not
+    /// finite.
+    fn device_segment(&self, p0: Point, p1: Point) -> Option<(Point, Point)> {
+        // Under perspective, first keep only the part in front of the w
+        // plane (as PerspectiveClip does for paths): points behind it map to
+        // flipped coordinates.
+        let (p0, p1) = clip_to_w_plane(&self.matrix, p0, p1)?;
+        let (a, b) = (self.matrix.map_point(p0), self.matrix.map_point(p1));
+        let bounds = (
+            -2.0,
+            -2.0,
+            f64::from(self.buffer.width) + 2.0,
+            f64::from(self.buffer.height) + 2.0,
+        );
+        clip_segment(a, b, bounds)
+    }
+
+    /// Plot one Wu endpoint: the pixel pair straddling `yend` in column
+    /// `major` (rows and columns swapped for steep lines), weighted by the
+    /// endpoint's horizontal gap coverage `xgap`.
+    fn plot_wu_endpoint(
+        &mut self,
+        steep: bool,
+        major: i32,
+        yend: Scalar,
+        xgap: Scalar,
+        source: &PixelSource<'_>,
+        blend_mode: BlendMode,
+    ) {
+        use skia_rs_core::cast::floor_to_i32;
+        let minor = floor_to_i32(yend);
+        let frac = yend - yend.floor();
+        let (near, far) = ((1.0 - frac) * xgap, frac * xgap);
+        if steep {
+            self.plot_aa(minor, major, near, source, blend_mode);
+            self.plot_aa(minor.saturating_add(1), major, far, source, blend_mode);
+        } else {
+            self.plot_aa(major, minor, near, source, blend_mode);
+            self.plot_aa(major, minor.saturating_add(1), far, source, blend_mode);
+        }
+    }
+
     /// Plot a pixel with coverage for anti-aliasing.
     #[inline]
-    fn plot_aa(&mut self, x: i32, y: i32, coverage: f32, color: Color, blend_mode: BlendMode) {
+    fn plot_aa(
+        &mut self,
+        x: i32,
+        y: i32,
+        coverage: f32,
+        source: &PixelSource<'_>,
+        blend_mode: BlendMode,
+    ) {
         let clip_coverage = self.get_clip_coverage(x, y);
         if clip_coverage > 0 {
+            let color = source_color_at(source, x, y);
             // Combine line AA coverage with clip coverage
             let combined_coverage = coverage * (f32::from(clip_coverage) / 255.0);
             self.buffer
@@ -765,16 +957,12 @@ impl<'a> Rasterizer<'a> {
 
         // For advanced clips (region-based or AA), use per-pixel with coverage
         if self.use_advanced_clip {
+            // Partial clip coverage blends like every other blit path
+            // (lerp toward the blend result for non-SrcOver modes).
             for x in start..=end {
                 let coverage = self.get_clip_coverage(x, y);
-                if coverage > 0 {
-                    if coverage == 255 {
-                        self.buffer.blend_pixel(x, y, color, blend_mode);
-                    } else {
-                        let adjusted = apply_coverage(color, coverage);
-                        self.buffer.blend_pixel(x, y, adjusted, blend_mode);
-                    }
-                }
+                self.buffer
+                    .blend_pixel_coverage(x, y, color, coverage, blend_mode);
             }
             return;
         }
@@ -817,7 +1005,9 @@ impl<'a> Rasterizer<'a> {
     /// `map_rect` (which would otherwise fill the quad's bounding box).
     pub fn fill_rect(&mut self, rect: &Rect, paint: &Paint) {
         use skia_rs_core::cast::round_to_i32;
-        if !self.matrix_is_axis_aligned() || paint.is_anti_alias() {
+        // Perspective maps a rect to a quadrilateral, not its bounding box.
+        if !self.matrix_is_axis_aligned() || self.matrix.has_perspective() || paint.is_anti_alias()
+        {
             let mut b = PathBuilder::new();
             b.add_rect(rect);
             self.fill_path(&b.build(), paint);
@@ -827,9 +1017,11 @@ impl<'a> Rasterizer<'a> {
         let transformed = self.matrix.map_rect(rect);
 
         let x0 = round_to_i32(transformed.left);
-        let y0 = round_to_i32(transformed.top);
         let x1 = round_to_i32(transformed.right);
-        let y1 = round_to_i32(transformed.bottom);
+        // Rows outside the buffer draw nothing; limiting them keeps huge or
+        // far-off rects from looping over billions of empty rows.
+        let y0 = round_to_i32(transformed.top).max(0);
+        let y1 = round_to_i32(transformed.bottom).min(self.buffer.height);
 
         let blend_mode = paint.blend_mode();
         let source = self.make_source(paint);
@@ -844,10 +1036,12 @@ impl<'a> Rasterizer<'a> {
     /// clip regardless of the matrix (`SkDraw::drawPaint`).
     pub fn fill_device_rect(&mut self, rect: &Rect, paint: &Paint) {
         use skia_rs_core::cast::round_to_i32;
-        let x0 = round_to_i32(rect.left) - self.origin.0;
-        let y0 = round_to_i32(rect.top) - self.origin.1;
-        let x1 = round_to_i32(rect.right) - self.origin.0;
-        let y1 = round_to_i32(rect.bottom) - self.origin.1;
+        let x0 = round_to_i32(rect.left).saturating_sub(self.origin.0);
+        let x1 = round_to_i32(rect.right).saturating_sub(self.origin.0);
+        let y0 = round_to_i32(rect.top).saturating_sub(self.origin.1).max(0);
+        let y1 = round_to_i32(rect.bottom)
+            .saturating_sub(self.origin.1)
+            .min(self.buffer.height);
 
         let blend_mode = paint.blend_mode();
         let source = self.make_source(paint);
@@ -868,6 +1062,19 @@ impl<'a> Rasterizer<'a> {
             return;
         }
 
+        // SkDraw::drawRect: an aliased hairline rect under a rect-preserving
+        // CTM (rectStaysRect: scale/translate or a 90-degree rotation) is
+        // blitted by SkScan::HairRect as a closed pixel frame. Other
+        // hairline rects are four hairline segments, as in Skia:
+        // SkScan::AntiHairRect is a 5-point AntiHairLine polyline (drawn
+        // segment by segment, so AA corners blend twice there too), and a
+        // non-rect-preserving CTM goes through hair_path's per-segment
+        // HairLine.
+        if !paint.is_anti_alias() && self.matrix.rect_stays_rect() {
+            self.hair_rect(rect, paint);
+            return;
+        }
+
         let tl = Point::new(rect.left, rect.top);
         let tr = Point::new(rect.right, rect.top);
         let bl = Point::new(rect.left, rect.bottom);
@@ -879,8 +1086,47 @@ impl<'a> Rasterizer<'a> {
         self.draw_line(bl, tl, paint);
     }
 
+    /// `SkScan::HairRect`: blit the one-pixel frame of the device rect,
+    /// spanning pixels `floor(left)..=floor(right)` and
+    /// `floor(top)..=floor(bottom)` (a solid block when either side is at
+    /// most two pixels).
+    fn hair_rect(&mut self, rect: &Rect, paint: &Paint) {
+        use skia_rs_core::cast::floor_to_i32;
+        let dev = self.matrix.map_rect(rect);
+        // Trim to the device outset by one (Skia intersects with the clip
+        // bounds outset by 1) so the integer extents cannot overflow.
+        let (w, h) = (self.buffer.width, self.buffer.height);
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let trim = |v: Scalar, hi: i32| floor_to_i32(v).clamp(-1, hi.saturating_add(1));
+        let (left, top) = (trim(dev.left, w), trim(dev.top, h));
+        let (right, bottom) = (trim(dev.right + 1.0, w), trim(dev.bottom + 1.0, h));
+        if left >= right || top >= bottom {
+            return;
+        }
+        let source = self.make_source(paint);
+        let blend_mode = paint.blend_mode();
+        if right - left <= 2 || bottom - top <= 2 {
+            for y in top..bottom {
+                self.blit_span(left, right, y, &source, blend_mode);
+            }
+            return;
+        }
+        self.blit_span(left, right, top, &source, blend_mode);
+        for y in top + 1..bottom - 1 {
+            self.blit_span(left, left + 1, y, &source, blend_mode);
+            self.blit_span(right - 1, right, y, &source, blend_mode);
+        }
+        self.blit_span(left, right, bottom - 1, &source, blend_mode);
+    }
+
     /// Draw a rectangle (filled or stroked based on paint style).
     pub fn draw_rect(&mut self, rect: &Rect, paint: &Paint) {
+        // SkCanvas::drawRect quick-rejects rects with non-finite edges.
+        if !rect.is_finite() {
+            return;
+        }
         match paint.style() {
             Style::Fill => self.fill_rect(rect, paint),
             Style::Stroke => self.stroke_rect(rect, paint),
@@ -911,14 +1157,16 @@ impl<'a> Rasterizer<'a> {
         let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
 
-        let y0 = floor_to_i32(tc.y - r);
-        let y1 = ceil_to_i32(tc.y + r);
+        // Only rows inside the buffer (huge or far-off circles would
+        // otherwise loop over billions of empty rows).
+        let y0 = floor_to_i32(tc.y - r).max(0);
+        let y1 = ceil_to_i32(tc.y + r).min(self.buffer.height);
         for y in y0..y1 {
             let dy = scalar_from_i32(y) + 0.5 - tc.y;
             if dy.abs() > r {
                 continue;
             }
-            let half = r.mul_add(r, -(dy * dy)).sqrt();
+            let half = (r * r - dy * dy).sqrt();
             let x0 = round_to_i32(tc.x - half);
             let x1 = round_to_i32(tc.x + half);
             self.blit_span(x0, x1, y, &source, blend_mode);
@@ -927,38 +1175,11 @@ impl<'a> Rasterizer<'a> {
 
     /// Draw a stroked circle.
     pub fn stroke_circle(&mut self, center: Point, radius: Scalar, paint: &Paint) {
-        use skia_rs_core::cast::round_to_i32;
-        let tc = self.matrix.map_point(center);
-        let cx = round_to_i32(tc.x);
-        let cy = round_to_i32(tc.y);
-        let r = round_to_i32(radius * self.matrix.scale_x().abs());
-
-        let color = premultiply_color(paint.color32());
-        let blend_mode = paint.blend_mode();
-
-        let mut x = 0;
-        let mut y = r;
-        let mut d = 1 - r;
-
-        while x <= y {
-            // Plot pixels in all 8 octants
-            self.buffer.blend_pixel(cx + x, cy + y, color, blend_mode);
-            self.buffer.blend_pixel(cx - x, cy + y, color, blend_mode);
-            self.buffer.blend_pixel(cx + x, cy - y, color, blend_mode);
-            self.buffer.blend_pixel(cx - x, cy - y, color, blend_mode);
-            self.buffer.blend_pixel(cx + y, cy + x, color, blend_mode);
-            self.buffer.blend_pixel(cx - y, cy + x, color, blend_mode);
-            self.buffer.blend_pixel(cx + y, cy - x, color, blend_mode);
-            self.buffer.blend_pixel(cx - y, cy - x, color, blend_mode);
-
-            x += 1;
-            if d < 0 {
-                d += 2 * x + 1;
-            } else {
-                y -= 1;
-                d += 2 * (x - y) + 1;
-            }
-        }
+        // Skia strokes circles as conic paths (a hairline circle goes
+        // through hair_path), which also honors the clip and shader.
+        let mut b = PathBuilder::new();
+        b.add_circle(center.x, center.y, radius);
+        self.stroke_path(&b.build(), paint);
     }
 
     /// Draw a circle (filled or stroked based on paint style).
@@ -973,6 +1194,7 @@ impl<'a> Rasterizer<'a> {
             && m.skew_y() == 0.0
             && (m.scale_x().abs() - m.scale_y().abs()).abs() <= 1e-6;
         let needs_path = !uniform
+            || m.has_perspective()
             || (paint.style() != Style::Fill && paint.stroke_width() > 0.0)
             || paint.style() == Style::StrokeAndFill;
         if needs_path {
@@ -1002,15 +1224,30 @@ impl<'a> Rasterizer<'a> {
         let cx = tc.x;
         let cy = tc.y;
         let r = radius * self.matrix.scale_x().abs();
+        // An empty circle is Skia's empty oval: nothing for fills and butt
+        // hairlines, but hair_path extends a degenerate contour's ends for
+        // round/square caps, drawing a dot (as the aliased path does).
+        if r.is_nan() || r <= 0.0 {
+            if !r.is_nan()
+                && paint.style() == Style::Stroke
+                && paint.stroke_cap() != skia_rs_paint::StrokeCap::Butt
+            {
+                let mut b = PathBuilder::new();
+                b.add_circle(center.x, center.y, 0.0);
+                self.stroke_path(&b.build(), paint);
+            }
+            return;
+        }
 
-        let color = premultiply_color(paint.color32());
+        let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
 
-        // Calculate bounding box
-        let min_x = floor_to_i32(cx - r - 1.0);
-        let max_x = ceil_to_i32(cx + r + 1.0);
-        let min_y = floor_to_i32(cy - r - 1.0);
-        let max_y = ceil_to_i32(cy + r + 1.0);
+        // Bounding box, limited to the buffer: pixels outside it draw
+        // nothing, and a huge or far-off circle must not loop over them.
+        let min_x = floor_to_i32(cx - r - 1.0).max(0);
+        let max_x = ceil_to_i32(cx + r + 1.0).min(self.buffer.width - 1);
+        let min_y = floor_to_i32(cy - r - 1.0).max(0);
+        let max_y = ceil_to_i32(cy + r + 1.0).min(self.buffer.height - 1);
 
         match paint.style() {
             Style::Fill => {
@@ -1020,7 +1257,7 @@ impl<'a> Rasterizer<'a> {
                         // Calculate distance from pixel center to circle center
                         let dx = scalar_from_i32(px) + 0.5 - cx;
                         let dy = scalar_from_i32(py) + 0.5 - cy;
-                        let dist_sq = dx.mul_add(dx, dy * dy);
+                        let dist_sq = dx * dx + dy * dy;
 
                         // Calculate coverage using smoothstep
                         let dist = dist_sq.sqrt();
@@ -1034,7 +1271,7 @@ impl<'a> Rasterizer<'a> {
                         };
 
                         if coverage > 0.0 {
-                            self.plot_aa(px, py, coverage, color, blend_mode);
+                            self.plot_aa(px, py, coverage, &source, blend_mode);
                         }
                     }
                 }
@@ -1048,7 +1285,11 @@ impl<'a> Rasterizer<'a> {
                     for px in min_x..=max_x {
                         let dx = scalar_from_i32(px) + 0.5 - cx;
                         let dy = scalar_from_i32(py) + 0.5 - cy;
-                        let dist = dx.mul_add(dx, dy * dy).sqrt();
+                        #[allow(
+                            clippy::imprecise_flops,
+                            reason = "per-pixel hot loop: hypot is markedly slower and its overflow guarding is unnecessary for pixel-space distances"
+                        )]
+                        let dist = (dx * dx + dy * dy).sqrt();
 
                         let outer_coverage = if dist <= outer_r - 0.5 {
                             1.0
@@ -1069,7 +1310,7 @@ impl<'a> Rasterizer<'a> {
                         let coverage = outer_coverage - inner_coverage;
 
                         if coverage > 0.0 {
-                            self.plot_aa(px, py, coverage, color, blend_mode);
+                            self.plot_aa(px, py, coverage, &source, blend_mode);
                         }
                     }
                 }
@@ -1125,6 +1366,12 @@ impl<'a> Rasterizer<'a> {
     /// normal (matrix-aware, clipped, AA-aware) fill pipeline. Width 0
     /// remains a hairline.
     fn stroke_path(&mut self, path: &Path, paint: &Paint) {
+        // Positive widths always fill the stroke outline, even sub-pixel
+        // ones. Skia's SkDrawTreatAsHairline instead draws thin AA strokes
+        // with its hairline blitters (modulating alpha by the width), which
+        // blend each polyline pixel once; this rasterizer's hairlines draw
+        // segment by segment. Filling the anti-aliased outline gives the
+        // same coverage while keeping the caps and one blend per pixel.
         if paint.stroke_width() > 0.0 {
             if let Some(outline) = stroke_outline(path, paint) {
                 self.fill_path(&outline, paint);
@@ -1154,6 +1401,27 @@ impl<'a> Rasterizer<'a> {
         }
     }
 
+    /// Draw one hairline curve segment from `start`: `eval` gives the local
+    /// point at `t`, `end` the exact end point. `points` is a reusable
+    /// buffer.
+    fn hairline_curve(
+        &mut self,
+        points: &mut Vec<Point>,
+        hull: &[Point],
+        eval: impl Fn(Scalar) -> Point,
+        end: Point,
+        paint: &Paint,
+    ) {
+        let start = hull[0];
+        let device = self.device_rect();
+        flatten_curve_culled(points, eval, end, &self.matrix, hull, Some(&device));
+        let mut prev = start;
+        for &p in points.iter() {
+            self.draw_line(prev, p, paint);
+            prev = p;
+        }
+    }
+
     /// Stroke a path as a hairline (width 0) by walking its flattened
     /// segments with the line rasterizer.
     #[allow(
@@ -1161,82 +1429,130 @@ impl<'a> Rasterizer<'a> {
         reason = "t/mt (parameter and its complement) and per-segment prev_t/prev_mt are the standard Bezier-flattening parameter names"
     )]
     fn stroke_path_hairline(&mut self, path: &Path, paint: &Paint) {
-        use skia_rs_core::cast::scalar_from_i32;
+        // Skia's hair_path extends segments for non-butt caps (extend_pts):
+        // 0.5 device px for square caps, pi/8 for round. Extension happens
+        // in device space, per segment: a segment that starts a contour
+        // extends its start, one that ends a contour extends its end, and
+        // closed contours only extend degenerate segments.
+        let cap_outset = match paint.stroke_cap() {
+            skia_rs_paint::StrokeCap::Butt => None,
+            skia_rs_paint::StrokeCap::Square => Some(0.5),
+            skia_rs_paint::StrokeCap::Round => Some(std::f32::consts::PI / 8.0),
+        };
+        let caps = cap_outset.and_then(|outset| {
+            self.matrix.invert().map(|inverse| HairlineCaps {
+                matrix: self.matrix,
+                inverse,
+                outset,
+            })
+        });
+        // Lookahead (contour ends, closed contours) reads the verb array,
+        // which lines up one-to-one with the element iterator.
+        let verbs = path.verbs();
 
         let mut current = Point::zero();
         let mut contour_start = Point::zero();
+        let mut closed = false;
+        let mut prev_is_move = false;
+        // Reused by every curve in the path (no per-segment allocation).
+        let mut curve_points: Vec<Point> = Vec::new();
 
-        for element in path {
+        for (index, element) in path.iter().enumerate() {
+            let ends_contour =
+                matches!(verbs.get(index + 1), None | Some(Verb::Move | Verb::Close));
+            // Extend `pts` when this segment is capped (hair_path's
+            // `!isClosed || degenerate` condition).
+            let extend = |pts: &mut [Point]| {
+                if let Some(caps) = &caps {
+                    let degenerate = pts.iter().all(|q| *q == pts[0]);
+                    if !closed || degenerate {
+                        caps.extend(pts, prev_is_move, ends_contour);
+                    }
+                }
+            };
             match element {
                 PathElement::Move(p) => {
                     current = p;
                     contour_start = p;
+                    closed = contour_is_closed(verbs.get(index + 1..).unwrap_or_default());
                 }
                 PathElement::Line(p) => {
-                    self.draw_line(current, p, paint);
+                    let mut pts = [current, p];
+                    extend(&mut pts);
+                    self.draw_line(pts[0], pts[1], paint);
                     current = p;
                 }
+                // Every curve is flattened against a device-pixel error bound
+                // (as in edge collection), so hairlines stay smooth under any
+                // CTM rather than showing fixed-step facets when magnified.
                 PathElement::Quad(ctrl, end) => {
-                    // Approximate with lines
-                    let steps = 16;
-                    for i in 1..=steps {
-                        let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                        let mt = 1.0 - t;
-                        let p = quad_point(t, mt, current, ctrl, end);
-                        self.draw_line(
-                            if i == 1 {
-                                current
-                            } else {
-                                let pt = scalar_from_i32(i - 1) / scalar_from_i32(steps);
-                                let pmt = 1.0 - pt;
-                                quad_point(pt, pmt, current, ctrl, end)
-                            },
-                            p,
-                            paint,
-                        );
-                    }
+                    let mut pts = [current, ctrl, end];
+                    extend(&mut pts);
+                    let [a, b, c] = pts;
+                    self.hairline_curve(
+                        &mut curve_points,
+                        &pts,
+                        |t| quad_point(t, 1.0 - t, a, b, c),
+                        c,
+                        paint,
+                    );
                     current = end;
                 }
-                PathElement::Conic(ctrl, end, _w) => {
-                    // Approximate as quad for simplicity
-                    let steps = 16;
-                    for i in 1..=steps {
-                        let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                        let mt = 1.0 - t;
-                        let p = quad_point(t, mt, current, ctrl, end);
-                        let prev_t = scalar_from_i32(i - 1) / scalar_from_i32(steps);
-                        let prev_mt = 1.0 - prev_t;
-                        let prev = quad_point(prev_t, prev_mt, current, ctrl, end);
-                        self.draw_line(prev, p, paint);
-                    }
+                PathElement::Conic(ctrl, end, weight) => {
+                    let mut pts = [current, ctrl, end];
+                    extend(&mut pts);
+                    let [a, b, c] = pts;
+                    self.hairline_curve(
+                        &mut curve_points,
+                        &pts,
+                        |t| conic_point(a, b, c, weight, t),
+                        c,
+                        paint,
+                    );
                     current = end;
                 }
                 PathElement::Cubic(c1, c2, end) => {
-                    // Approximate with lines
-                    let steps = 24;
-                    let mut prev = current;
-                    for i in 1..=steps {
-                        let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                        let mt = 1.0 - t;
-                        let p = cubic_point(t, mt, current, c1, c2, end);
-                        self.draw_line(prev, p, paint);
-                        prev = p;
-                    }
+                    let mut pts = [current, c1, c2, end];
+                    extend(&mut pts);
+                    let [a, b, c, d] = pts;
+                    self.hairline_curve(
+                        &mut curve_points,
+                        &pts,
+                        |t| cubic_point(t, 1.0 - t, a, b, c, d),
+                        d,
+                        paint,
+                    );
                     current = end;
                 }
                 PathElement::Close => {
-                    if current != contour_start {
-                        self.draw_line(current, contour_start, paint);
+                    let mut pts = [current, contour_start];
+                    // hair_path caps a moveTo/close pair (a degenerate
+                    // contour) to match SVG's dot for zero-length subpaths.
+                    if prev_is_move && let Some(caps) = &caps {
+                        caps.extend(&mut pts, true, ends_contour);
+                    }
+                    if pts[0] != pts[1] {
+                        self.draw_line(pts[0], pts[1], paint);
                     }
                     current = contour_start;
+                    // Segments after a Close (without a Move) form a new
+                    // contour from the same start: Skia injects a moveTo, so
+                    // the cap state is that of a fresh contour.
+                    closed = contour_is_closed(verbs.get(index + 1..).unwrap_or_default());
                 }
             }
+            prev_is_move = matches!(element, PathElement::Move(_) | PathElement::Close);
         }
     }
 
     /// Fill a path, routing anti-aliased paints through [`fill_path_aa`]
     /// (`paint.isAntiAlias()` selects the AA blitter in `SkDraw::drawPath`).
     fn fill_path(&mut self, path: &Path, paint: &Paint) {
+        // SkPathPriv::PerspectiveClip: under perspective, geometry at or
+        // behind the w = 0 plane maps to flipped or non-finite points, so the
+        // path is first clipped to w > kW0PlaneDistance in local space.
+        let clipped = perspective_clip(path, &self.matrix);
+        let path = clipped.as_ref().unwrap_or(path);
         if paint.is_anti_alias() {
             self.fill_path_aa(path, paint);
         } else {
@@ -1263,7 +1579,7 @@ impl<'a> Rasterizer<'a> {
         let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
 
-        let edges = collect_edges(path, &self.matrix);
+        let edges = collect_edges(path, &self.matrix, Some(&self.device_rect()));
         if edges.is_empty() && !inverse {
             return;
         }
@@ -1342,7 +1658,7 @@ impl<'a> Rasterizer<'a> {
         let source = self.make_source(paint);
         let blend_mode = paint.blend_mode();
 
-        let edges = collect_edges(path, &self.matrix);
+        let edges = collect_edges(path, &self.matrix, Some(&self.device_rect()));
         if edges.is_empty() && !inverse {
             return;
         }
@@ -1385,9 +1701,8 @@ impl<'a> Rasterizer<'a> {
                     for x in px_start..px_end {
                         let l = scalar_from_i32(x).max(x0);
                         let r = scalar_from_i32(x + 1).min(x1);
-                        coverage[usize::try_from(x - clip_x0).unwrap_or(0)] = (r - l)
-                            .max(0.0)
-                            .mul_add(0.25, coverage[usize::try_from(x - clip_x0).unwrap_or(0)]);
+                        coverage[usize::try_from(x - clip_x0).unwrap_or(0)] +=
+                            (r - l).max(0.0) * 0.25;
                     }
                 }
             }
@@ -1448,7 +1763,13 @@ pub(crate) fn path_to_region(path: &Path, clip_bounds: &IRect) -> Region {
     );
 
     let mut region = Region::new();
-    let edges = collect_edges(path, &Matrix::IDENTITY);
+    let device = Rect::new(
+        scalar_from_i32(clip_bounds.left),
+        scalar_from_i32(clip_bounds.top),
+        scalar_from_i32(clip_bounds.right),
+        scalar_from_i32(clip_bounds.bottom),
+    );
+    let edges = collect_edges(path, &Matrix::IDENTITY, Some(&device));
     if !edges.is_empty() {
         let mut get = GlobalEdgeTable::new(edges);
         if let Some(y_start) = get.y_min() {
@@ -1501,7 +1822,14 @@ pub(crate) fn path_coverage_aa(path: &Path, clip_bounds: &IRect) -> Vec<u8> {
         fill_type,
         FillType::InverseWinding | FillType::InverseEvenOdd
     );
-    let edges = collect_edges(path, &Matrix::IDENTITY);
+    // As the aliased clip mask: flatten curves to the clip bounds.
+    let device = Rect::new(
+        scalar_from_i32(clip_bounds.left),
+        scalar_from_i32(clip_bounds.top),
+        scalar_from_i32(clip_bounds.right),
+        scalar_from_i32(clip_bounds.bottom),
+    );
+    let edges = collect_edges(path, &Matrix::IDENTITY, Some(&device));
     if edges.is_empty() {
         if inverse {
             result.fill(255);
@@ -1620,7 +1948,7 @@ impl Edge {
     /// Calculate x intersection at a given scanline y.
     #[inline]
     fn x_at(&self, y: f32) -> f32 {
-        (y - self.y_min).mul_add(self.inv_slope, self.x_at_y_min)
+        (y - self.y_min) * self.inv_slope + self.x_at_y_min
     }
 
     /// Check if this edge is active at the given scanline.
@@ -1788,11 +2116,12 @@ impl ActiveEdgeTable {
 
                     if !was_inside && is_inside {
                         span_start = Some(edge.x);
-                    } else if was_inside && !is_inside {
-                        if let Some(start) = span_start {
-                            spans.push((start, edge.x));
-                            span_start = None;
-                        }
+                    } else if was_inside
+                        && !is_inside
+                        && let Some(start) = span_start
+                    {
+                        spans.push((start, edge.x));
+                        span_start = None;
                     }
                 }
             }
@@ -1817,52 +2146,625 @@ impl ActiveEdgeTable {
     }
 
     /// Check if the AET is empty.
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.edges.is_empty()
     }
 }
 
-/// Quadratic Bezier point at parameter `t` (`mt` = 1 - t), as separable
-/// `mul_add` chains: `p0*mt^2 + 2*p1*mt*t + p2*t^2`.
+/// Quadratic Bezier point at parameter `t` (`mt` = 1 - t):
+/// `p0*mt^2 + 2*p1*mt*t + p2*t^2`.
 fn quad_point(t: Scalar, mt: Scalar, p0: Point, p1: Point, p2: Point) -> Point {
     Point::new(
-        (t * t).mul_add(p2.x, (2.0 * mt * t).mul_add(p1.x, mt * mt * p0.x)),
-        (t * t).mul_add(p2.y, (2.0 * mt * t).mul_add(p1.y, mt * mt * p0.y)),
+        mt * mt * p0.x + 2.0 * mt * t * p1.x + t * t * p2.x,
+        mt * mt * p0.y + 2.0 * mt * t * p1.y + t * t * p2.y,
     )
 }
 
-/// Cubic Bezier point at parameter `t` (`mt` = 1 - t), as separable `mul_add`
-/// chains: `p0*mt^3 + 3*p1*mt^2*t + 3*p2*mt*t^2 + p3*t^3`.
+/// Cubic Bezier point at parameter `t` (`mt` = 1 - t):
+/// `p0*mt^3 + 3*p1*mt^2*t + 3*p2*mt*t^2 + p3*t^3`.
 fn cubic_point(t: Scalar, mt: Scalar, p0: Point, p1: Point, p2: Point, p3: Point) -> Point {
     let mt2 = mt * mt;
     let t2 = t * t;
     Point::new(
-        (t2 * t).mul_add(
-            p3.x,
-            (3.0 * mt * t2).mul_add(p2.x, (mt2 * mt).mul_add(p0.x, 3.0 * mt2 * t * p1.x)),
-        ),
-        (t2 * t).mul_add(
-            p3.y,
-            (3.0 * mt * t2).mul_add(p2.y, (mt2 * mt).mul_add(p0.y, 3.0 * mt2 * t * p1.y)),
-        ),
+        mt2 * mt * p0.x + 3.0 * mt2 * t * p1.x + 3.0 * mt * t2 * p2.x + t2 * t * p3.x,
+        mt2 * mt * p0.y + 3.0 * mt2 * t * p1.y + 3.0 * mt * t2 * p2.y + t2 * t * p3.y,
     )
 }
 
-/// Collect edges from a path.
-#[allow(
-    clippy::similar_names,
-    reason = "t/mt (Bezier parameter and its complement) is the standard flattening naming"
-)]
-fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
-    use skia_rs_core::cast::scalar_from_i32;
+/// The point at `t` on the conic `[start, ctrl, end]` with `weight`, in its
+/// exact rational form.
+fn conic_point(start: Point, ctrl: Point, end: Point, weight: Scalar, t: Scalar) -> Point {
+    let mt = 1.0 - t;
+    let (a, b, c) = (mt * mt, 2.0 * weight * t * mt, t * t);
+    let denom = a + b + c;
+    Point::new(
+        (start.x * a + ctrl.x * b + end.x * c) / denom,
+        (start.y * a + ctrl.y * b + end.y * c) / denom,
+    )
+}
 
-    let mut edges = Vec::new();
+/// Flatten one curve segment into device-space edges, starting from the
+/// already-mapped `current` point, and return the new current point.
+///
+/// `eval` gives the curve's local-space point at `t` in `[0, 1]` and `end`
+/// is its exact local end point (see [`flatten_curve_device_error`]).
+/// `hull` is the curve's local control polygon; its last point is the end.
+fn push_curve_edges(
+    edges: &mut Vec<Edge>,
+    scratch: &mut Vec<Point>,
+    mut current: Point,
+    eval: impl Fn(Scalar) -> Point,
+    matrix: &Matrix,
+    hull: &[Point],
+    device: Option<&Rect>,
+) -> Point {
+    let end = hull[hull.len() - 1];
+    flatten_curve_culled(scratch, eval, end, matrix, hull, device);
+    for &p in scratch.iter() {
+        let p = matrix.map_point(p);
+        if let Some(edge) = Edge::new(current, p) {
+            edges.push(edge);
+        }
+        current = p;
+    }
+    current
+}
+
+/// Flatten a curve into local-space polyline points (excluding its start),
+/// replacing the contents of `out` (a reusable buffer, so hot paths do not
+/// allocate per segment), subdividing until every piece deviates from the
+/// true curve by at most [`CONIC_FLATTEN_TOLERANCE`] *device* pixels under
+/// `matrix` (checked at the quarter, half and three-quarter points of each
+/// piece, so inflected cubics are subdivided too).
+///
+/// `eval` gives the local-space point at `t` in `[0, 1]`; `end` is the exact
+/// local end point. The curve is evaluated in local space and the error is
+/// measured after mapping through the full matrix, which is correct for any
+/// CTM, including perspective (where mapping control points alone would draw
+/// the wrong curve, and would change a conic's weight). Subdivision depth is
+/// capped at 2^12 segments per curve, comparable to Skia's edge builders
+/// (up to 32 quads per conic, each up to 64 lines), which keeps the bound
+/// for curves with device radii up to ~1e6 px; only curves that need the
+/// depth pay for it.
+fn flatten_curve_device_error(
+    out: &mut Vec<Point>,
+    eval: impl Fn(Scalar) -> Point,
+    end: Point,
+    matrix: &Matrix,
+) {
+    const MAX_DEPTH: u32 = 12;
+
+    out.clear();
+    // Iterative depth-first subdivision over [t0, t1] intervals, in curve
+    // order. Each pop pushes at most two entries one level deeper, so the
+    // stack never holds more than MAX_DEPTH + 1 entries: a fixed array.
+    let mut stack = [(0.0_f32, 1.0_f32, 0_u32); MAX_DEPTH as usize + 1];
+    let mut len = 1;
+    while len > 0 {
+        len -= 1;
+        let (t0, t1, depth) = stack[len];
+        let tm = f32::midpoint(t0, t1);
+        let d0 = matrix.map_point(eval(t0));
+        let d1 = matrix.map_point(eval(t1));
+        // Compare the curve with the chord at t = 1/4, 1/2 and 3/4 of the
+        // interval. The midpoint alone is blind to inflections: a symmetric
+        // S-shaped cubic passes exactly through its chord's midpoint while
+        // bulging to both sides of it.
+        let mut max_dev_sq: Scalar = 0.0;
+        for f in [0.25, 0.5, 0.75] {
+            let p = matrix.map_point(eval((t1 - t0) * f + t0));
+            let (cx, cy) = ((d1.x - d0.x) * f + d0.x, (d1.y - d0.y) * f + d0.y);
+            let (dx, dy) = (p.x - cx, p.y - cy);
+            max_dev_sq = max_dev_sq.max(dx * dx + dy * dy);
+        }
+        let within = max_dev_sq <= CONIC_FLATTEN_TOLERANCE * CONIC_FLATTEN_TOLERANCE;
+        if depth >= MAX_DEPTH || within || !max_dev_sq.is_finite() {
+            out.push(if t1 >= 1.0 { end } else { eval(t1) });
+        } else {
+            // Push the second half first so the first half is processed
+            // next, keeping the output in curve order.
+            stack[len] = (tm, t1, depth + 1);
+            stack[len + 1] = (t0, tm, depth + 1);
+            len += 2;
+        }
+    }
+}
+
+/// [`flatten_curve_device_error`] for a curve with local control points
+/// `hull`, except that a curve whose mapped hull lies entirely beyond one
+/// side of `device` becomes a single chord. The curve stays inside its hull,
+/// so every crossing it would make is on the same off-device side as the
+/// chord's: the device's coverage is unchanged, and huge off-screen curves
+/// cost nothing (Skia clips curves to the device before building edges).
+fn flatten_curve_culled(
+    out: &mut Vec<Point>,
+    eval: impl Fn(Scalar) -> Point,
+    end: Point,
+    matrix: &Matrix,
+    hull: &[Point],
+    device: Option<&Rect>,
+) {
+    if let Some(device) = device
+        && !matrix.has_perspective()
+    {
+        let mapped = hull.iter().map(|p| matrix.map_point(*p));
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+            Scalar::INFINITY,
+            Scalar::INFINITY,
+            Scalar::NEG_INFINITY,
+            Scalar::NEG_INFINITY,
+        );
+        for q in mapped {
+            min_x = min_x.min(q.x);
+            min_y = min_y.min(q.y);
+            max_x = max_x.max(q.x);
+            max_y = max_y.max(q.y);
+        }
+        let off = max_x < device.left - 1.0
+            || min_x > device.right + 1.0
+            || max_y < device.top - 1.0
+            || min_y > device.bottom + 1.0;
+        if off {
+            out.clear();
+            out.push(end);
+            return;
+        }
+    }
+    flatten_curve_device_error(out, eval, end, matrix);
+}
+
+/// `path` with every curve flattened in local space so that, after mapping
+/// through `matrix`, the polyline stays within the device-pixel flattening
+/// error (the same bound fills use). Lets a path be mapped point-by-point
+/// under perspective, where mapping control points would bend curves wrong.
+pub(crate) fn flatten_for_matrix(path: &Path, matrix: &Matrix) -> Path {
+    let mut out = PathBuilder::new();
+    out.fill_type(path.fill_type());
+    let mut scratch: Vec<Point> = Vec::new();
     let mut current = Point::zero();
-    let mut contour_start = Point::zero();
-
+    let mut start = Point::zero();
+    let emit = |out: &mut PathBuilder, points: &[Point]| {
+        for q in points {
+            out.line_to(q.x, q.y);
+        }
+    };
     for element in path {
         match element {
             PathElement::Move(p) => {
+                out.move_to(p.x, p.y);
+                (current, start) = (p, p);
+            }
+            PathElement::Line(p) => {
+                out.line_to(p.x, p.y);
+                current = p;
+            }
+            PathElement::Quad(c1, p) => {
+                let s0 = current;
+                flatten_curve_device_error(
+                    &mut scratch,
+                    |t| quad_point(t, 1.0 - t, s0, c1, p),
+                    p,
+                    matrix,
+                );
+                emit(&mut out, &scratch);
+                current = p;
+            }
+            PathElement::Conic(c1, p, weight) => {
+                let s0 = current;
+                flatten_curve_device_error(
+                    &mut scratch,
+                    |t| conic_point(s0, c1, p, weight, t),
+                    p,
+                    matrix,
+                );
+                emit(&mut out, &scratch);
+                current = p;
+            }
+            PathElement::Cubic(c1, c2, p) => {
+                let s0 = current;
+                flatten_curve_device_error(
+                    &mut scratch,
+                    |t| cubic_point(t, 1.0 - t, s0, c1, c2, p),
+                    p,
+                    matrix,
+                );
+                emit(&mut out, &scratch);
+                current = p;
+            }
+            PathElement::Close => {
+                out.close();
+                current = start;
+            }
+        }
+    }
+    out.build()
+}
+
+/// Skia's `SkPathPriv::kW0PlaneDistance`: perspective geometry is clipped
+/// to `w > 1/16384`.
+const W0_PLANE_DISTANCE: Scalar = 1.0 / 16384.0;
+
+/// Segments a curve crossing the w plane is split into before clipping.
+const PERSPECTIVE_CLIP_STEPS: u16 = 32;
+
+/// Port of `SkPathPriv::PerspectiveClip` for fills: `None` when `matrix` has
+/// no perspective or the whole path is in front of the `w = 1/16384` plane;
+/// otherwise the path clipped to that half-plane in local space (empty when
+/// it lies entirely behind). Every contour is treated as closed (a fill) and
+/// clipped Sutherland-Hodgman style; curves wholly in front of the plane
+/// are kept exactly, and curves that cross it are flattened first (Skia's
+/// edge clipper chops them exactly).
+pub(crate) fn perspective_clip(path: &Path, matrix: &Matrix) -> Option<Path> {
+    if !matrix.has_perspective() {
+        return None;
+    }
+    let [.., persp_x, persp_y, persp_w] = matrix.values;
+    let plane_offset = persp_w - W0_PLANE_DISTANCE;
+    let w = |p: Point| persp_x * p.x + persp_y * p.y + plane_offset;
+    let bounds = path.bounds();
+    let corners = [
+        Point::new(bounds.left, bounds.top),
+        Point::new(bounds.right, bounds.top),
+        Point::new(bounds.left, bounds.bottom),
+        Point::new(bounds.right, bounds.bottom),
+    ];
+    let in_front = corners.iter().filter(|p| w(**p) > 0.0).count();
+    if in_front == corners.len() {
+        return None;
+    }
+    let mut out = PathBuilder::new();
+    out.fill_type(path.fill_type());
+    if in_front == 0 {
+        return Some(out.build());
+    }
+
+    let mut clipper = PlaneClipper {
+        out: &mut out,
+        w: &w,
+        started: false,
+        pending: None,
+    };
+    let (mut start, mut current) = (Point::zero(), Point::zero());
+    // A path without a leading move starts at the origin (as collect_edges
+    // treats it).
+    clipper.begin(Point::zero());
+    for element in path {
+        match element {
+            PathElement::Move(p) => {
+                clipper.close_contour(current, start);
+                (start, current) = (p, p);
+                clipper.begin(p);
+            }
+            PathElement::Line(p) => {
+                clipper.line(current, p);
+                current = p;
+            }
+            PathElement::Quad(c1, p) => {
+                let s0 = current;
+                clipper.curve(
+                    &[s0, c1, p],
+                    |t| quad_point(t, 1.0 - t, s0, c1, p),
+                    |o| {
+                        o.quad_to(c1.x, c1.y, p.x, p.y);
+                    },
+                );
+                current = p;
+            }
+            PathElement::Conic(c1, p, weight) => {
+                let s0 = current;
+                clipper.curve(
+                    &[s0, c1, p],
+                    |t| conic_point(s0, c1, p, weight, t),
+                    |o| {
+                        o.conic_to(c1.x, c1.y, p.x, p.y, weight);
+                    },
+                );
+                current = p;
+            }
+            PathElement::Cubic(c1, c2, p) => {
+                let s0 = current;
+                clipper.curve(
+                    &[s0, c1, c2, p],
+                    |t| cubic_point(t, 1.0 - t, s0, c1, c2, p),
+                    |o| {
+                        o.cubic_to(c1.x, c1.y, c2.x, c2.y, p.x, p.y);
+                    },
+                );
+                current = p;
+            }
+            PathElement::Close => {
+                clipper.close_contour(current, start);
+                current = start;
+                clipper.begin(start);
+            }
+        }
+    }
+    clipper.close_contour(current, start);
+    Some(out.build())
+}
+
+/// The part of the local segment `p0`-`p1` in front of the perspective
+/// `w = 1/16384` plane (the segment itself without perspective); `None`
+/// when it lies entirely behind.
+fn clip_to_w_plane(matrix: &Matrix, p0: Point, p1: Point) -> Option<(Point, Point)> {
+    if !matrix.has_perspective() {
+        return Some((p0, p1));
+    }
+    let [.., persp_x, persp_y, persp_w] = matrix.values;
+    let plane_offset = persp_w - W0_PLANE_DISTANCE;
+    let w = |p: Point| persp_x * p.x + persp_y * p.y + plane_offset;
+    let (w0, w1) = (w(p0), w(p1));
+    let crossing = || {
+        let t = w0 / (w0 - w1);
+        Point::new(p0.x + (p1.x - p0.x) * t, p0.y + (p1.y - p0.y) * t)
+    };
+    match (w0 > 0.0, w1 > 0.0) {
+        (true, true) => Some((p0, p1)),
+        (true, false) => Some((p0, crossing())),
+        (false, true) => Some((crossing(), p1)),
+        (false, false) => None,
+    }
+}
+
+/// Sutherland-Hodgman clipping of closed contours against `w(p) > 0`.
+struct PlaneClipper<'a, W: Fn(Point) -> Scalar> {
+    out: &'a mut PathBuilder,
+    w: &'a W,
+    /// Whether the current output contour has its `move_to` yet.
+    started: bool,
+    /// The contour's start point, when in front of the plane, emitted with
+    /// the first segment (so a bare move, e.g. after a `Close`, adds no
+    /// empty contour).
+    pending: Option<Point>,
+}
+
+impl<W: Fn(Point) -> Scalar> PlaneClipper<'_, W> {
+    fn begin(&mut self, p: Point) {
+        self.started = false;
+        self.pending = ((self.w)(p) > 0.0).then_some(p);
+    }
+
+    /// Open the output contour at the pending start point, if any.
+    fn flush(&mut self) {
+        if !self.started
+            && let Some(start) = self.pending.take()
+        {
+            self.out.move_to(start.x, start.y);
+            self.started = true;
+        }
+    }
+
+    fn emit(&mut self, p: Point) {
+        self.flush();
+        if self.started {
+            self.out.line_to(p.x, p.y);
+        } else {
+            self.out.move_to(p.x, p.y);
+            self.started = true;
+        }
+    }
+
+    /// The point on `a`-`b` where `w` crosses zero.
+    fn crossing(&self, a: Point, b: Point) -> Point {
+        let (wa, wb) = ((self.w)(a), (self.w)(b));
+        let t = wa / (wa - wb);
+        Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+    }
+
+    fn line(&mut self, a: Point, b: Point) {
+        let (ia, ib) = ((self.w)(a) > 0.0, (self.w)(b) > 0.0);
+        match (ia, ib) {
+            (true, true) => self.emit(b),
+            (true, false) => {
+                let i = self.crossing(a, b);
+                self.emit(i);
+            }
+            (false, true) => {
+                let i = self.crossing(a, b);
+                self.emit(i);
+                self.emit(b);
+            }
+            (false, false) => {}
+        }
+    }
+
+    /// A curve with control polygon `points` (first = current point): kept
+    /// verbatim (via `keep`) when every control point is in front of the
+    /// plane (the curve lies in their hull), else flattened and clipped.
+    fn curve(
+        &mut self,
+        points: &[Point],
+        eval: impl Fn(Scalar) -> Point,
+        keep: impl FnOnce(&mut PathBuilder),
+    ) {
+        if points.iter().all(|p| (self.w)(*p) > 0.0) {
+            self.flush();
+            if self.started {
+                keep(self.out);
+                return;
+            }
+        }
+        let mut prev = points[0];
+        for i in 1..=PERSPECTIVE_CLIP_STEPS {
+            let t = Scalar::from(i) / Scalar::from(PERSPECTIVE_CLIP_STEPS);
+            let next = eval(t);
+            self.line(prev, next);
+            prev = next;
+        }
+    }
+
+    fn close_contour(&mut self, current: Point, start: Point) {
+        if current != start {
+            self.line(current, start);
+        }
+        if self.started {
+            self.out.close();
+        }
+        self.started = false;
+        self.pending = None;
+    }
+}
+
+/// Liang-Barsky clip of the segment `a`-`b` to `(left, top, right, bottom)`,
+/// computed in f64 so endpoints far outside the device keep the visible
+/// part precise. `None` when the segment is outside or not finite.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "clipped coordinates lie within the device bounds, so they fit f32"
+)]
+fn clip_segment(a: Point, b: Point, bounds: (f64, f64, f64, f64)) -> Option<(Point, Point)> {
+    let (left, top, right, bottom) = bounds;
+    let (ax, ay, bx, by) = (
+        f64::from(a.x),
+        f64::from(a.y),
+        f64::from(b.x),
+        f64::from(b.y),
+    );
+    if !(ax.is_finite() && ay.is_finite() && bx.is_finite() && by.is_finite()) {
+        return None;
+    }
+    let (dx, dy) = (bx - ax, by - ay);
+    let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+    for (p, q) in [
+        (-dx, ax - left),
+        (dx, right - ax),
+        (-dy, ay - top),
+        (dy, bottom - ay),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None;
+            }
+        } else {
+            let r = q / p;
+            if p < 0.0 {
+                t0 = t0.max(r);
+            } else {
+                t1 = t1.min(r);
+            }
+        }
+    }
+    if t0 > t1 {
+        return None;
+    }
+    let at = |t: f64| Point::new((ax + t * dx) as Scalar, (ay + t * dy) as Scalar);
+    // Unclipped ends are returned exactly.
+    Some((
+        if t0 > 0.0 { at(t0) } else { a },
+        if t1 < 1.0 { at(t1) } else { b },
+    ))
+}
+
+/// Cap extension for hairline segments (Skia's `extend_pts`), applied in
+/// device space and mapped back to the local space the walker draws in.
+struct HairlineCaps {
+    matrix: Matrix,
+    inverse: Matrix,
+    outset: Scalar,
+}
+
+impl HairlineCaps {
+    /// Extend a segment's start (`at_start`) and/or end (`at_end`) by the cap
+    /// outset along its device-space tangent. Control points that coincide
+    /// with the end point move with it; a fully degenerate segment moves its
+    /// end point horizontally by the outset (+x at the start, -x at the end):
+    /// Skia sets the tangent to (1, 0) / (-1, 0) and then adds
+    /// `tangent * capOutset`, as for any other tangent.
+    fn extend(&self, pts: &mut [Point], at_start: bool, at_end: bool) {
+        if !(at_start || at_end) {
+            return;
+        }
+        let mut dev: [Point; 4] = [Point::zero(); 4];
+        let n = pts.len();
+        for (d, p) in dev.iter_mut().zip(pts.iter()) {
+            *d = self.matrix.map_point(*p);
+        }
+        let dev = &mut dev[..n];
+        let outset = self.outset;
+        let push = |p: &mut Point, (tx, ty): (Scalar, Scalar)| {
+            p.x += tx * outset;
+            p.y += ty * outset;
+        };
+        let unit = |from: Point, to: Point| {
+            let (dx, dy) = (from.x - to.x, from.y - to.y);
+            let len = dx.hypot(dy);
+            (dx / len, dy / len)
+        };
+        if at_start {
+            match (1..n).find(|&k| dev[k] != dev[0]) {
+                Some(k) => {
+                    let tangent = unit(dev[0], dev[k]);
+                    for p in &mut dev[..k] {
+                        push(p, tangent);
+                    }
+                }
+                None => push(&mut dev[0], (1.0, 0.0)),
+            }
+        }
+        if at_end {
+            let last = n - 1;
+            match (0..last).rev().find(|&k| dev[k] != dev[last]) {
+                Some(k) => {
+                    let tangent = unit(dev[last], dev[k]);
+                    for p in &mut dev[k + 1..] {
+                        push(p, tangent);
+                    }
+                }
+                None => push(&mut dev[last], (-1.0, 0.0)),
+            }
+        }
+        for (p, d) in pts.iter_mut().zip(dev.iter()) {
+            *p = self.inverse.map_point(*d);
+        }
+    }
+}
+
+/// Whether the contour whose verbs (after its `Move`) are `rest` ends with a
+/// `Close` (Skia's `is_next_contour_closed`).
+fn contour_is_closed(rest: &[Verb]) -> bool {
+    rest.iter()
+        .find(|v| matches!(v, Verb::Move | Verb::Close))
+        .is_some_and(|v| *v == Verb::Close)
+}
+
+/// Maximum distance, in device pixels, between a conic and the polyline it is
+/// flattened to (Skia's path flattening tolerance).
+pub(crate) const CONIC_FLATTEN_TOLERANCE: Scalar = 0.25;
+
+/// Collect edges from a path.
+fn collect_edges(path: &Path, matrix: &Matrix, device: Option<&Rect>) -> Vec<Edge> {
+    let mut edges = Vec::new();
+    // A path without a leading move starts at the local origin, so the
+    // device-space start is the *mapped* origin (matching the local one).
+    let mut current = matrix.map_point(Point::zero());
+    let mut contour_start = current;
+    // Local-space counterparts, needed to flatten conics before a
+    // perspective projection.
+    let mut local_current = Point::zero();
+    let mut local_contour_start = Point::zero();
+    // Reused by every curve in the path (no per-segment allocation).
+    let mut curve_scratch: Vec<Point> = Vec::new();
+
+    for element in path {
+        let local_start = local_current;
+        local_current = match element {
+            PathElement::Move(p) => {
+                local_contour_start = p;
+                p
+            }
+            PathElement::Line(p)
+            | PathElement::Quad(_, p)
+            | PathElement::Conic(_, p, _)
+            | PathElement::Cubic(_, _, p) => p,
+            PathElement::Close => local_contour_start,
+        };
+        match element {
+            PathElement::Move(p) => {
+                // Filling treats every open contour as closed (as Skia does):
+                // add the implicit closing edge before starting a new one.
+                if let Some(edge) = Edge::new(current, contour_start) {
+                    edges.push(edge);
+                }
                 current = matrix.map_point(p);
                 contour_start = current;
             }
@@ -1873,52 +2775,42 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
                 }
                 current = end;
             }
-            PathElement::Quad(ctrl, end) => {
-                let ctrl = matrix.map_point(ctrl);
-                let end = matrix.map_point(end);
-                // Flatten to lines
-                let steps = 8;
-                let start = current;
-                for i in 1..=steps {
-                    let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                    let mt = 1.0 - t;
-                    let p = quad_point(t, mt, start, ctrl, end);
-                    if let Some(edge) = Edge::new(current, p) {
-                        edges.push(edge);
-                    }
-                    current = p;
-                }
+            PathElement::Conic(ctrl, end, weight) => {
+                current = push_curve_edges(
+                    &mut edges,
+                    &mut curve_scratch,
+                    current,
+                    |t| conic_point(local_start, ctrl, end, weight, t),
+                    matrix,
+                    &[local_start, ctrl, end],
+                    device,
+                );
             }
-            PathElement::Conic(ctrl, end, _w) => {
-                let ctrl = matrix.map_point(ctrl);
-                let end = matrix.map_point(end);
-                let steps = 8;
-                let start = current;
-                for i in 1..=steps {
-                    let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                    let mt = 1.0 - t;
-                    let p = quad_point(t, mt, start, ctrl, end);
-                    if let Some(edge) = Edge::new(current, p) {
-                        edges.push(edge);
-                    }
-                    current = p;
-                }
+            // Every curve is evaluated in local space and flattened against
+            // a device-pixel error bound: correct under any CTM (mapping
+            // control points is wrong under perspective) and as fine as
+            // the curve's on-screen size needs.
+            PathElement::Quad(ctrl, end) => {
+                current = push_curve_edges(
+                    &mut edges,
+                    &mut curve_scratch,
+                    current,
+                    |t| quad_point(t, 1.0 - t, local_start, ctrl, end),
+                    matrix,
+                    &[local_start, ctrl, end],
+                    device,
+                );
             }
             PathElement::Cubic(c1, c2, end) => {
-                let c1 = matrix.map_point(c1);
-                let c2 = matrix.map_point(c2);
-                let end = matrix.map_point(end);
-                let steps = 12;
-                let start = current;
-                for i in 1..=steps {
-                    let t = scalar_from_i32(i) / scalar_from_i32(steps);
-                    let mt = 1.0 - t;
-                    let p = cubic_point(t, mt, start, c1, c2, end);
-                    if let Some(edge) = Edge::new(current, p) {
-                        edges.push(edge);
-                    }
-                    current = p;
-                }
+                current = push_curve_edges(
+                    &mut edges,
+                    &mut curve_scratch,
+                    current,
+                    |t| cubic_point(t, 1.0 - t, local_start, c1, c2, end),
+                    matrix,
+                    &[local_start, c1, c2, end],
+                    device,
+                );
             }
             PathElement::Close => {
                 if let Some(edge) = Edge::new(current, contour_start) {
@@ -1928,6 +2820,11 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
             }
         }
     }
+    // Implicitly close the last contour (a Close already made this a
+    // zero-length edge, which Edge::new rejects).
+    if let Some(edge) = Edge::new(current, contour_start) {
+        edges.push(edge);
+    }
 
     edges
 }
@@ -1935,6 +2832,67 @@ fn collect_edges(path: &Path, matrix: &Matrix) -> Vec<Edge> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn huge_curves_stay_within_the_device_flattening_tolerance() {
+        // A quarter circle of device radius 1e5: every chord's sagitta must
+        // stay within CONIC_FLATTEN_TOLERANCE (256 segments gave ~0.47 px).
+        let radius = 1.0e5_f32;
+        let matrix = Matrix::scale(radius, radius);
+        let (start, ctrl, end) = (
+            Point::new(1.0, 0.0),
+            Point::new(1.0, 1.0),
+            Point::new(0.0, 1.0),
+        );
+        let weight = std::f32::consts::FRAC_1_SQRT_2;
+        let mut out = Vec::new();
+        flatten_curve_device_error(
+            &mut out,
+            |t| conic_point(start, ctrl, end, weight, t),
+            end,
+            &matrix,
+        );
+        let mut prev = matrix.map_point(start);
+        let mut worst = 0.0_f64;
+        for q in &out {
+            let next = matrix.map_point(*q);
+            let (mx, my) = (
+                f64::midpoint(f64::from(prev.x), f64::from(next.x)),
+                f64::midpoint(f64::from(prev.y), f64::from(next.y)),
+            );
+            worst = worst.max(f64::from(radius) - mx.hypot(my));
+            prev = next;
+        }
+        assert!(
+            worst <= 0.3,
+            "max sagitta {worst} px over {} segments",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn perspective_clip_adds_no_empty_contours() {
+        // Three closed rects straddling the w plane: every output contour
+        // must have segments (no bare move+close left after each Close).
+        let mut b = PathBuilder::new();
+        for i in 0..3_u8 {
+            let x = f32::from(i) * 60.0;
+            b.add_rect(&Rect::new(x, 0.0, x + 50.0, 150.0));
+        }
+        let matrix = Matrix {
+            values: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -0.01, 1.0],
+        };
+        let clipped = perspective_clip(&b.build(), &matrix).expect("straddles the plane");
+        let verbs = clipped.verbs();
+        for pair in verbs.windows(2) {
+            assert!(
+                !(pair[0] == Verb::Move && pair[1] == Verb::Close),
+                "empty contour in {verbs:?}"
+            );
+        }
+        let contours = verbs.iter().filter(|v| **v == Verb::Move).count();
+        assert_eq!(contours, 3);
+    }
 
     #[test]
     fn test_pixel_buffer_new() {

@@ -122,10 +122,10 @@ fn ns_to_prefix(ns: &str) -> &'static str {
 fn collect_text(node: roxmltree::Node) -> String {
     let mut out = String::new();
     for desc in node.descendants() {
-        if desc.is_text() {
-            if let Some(t) = desc.text() {
-                out.push_str(t);
-            }
+        if desc.is_text()
+            && let Some(t) = desc.text()
+        {
+            out.push_str(t);
         }
     }
     out
@@ -190,14 +190,29 @@ fn build_node(
     let mut node = match tag {
         "svg" => SvgNode::new(SvgNodeKind::Svg),
         "g" => SvgNode::new(SvgNodeKind::Group),
-        "rect" => SvgNode::new(SvgNodeKind::Rect(SvgRect {
-            x: hlen("x", "0"),
-            y: vlen("y", "0"),
-            width: hlen("width", "0"),
-            height: vlen("height", "0"),
-            rx: hlen("rx", "0"),
-            ry: vlen("ry", "0"),
-        })),
+        "rect" => {
+            // SkSVGRect's ResolveOptionalRadii (SVG 2): a missing rx/ry is
+            // "auto" (as is `auto` or any value that is not a length); a
+            // given one resolves on its own axis, and an auto one takes the
+            // other's resolved value. A given negative radius is kept: it
+            // draws square corners (SkRRect::MakeRectXY).
+            let given = |k: &str| attrs.get(k).is_some_and(|v| is_length(v));
+            let rx = given("rx").then(|| hlen("rx", "0"));
+            let ry = given("ry").then(|| vlen("ry", "0"));
+            let (rx, ry) = match (rx, ry) {
+                (Some(rx), Some(ry)) => (rx, ry),
+                (Some(r), None) | (None, Some(r)) => (r, r),
+                (None, None) => (0.0, 0.0),
+            };
+            SvgNode::new(SvgNodeKind::Rect(SvgRect {
+                x: hlen("x", "0"),
+                y: vlen("y", "0"),
+                width: hlen("width", "0"),
+                height: vlen("height", "0"),
+                rx,
+                ry,
+            }))
+        }
         "circle" => SvgNode::new(SvgNodeKind::Circle(SvgCircle {
             cx: hlen("cx", "0"),
             cy: vlen("cy", "0"),
@@ -388,10 +403,10 @@ fn apply_common_attrs(node: &mut SvgNode, attrs: &HashMap<String, String>) {
         node.visible = visibility != "hidden";
     }
 
-    if let Some(display) = attrs.get("display") {
-        if display == "none" {
-            node.visible = false;
-        }
+    if let Some(display) = attrs.get("display")
+        && display == "none"
+    {
+        node.visible = false;
     }
 
     // Preserve `style="..."` so css::apply_stylesheet can reapply inline
@@ -501,6 +516,34 @@ fn parse_gradient_units(s: Option<&str>) -> GradientUnits {
 /// 96dpi.
 #[must_use]
 pub fn parse_length(s: &str) -> Scalar {
+    parse_length_inner(s)
+}
+
+/// Whether `s` is a length as `LengthContext::resolve` reads it (a number
+/// with an optional unit directly after it, or a percentage, which may have
+/// space before the `%`), as opposed to a keyword such as `auto` or junk
+/// that would read as 0.
+fn is_length(s: &str) -> bool {
+    const UNITS: &[&str] = &[
+        "vmin", "vmax", "rem", "px", "pt", "pc", "em", "ex", "ch", "vw", "vh", "cm", "mm", "in",
+    ];
+    // Exactly as LengthContext::resolve reads it: a percentage may have
+    // space before the `%`; any other unit must follow the number directly
+    // (parse_length).
+    let s = s.trim();
+    let number = s.strip_suffix('%').map_or_else(
+        || {
+            UNITS
+                .iter()
+                .find_map(|unit| s.strip_suffix(unit))
+                .unwrap_or(s)
+        },
+        str::trim,
+    );
+    number.parse::<Scalar>().is_ok_and(Scalar::is_finite)
+}
+
+fn parse_length_inner(s: &str) -> Scalar {
     // Strip optional trailing unit; anything else is treated as a plain
     // number in user units. Ordered longest-first so that `1rem` matches
     // `rem` before falling through to `em`.

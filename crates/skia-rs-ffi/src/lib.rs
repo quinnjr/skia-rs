@@ -698,32 +698,30 @@ pub unsafe extern "C" fn sk_surface_ref(surface: *mut sk_surface_t) {
 /// Decrement the reference count of a surface.
 ///
 /// Frees the surface when the count reaches 0.
-///
-/// # Panics
-/// Panics (caught by `catch_panic_void`, see the crate-level docs) if the
-/// internal locked-surfaces mutex is poisoned by another thread panicking
-/// while holding it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_surface_unref(surface: *mut sk_surface_t) {
     catch_panic_void(|| {
         if RefCounted::unref_ptr(surface) {
             // The surface was freed — drop any stale lock entry so its
             // address can be safely reused by a future allocation.
-            locked_surfaces()
-                .lock()
-                .unwrap()
-                .remove(&(surface as usize));
+            locked_surface_set().remove(&(surface as usize));
         }
     });
 }
 
 /// Get the reference count of a surface.
+///
+/// A canvas locked with [`sk_surface_lock_canvas`] holds one reference
+/// until [`sk_canvas_release`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_surface_get_refcnt(surface: *const sk_surface_t) -> u32 {
     catch_panic(|| RefCounted::get_count(surface))
 }
 
 /// Check if the surface has only one reference.
+///
+/// A locked canvas holds a reference, so this is false while one is
+/// locked.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_surface_is_unique(surface: *const sk_surface_t) -> bool {
     catch_panic(|| RefCounted::is_unique(surface))
@@ -1628,11 +1626,21 @@ pub const unsafe extern "C" fn sk_is_available() -> bool {
 // Surface drawing helpers (simplified path; prefer sk_canvas_* for parity)
 // =============================================================================
 
+/// The [`locked_surfaces`] set, usable even if another thread panicked
+/// while holding its mutex (the set stays consistent: every update is a
+/// single insert or remove), so a stale entry can never outlive its surface.
+fn locked_surface_set() -> std::sync::MutexGuard<'static, std::collections::HashSet<usize>> {
+    locked_surfaces()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Global set of surface pointer addresses currently locked via
 /// [`sk_surface_lock_canvas`]. Backs the documented lock contract: only one
 /// canvas may be held per surface at a time, and the `sk_surface_draw_*` /
 /// [`sk_surface_clear`] convenience helpers (which draw directly on the
 /// surface, bypassing the locked canvas) are rejected while a lock is held.
+/// Access it through [`locked_surface_set`].
 fn locked_surfaces() -> &'static std::sync::Mutex<std::collections::HashSet<usize>> {
     static LOCKED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
         std::sync::OnceLock::new();
@@ -1642,11 +1650,7 @@ fn locked_surfaces() -> &'static std::sync::Mutex<std::collections::HashSet<usiz
 /// Returns true if `surface` currently has an outstanding lock from
 /// [`sk_surface_lock_canvas`].
 unsafe fn is_surface_locked(surface: *const sk_surface_t) -> bool {
-    !surface.is_null()
-        && locked_surfaces()
-            .lock()
-            .unwrap()
-            .contains(&(surface as usize))
+    !surface.is_null() && locked_surface_set().contains(&(surface as usize))
 }
 
 /// Clear a surface with a color. No-op while the surface is locked (see
@@ -1770,7 +1774,7 @@ pub struct sk_canvas_t {
     height: i32,
     state: CanvasState,
     /// Identity (pointer address) of the [`sk_surface_t`] this canvas was
-    /// locked from, used to release the entry in [`LOCKED_SURFACES`] on
+    /// locked from, used to release the entry in [`locked_surfaces`] on
     /// [`sk_canvas_release`]. 0 for canvases not tied to a surface lock.
     locked_surface: usize,
 }
@@ -1779,31 +1783,62 @@ pub struct sk_canvas_t {
 ///
 /// The FFI canvas rebuilds a new [`skia_rs_canvas::Canvas`] for every draw call,
 /// so any clip state must be persisted here and replayed before each draw.
+/// Each entry keeps the matrix it was set under: like `SkCanvas`, a clip is
+/// fixed in device space when it is made, so later transforms do not move it.
 #[derive(Clone)]
 enum ClipEntry {
     Rect {
         rect: Rect,
         op: ClipOp,
         anti_alias: bool,
+        matrix: Matrix,
     },
     Path {
         path: Box<Path>,
         op: ClipOp,
         anti_alias: bool,
+        matrix: Matrix,
     },
 }
 
+/// An offscreen layer pushed by [`sk_canvas_save_layer`]: draws go into its
+/// pixels until the matching restore composites them onto `parent`.
+struct FfiLayer {
+    /// The layer's premultiplied pixels (owned; from `Box::into_raw`, null
+    /// once taken).
+    pixels: *mut PixelBuffer,
+    /// The layer's top-left in device space.
+    origin: (i32, i32),
+    /// The area draws into the layer may cover, in device space (the
+    /// `bounds` hint limits content, not the filtered result).
+    content: skia_rs_core::IRect,
+    /// The draw target to return to on restore.
+    parent: *mut PixelBuffer,
+    /// The layer paint (alpha, blend mode, color and image filters).
+    paint: Option<Paint>,
+}
+
+impl FfiLayer {
+    /// Takes ownership of the layer's pixels.
+    fn take_pixels(&mut self) -> Option<PixelBuffer> {
+        let pixels = std::mem::replace(&mut self.pixels, ptr::null_mut());
+        // SAFETY: `pixels` came from `Box::into_raw` and is taken only once.
+        (!pixels.is_null()).then(|| *unsafe { Box::from_raw(pixels) })
+    }
+}
+
+impl Drop for FfiLayer {
+    fn drop(&mut self) {
+        drop(self.take_pixels());
+    }
+}
+
 /// Snapshot of a [`CanvasState`] pushed by [`sk_canvas_save`] or
-/// [`sk_canvas_save_layer`].
-///
-/// `save_layer` currently records the same state as a plain `save` because
-/// the FFI canvas reconstructs its underlying [`Canvas<'_>`] between calls —
-/// there's no persistent layer to pop. Layer bounds/paint will be added
-/// here when layer composition is wired through the transient canvas.
-#[derive(Clone)]
+/// [`sk_canvas_save_layer`] (which also carries the layer).
 struct CanvasSaveFrame {
     matrix: Matrix,
     clip_len: usize,
+    layer: Option<FfiLayer>,
 }
 
 struct CanvasState {
@@ -1829,43 +1864,112 @@ impl sk_canvas_t {
     /// and the transient `Canvas<'_>` returned borrows the pixel buffer
     /// exclusively. Clip-rect entries are cheap; clip-path entries clone
     /// the `Path` (which holds `Vec<Verb>` + `Vec<Point>`) — usually small.
+    ///
+    /// Inside a layer only the clips set since the layer was pushed apply
+    /// (Skia's layer device starts wide open; the outer clip applies when
+    /// the layer is composited), and device coordinates are shifted to the
+    /// layer's origin.
     unsafe fn canvas_with_state(&mut self) -> skia_rs_canvas::Canvas<'_> {
-        let transform = self.state.matrix;
-        let clips = self.state.clips.clone();
+        use skia_rs_core::cast::scalar_from_i32;
+
+        let (clip_base, (ox, oy)) = self.target();
+        let base = Matrix::translate(-scalar_from_i32(ox), -scalar_from_i32(oy));
+        let transform = base.concat(&self.state.matrix);
+        let clips = self.state.clips[clip_base.min(self.state.clips.len())..].to_vec();
+        let content = self
+            .state
+            .stack
+            .iter()
+            .rev()
+            .find_map(|f| f.layer.as_ref().map(|l| l.content));
         let mut c = self.canvas();
-        c.concat(&transform);
+        if let Some(content) = content {
+            c.set_matrix(&base);
+            c.clip_rect(
+                &Rect::new(
+                    scalar_from_i32(content.left),
+                    scalar_from_i32(content.top),
+                    scalar_from_i32(content.right),
+                    scalar_from_i32(content.bottom),
+                ),
+                ClipOp::Intersect,
+                false,
+            );
+        }
         for entry in &clips {
             match entry {
                 ClipEntry::Rect {
                     rect,
                     op,
                     anti_alias,
-                } => c.clip_rect(rect, *op, *anti_alias),
+                    matrix,
+                } => {
+                    c.set_matrix(&base.concat(matrix));
+                    c.clip_rect(rect, *op, *anti_alias);
+                }
                 ClipEntry::Path {
                     path,
                     op,
                     anti_alias,
-                } => c.clip_path(path.as_ref(), *op, *anti_alias),
+                    matrix,
+                } => {
+                    c.set_matrix(&base.concat(matrix));
+                    c.clip_path(path.as_ref(), *op, *anti_alias);
+                }
             }
         }
+        c.set_matrix(&transform);
         c
+    }
+
+    /// The current draw target: the index of the first clip that applies
+    /// to it, and its origin in device space (the innermost layer's, or
+    /// the surface's).
+    fn target(&self) -> (usize, (i32, i32)) {
+        self.state
+            .stack
+            .iter()
+            .rev()
+            .find_map(|f| f.layer.as_ref().map(|l| (f.clip_len, l.origin)))
+            .unwrap_or((0, (0, 0)))
+    }
+
+    /// Pops one save; a layer is composited onto its parent through the
+    /// parent's clip, like `SkCanvas::internalRestore`.
+    unsafe fn restore_one(&mut self) {
+        let Some(mut frame) = self.state.stack.pop() else {
+            return;
+        };
+        self.state.matrix = frame.matrix;
+        self.state.clips.truncate(frame.clip_len);
+        self.state.save_count = self.state.save_count.saturating_sub(1);
+        if let Some(mut layer) = frame.layer.take() {
+            self.buffer = layer.parent;
+            let Some(pixels) = layer.take_pixels() else {
+                return;
+            };
+            let (_, (px, py)) = self.target();
+            let origin = (layer.origin.0 - px, layer.origin.1 - py);
+            self.canvas_with_state()
+                .composite_layer_pixels(pixels, origin, layer.paint.as_ref());
+        }
     }
 }
 
 /// Acquire a canvas borrowed from the given surface.
 ///
-/// The returned canvas is valid until [`sk_canvas_release`] is called and
-/// must not outlive `surface`. Only one canvas may be held per surface at
+/// The returned canvas is valid until [`sk_canvas_release`] is called. It
+/// holds a reference to `surface` until then, so unreffing the surface
+/// while it is locked does not free it under the canvas. Only one canvas may be held per surface at
 /// a time — attempting to lock twice returns null. While a surface is
 /// locked, the `sk_surface_draw_*`/`sk_surface_clear` convenience helpers
 /// (which bypass the locked canvas and draw directly on the surface) are
 /// rejected (no-op) to avoid two independent mutable views of the same
 /// pixel buffer.
 ///
-/// # Panics
-/// Panics (caught by `catch_panic`, see the crate-level docs) if the
-/// internal locked-surfaces mutex is poisoned by another thread panicking
-/// while holding it.
+/// # Safety
+/// `surface` must be null or a live surface handle. The returned canvas must
+/// be released exactly once with [`sk_canvas_release`] and not used after.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_surface_lock_canvas(surface: *mut sk_surface_t) -> *mut sk_canvas_t {
     catch_panic(|| {
@@ -1873,17 +1977,20 @@ pub unsafe extern "C" fn sk_surface_lock_canvas(surface: *mut sk_surface_t) -> *
             return ptr::null_mut();
         }
         let key = surface as usize;
-        if !locked_surfaces().lock().unwrap().insert(key) {
+        if !locked_surface_set().insert(key) {
             // Already locked.
             return ptr::null_mut();
         }
         let Some(s) = RefCounted::get_mut(surface) else {
-            locked_surfaces().lock().unwrap().remove(&key);
+            locked_surface_set().remove(&key);
             return ptr::null_mut();
         };
         let width = s.width();
         let height = s.height();
         let buffer: *mut PixelBuffer = s.pixel_buffer_mut();
+        // Keep the surface alive while locked: the canvas draws into its
+        // buffer, and release may composite open layers into it.
+        RefCounted::ref_ptr(surface);
         Box::into_raw(Box::new(sk_canvas_t {
             buffer,
             width,
@@ -1901,20 +2008,45 @@ pub unsafe extern "C" fn sk_surface_lock_canvas(surface: *mut sk_surface_t) -> *
 
 /// Release a canvas acquired via [`sk_surface_lock_canvas`].
 ///
-/// # Panics
-/// Panics (caught by `catch_panic_void`, see the crate-level docs) if the
-/// internal locked-surfaces mutex is poisoned by another thread panicking
-/// while holding it.
+/// Like `~SkCanvas`, open saves are unwound first, compositing any open
+/// layer into the surface.
+///
+/// # Safety
+/// `canvas` must be null or a canvas from [`sk_surface_lock_canvas`] that
+/// has not been released; it must not be used afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_canvas_release(canvas: *mut sk_canvas_t) {
     catch_panic_void(|| {
         if !canvas.is_null() {
-            let c = Box::from_raw(canvas);
-            if c.locked_surface != 0 {
-                locked_surfaces().lock().unwrap().remove(&c.locked_surface);
+            // Unlocks the surface and drops the canvas's reference to it
+            // even if compositing below panics. Declared before the canvas
+            // so the canvas (which points into the surface's pixels) drops
+            // first.
+            let _unlock = SurfaceUnlock((*canvas).locked_surface);
+            let mut c = Box::from_raw(canvas);
+            // Like ~SkCanvas: unwind open saves, compositing open layers.
+            while !c.state.stack.is_empty() {
+                c.restore_one();
             }
         }
     });
+}
+
+/// Releases a locked surface on drop: removes its [`locked_surfaces`] entry
+/// and the reference [`sk_surface_lock_canvas`] took. 0 means no surface.
+struct SurfaceUnlock(usize);
+
+impl Drop for SurfaceUnlock {
+    fn drop(&mut self) {
+        if self.0 == 0 {
+            return;
+        }
+        // Remove the entry even if another thread poisoned the mutex: a
+        // stale address would make a later surface there look locked.
+        locked_surface_set().remove(&self.0);
+        // SAFETY: the lock took a reference, so the surface is alive.
+        unsafe { RefCounted::unref_ptr(self.0 as *mut sk_surface_t) };
+    }
 }
 
 /// Get the width of the canvas.
@@ -1930,6 +2062,13 @@ pub unsafe extern "C" fn sk_canvas_get_height(canvas: *const sk_canvas_t) -> i32
 }
 
 /// Save the current transformation matrix and clip stack.
+///
+/// Returns the same value as `SkCanvas::save()`: the save count *before*
+/// this call in Skia's 1-based counting (1 for the first save, 2 for a
+/// nested one, ...). Returns 0 if `canvas` is null.
+///
+/// # Safety
+/// `canvas` must be null or a live canvas handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_canvas_save(canvas: *mut sk_canvas_t) -> i32 {
     catch_panic(|| {
@@ -1939,6 +2078,7 @@ pub unsafe extern "C" fn sk_canvas_save(canvas: *mut sk_canvas_t) -> i32 {
         let frame = CanvasSaveFrame {
             matrix: c.state.matrix,
             clip_len: c.state.clips.len(),
+            layer: None,
         };
         c.state.stack.push(frame);
         c.state.save_count += 1;
@@ -1946,54 +2086,102 @@ pub unsafe extern "C" fn sk_canvas_save(canvas: *mut sk_canvas_t) -> i32 {
     })
 }
 
-/// Save a layer — pushes a save frame that records the layer bounds and
-/// paint for composition on restore.
+/// Save a layer, like `SkCanvas::saveLayer`.
 ///
-/// Both `bounds` and `paint` are optional (null is acceptable). The layer
-/// is allocated lazily (at the next draw) because draws go through the
-/// transient [`Canvas`](skia_rs_canvas::Canvas) layer machinery already. Returns the new save count,
-/// or 0 on failure (null canvas).
+/// Later draws go into an offscreen layer until the matching
+/// [`sk_canvas_restore`] (or [`sk_canvas_release`]), which composites it
+/// through the clip in effect here using `paint`'s alpha, blend mode, color
+/// filter and image filter. `bounds` (local coordinates), if given, clips
+/// what is drawn into the layer, as in Skia; the image filter's result may
+/// still spread past it, up to the clip. Both may be null. Inside the layer
+/// only clips set after this call (and `bounds`) apply, as in Skia.
 ///
-/// **Pragmatic note:** because the FFI canvas reconstructs its underlying
-/// [`Canvas`](skia_rs_canvas::Canvas) between calls, the `layer_paint` / `layer_bounds` are tracked but
-/// composition is delegated to the transient canvas at the next draw — the
-/// effective behavior matches the recording-only semantics in
-/// [`skia_rs_canvas::Canvas::save_layer`].
+/// Returns the same value as `SkCanvas::saveLayer()` (and
+/// [`sk_canvas_save`]): the save count *before* this call in Skia's
+/// 1-based counting (1 for the first save, 2 for a nested one, ...).
+/// Returns 0 if `canvas` is null.
+///
+/// # Safety
+/// `canvas` must be null or a live locked canvas; `bounds` must be null or
+/// point to a valid `sk_rect_t`; `paint` must be null or a live paint
+/// handle. The paint is copied, so it may be released afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_canvas_save_layer(
     canvas: *mut sk_canvas_t,
-    _bounds: *const sk_rect_t,
-    _paint: *const sk_paint_t,
-) -> u32 {
-    // Currently behaves as a plain save() — see [`CanvasSaveFrame`] for why
-    // layer composition is deferred. The parameters are typed and accepted
-    // now so the C ABI doesn't need to break when layer support lands.
+    bounds: *const sk_rect_t,
+    paint: *const sk_paint_t,
+) -> i32 {
     catch_panic(|| {
+        use skia_rs_core::cast::scalar_from_i32;
+
         let Some(c) = canvas.as_mut() else {
             return 0;
         };
-        let frame = CanvasSaveFrame {
+        let bounds = bounds.as_ref().map(|b| Rect::from(*b));
+        let paint = RefCounted::get_ref(paint).cloned();
+        let (_, (ox, oy)) = c.target();
+        // The surface, in the coordinates of the current target's pixels:
+        // bounds nested filtered layers by the real device, not the parent
+        // layer.
+        let device = Rect::new(
+            scalar_from_i32(-ox),
+            scalar_from_i32(-oy),
+            scalar_from_i32(c.width - ox),
+            scalar_from_i32(c.height - oy),
+        );
+        let (rect, content, paint) = {
+            let inner = c.canvas_with_state();
+            let rec = skia_rs_canvas::SaveLayerRec {
+                bounds: bounds.as_ref(),
+                paint: paint.as_ref(),
+                flags: skia_rs_canvas::SaveLayerFlags::NONE,
+            };
+            let (rect, content) = inner.layer_bounds_and_content_within(&rec, &device);
+            let paint = inner.layer_paint(paint.as_ref(), &rect);
+            (rect, content, paint)
+        };
+        let (w, h) = (rect.width().max(0), rect.height().max(0));
+        let pixels = Box::into_raw(Box::new(PixelBuffer::new(w, h)));
+        let layer = FfiLayer {
+            pixels,
+            origin: (rect.left + ox, rect.top + oy),
+            content: skia_rs_core::IRect::new(
+                content.left + ox,
+                content.top + oy,
+                content.right + ox,
+                content.bottom + oy,
+            ),
+            parent: c.buffer,
+            paint,
+        };
+        c.state.stack.push(CanvasSaveFrame {
             matrix: c.state.matrix,
             clip_len: c.state.clips.len(),
-        };
-        c.state.stack.push(frame);
+            layer: Some(layer),
+        });
+        c.buffer = pixels;
         c.state.save_count += 1;
-        u32::try_from(c.state.save_count).unwrap_or(u32::MAX)
+        i32::try_from(c.state.save_count).unwrap_or(i32::MAX)
     })
 }
 
-/// Restore the most recently saved matrix and clip.
+/// Restore the most recently saved matrix and clip, like `SkCanvas::restore`.
+///
+/// If that save was a [`sk_canvas_save_layer`], its
+/// offscreen layer is composited into the layer or surface below, through
+/// the outer clip, with the layer paint's alpha, blend mode, color filter
+/// and image filter. Does nothing when there is no save to restore.
+///
+/// # Safety
+/// `canvas` must be null or a canvas from [`sk_surface_lock_canvas`] that
+/// has not been released.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_canvas_restore(canvas: *mut sk_canvas_t) {
     catch_panic_void(|| {
         let Some(c) = canvas.as_mut() else {
             return;
         };
-        if let Some(frame) = c.state.stack.pop() {
-            c.state.matrix = frame.matrix;
-            c.state.clips.truncate(frame.clip_len);
-            c.state.save_count = c.state.save_count.saturating_sub(1);
-        }
+        c.restore_one();
     });
 }
 
@@ -2120,6 +2308,7 @@ pub unsafe extern "C" fn sk_canvas_clip_rect(
             rect: Rect::from(*r),
             op: clip_op,
             anti_alias,
+            matrix: c.state.matrix,
         });
         true
     })
@@ -2150,6 +2339,7 @@ pub unsafe extern "C" fn sk_canvas_clip_path(
             path: Box::new(p.clone()),
             op: clip_op,
             anti_alias,
+            matrix: c.state.matrix,
         });
         true
     })
@@ -2157,8 +2347,14 @@ pub unsafe extern "C" fn sk_canvas_clip_path(
 
 /// Fill `out` with the device-space integer clip bounds of this canvas.
 ///
-/// Returns true on success. If the clip is empty or the canvas has no clips,
-/// `out` is filled with `[0, 0, width, height]`.
+/// Returns true on success. With no clips `out` is the device bounds
+/// `[0, 0, width, height]` (inside a layer, the layer's content bounds:
+/// its `bounds` hint, if one was given); an empty clip gives
+/// `[0, 0, 0, 0]`, as `SkCanvas::getDeviceClipBounds`.
+///
+/// # Safety
+/// `canvas` must be null or a live canvas handle, and `out` must be null or
+/// point to writable memory for one `sk_irect_t`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_canvas_get_clip_ibounds(
     canvas: *mut sk_canvas_t,
@@ -2171,13 +2367,27 @@ pub unsafe extern "C" fn sk_canvas_get_clip_ibounds(
         let Some(dst) = out.as_mut() else {
             return false;
         };
+        // Inside a layer the transient canvas is in the layer's pixels:
+        // shift back to device space, as getDeviceClipBounds reports.
+        let (_, (ox, oy)) = c.target();
         let inner = c.canvas_with_state();
         let bounds = inner.clip_bounds();
-        *dst = sk_irect_t {
-            left: skia_rs_core::cast::floor_to_i32(bounds.left),
-            top: skia_rs_core::cast::floor_to_i32(bounds.top),
-            right: skia_rs_core::cast::ceil_to_i32(bounds.right),
-            bottom: skia_rs_core::cast::ceil_to_i32(bounds.bottom),
+        // An empty clip is (0, 0, 0, 0), as getDeviceClipBounds reports it,
+        // not a zero-size rect at the layer origin.
+        *dst = if bounds.is_empty() {
+            sk_irect_t {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            }
+        } else {
+            sk_irect_t {
+                left: skia_rs_core::cast::floor_to_i32(bounds.left) + ox,
+                top: skia_rs_core::cast::floor_to_i32(bounds.top) + oy,
+                right: skia_rs_core::cast::ceil_to_i32(bounds.right) + ox,
+                bottom: skia_rs_core::cast::ceil_to_i32(bounds.bottom) + oy,
+            }
         };
         true
     })
@@ -2969,7 +3179,10 @@ pub struct sk_picture_recorder_t {
     commands: Vec<skia_rs_canvas::DrawCommand>,
     /// Cull rect recorded by `begin_recording`.
     cull_rect: Rect,
-    /// State of the borrowed recording canvas (if any).
+    /// State of the borrowed recording canvas (if any). Only the save stack
+    /// is used (to drop unbalanced restores): transforms are recorded as
+    /// commands and geometry stays local, so playback applies them; never
+    /// bake the matrix or clips here into recorded geometry.
     state: Option<CanvasState>,
     recording: bool,
     /// Liveness flag shared with every [`sk_recording_canvas_t`] handed out
@@ -3027,7 +3240,7 @@ pub struct sk_recording_canvas_t {
     alive: Arc<AtomicBool>,
 }
 
-/// Resolve a recording-canvas handle to its active `(recorder, state)` pair.
+/// Resolve a recording-canvas handle to its recorder's `(commands, state)`.
 ///
 /// Returns `None` if the handle is null, the recorder that created it has
 /// since been deleted (checked via the shared `alive` flag *before* the
@@ -3037,16 +3250,22 @@ pub struct sk_recording_canvas_t {
 /// `finish_recording`) is absent.
 unsafe fn resolve_recording_canvas<'a>(
     canvas: *mut sk_recording_canvas_t,
-) -> Option<(&'a mut sk_picture_recorder_t, &'a mut CanvasState)> {
+) -> Option<(
+    &'a mut Vec<skia_rs_canvas::DrawCommand>,
+    &'a mut CanvasState,
+)> {
     let rc = canvas.as_mut()?;
     if !rc.alive.load(Ordering::Acquire) {
         return None;
     }
     let rec = rc.recorder.as_mut()?;
-    // Split borrow: `rec.state` and `rec` otherwise alias.
-    let state_ptr: *mut Option<CanvasState> = &raw mut rec.state;
-    let state = (&mut *state_ptr).as_mut()?;
-    Some((rec, state))
+    // Hand out two *disjoint* field borrows (the command list and the canvas
+    // state) rather than the whole recorder plus a pointer into it, so no
+    // two live `&mut` overlap.
+    let sk_picture_recorder_t {
+        commands, state, ..
+    } = rec;
+    Some((commands, state.as_mut()?))
 }
 
 /// Begin recording into a fresh picture.
@@ -3116,15 +3335,29 @@ pub unsafe extern "C" fn sk_picture_recorder_finish_recording(
 }
 
 /// Push a save onto the recording canvas's state.
+///
+/// Returns the same value as `SkCanvas::save()`: the save count *before*
+/// this call in Skia's 1-based counting (1 for the first save). Returns 0
+/// if the handle is null or its recorder was deleted.
+///
+/// Like `SkPicture`, the recording stores the save and later transform ops
+/// as commands and keeps geometry in local coordinates, so playback composes
+/// with the target canvas's own matrix and path effects see local geometry.
+///
+/// # Safety
+/// `canvas` must be null or a recording canvas handle from
+/// `sk_picture_recorder_begin_recording`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_recording_canvas_save(canvas: *mut sk_recording_canvas_t) -> i32 {
     catch_panic(|| {
-        let Some((_, state)) = resolve_recording_canvas(canvas) else {
+        let Some((commands, state)) = resolve_recording_canvas(canvas) else {
             return 0;
         };
+        commands.push(skia_rs_canvas::DrawCommand::Save);
         let frame = CanvasSaveFrame {
             matrix: state.matrix,
             clip_len: state.clips.len(),
+            layer: None,
         };
         state.stack.push(frame);
         state.save_count += 1;
@@ -3136,10 +3369,11 @@ pub unsafe extern "C" fn sk_recording_canvas_save(canvas: *mut sk_recording_canv
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_recording_canvas_restore(canvas: *mut sk_recording_canvas_t) {
     catch_panic_void(|| {
-        let Some((_, state)) = resolve_recording_canvas(canvas) else {
+        let Some((commands, state)) = resolve_recording_canvas(canvas) else {
             return;
         };
         if let Some(frame) = state.stack.pop() {
+            commands.push(skia_rs_canvas::DrawCommand::Restore);
             state.matrix = frame.matrix;
             state.clips.truncate(frame.clip_len);
             state.save_count = state.save_count.saturating_sub(1);
@@ -3155,16 +3389,16 @@ pub unsafe extern "C" fn sk_recording_canvas_translate(
     dy: f32,
 ) {
     catch_panic_void(|| {
-        let Some((_, state)) = resolve_recording_canvas(canvas) else {
+        let Some((commands, _)) = resolve_recording_canvas(canvas) else {
             return;
         };
-        state.matrix = state.matrix.concat(&Matrix::translate(dx, dy));
+        commands.push(skia_rs_canvas::DrawCommand::Translate { dx, dy });
     });
 }
 
-/// Draw a rect into the recording canvas. The rect is captured in the
-/// caller-space coordinates (post-transform) so playback can place it on
-/// any target canvas.
+/// Draw a rect into the recording canvas. The rect is recorded in local
+/// coordinates; the transform ops recorded before it are replayed on top of
+/// the playback canvas's matrix, as with `SkPicture`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sk_recording_canvas_draw_rect(
     canvas: *mut sk_recording_canvas_t,
@@ -3172,16 +3406,15 @@ pub unsafe extern "C" fn sk_recording_canvas_draw_rect(
     paint: *const sk_paint_t,
 ) {
     catch_panic_void(|| {
-        let Some((rec, state)) = resolve_recording_canvas(canvas) else {
+        let Some((commands, _)) = resolve_recording_canvas(canvas) else {
             return;
         };
         let Some(r) = rect.as_ref() else { return };
         let Some(p) = RefCounted::get_ref(paint).cloned() else {
             return;
         };
-        let transformed = state.matrix.map_rect(&Rect::from(*r));
-        rec.commands.push(skia_rs_canvas::DrawCommand::DrawRect {
-            rect: transformed,
+        commands.push(skia_rs_canvas::DrawCommand::DrawRect {
+            rect: Rect::from(*r),
             paint: p,
         });
     });
@@ -3195,7 +3428,7 @@ pub unsafe extern "C" fn sk_recording_canvas_draw_path(
     paint: *const sk_paint_t,
 ) {
     catch_panic_void(|| {
-        let Some((rec, state)) = resolve_recording_canvas(canvas) else {
+        let Some((commands, _)) = resolve_recording_canvas(canvas) else {
             return;
         };
         let Some(path_ref) = RefCounted::get_ref(path).cloned() else {
@@ -3204,9 +3437,8 @@ pub unsafe extern "C" fn sk_recording_canvas_draw_path(
         let Some(p) = RefCounted::get_ref(paint).cloned() else {
             return;
         };
-        let transformed = path_ref.transformed(&state.matrix);
-        rec.commands.push(skia_rs_canvas::DrawCommand::DrawPath {
-            path: transformed,
+        commands.push(skia_rs_canvas::DrawCommand::DrawPath {
+            path: path_ref,
             paint: p,
         });
     });
@@ -3384,8 +3616,9 @@ pub type sk_patheffect_t = RefCounted<PathEffectRef>;
 
 /// Create a dash path effect.
 ///
-/// `intervals` must be non-null with `count` positive entries; the pattern
-/// is duplicated internally if `count` is odd, matching Skia's semantics.
+/// `intervals` must be non-null with an even `count` of at least 2
+/// non-negative entries; like `SkDashPathEffect::Make`, an odd `count`
+/// returns null.
 /// `phase` shifts where the pattern starts. Returns null if the intervals
 /// are invalid (empty, negative, or sum to 0).
 #[unsafe(no_mangle)]
@@ -4230,7 +4463,7 @@ mod tests {
             let canvas = sk_surface_lock_canvas(surface);
             let n0 = sk_canvas_save(canvas);
             let n1 = sk_canvas_save_layer(canvas, ptr::null(), ptr::null());
-            assert_eq!(i32::try_from(n1).unwrap(), n0 + 1);
+            assert_eq!(n1, n0 + 1);
             sk_canvas_restore(canvas);
             sk_canvas_restore(canvas);
             sk_canvas_release(canvas);
@@ -4394,6 +4627,73 @@ mod tests {
     }
 
     #[test]
+    fn test_recording_canvas_records_transforms_and_local_geometry() {
+        // Like SkPicture: transform ops are recorded as commands and geometry
+        // stays local, so path effects see local coordinates at playback.
+        unsafe {
+            let rec = sk_picture_recorder_new();
+            let cull = sk_rect_t {
+                left: 0.0,
+                top: 0.0,
+                right: 32.0,
+                bottom: 32.0,
+            };
+            let rcanvas = sk_picture_recorder_begin_recording(rec, &raw const cull);
+            let paint = sk_paint_new();
+            let r = sk_rect_t {
+                left: 0.0,
+                top: 0.0,
+                right: 4.0,
+                bottom: 4.0,
+            };
+            sk_recording_canvas_save(rcanvas);
+            sk_recording_canvas_translate(rcanvas, 8.0, 0.0);
+            sk_recording_canvas_draw_rect(rcanvas, &raw const r, paint);
+            sk_recording_canvas_restore(rcanvas);
+
+            let commands = &(*rec).commands;
+            assert!(matches!(commands[0], skia_rs_canvas::DrawCommand::Save));
+            match commands[1] {
+                skia_rs_canvas::DrawCommand::Translate { dx, dy } => {
+                    assert!((dx - 8.0).abs() < f32::EPSILON && dy.abs() < f32::EPSILON);
+                }
+                ref other => panic!("expected Translate, got {other:?}"),
+            }
+            match &commands[2] {
+                skia_rs_canvas::DrawCommand::DrawRect { rect, .. } => {
+                    assert_eq!(
+                        *rect,
+                        Rect::from_xywh(0.0, 0.0, 4.0, 4.0),
+                        "rect stays local"
+                    );
+                }
+                other => panic!("expected DrawRect, got {other:?}"),
+            }
+            assert!(matches!(commands[3], skia_rs_canvas::DrawCommand::Restore));
+
+            sk_paint_unref(paint);
+            sk_recording_canvas_release(rcanvas);
+
+            // Playback still lands the rect at x = 8..12.
+            let picture = sk_picture_recorder_finish_recording(rec);
+            let surface = sk_surface_new_raster(32, 32);
+            let canvas = sk_surface_lock_canvas(surface);
+            sk_canvas_clear(canvas, 0xFFFF_FFFF);
+            assert!(sk_picture_playback(picture, canvas));
+            sk_canvas_release(canvas);
+            let mut buf = vec![0u8; 32 * 32 * 4];
+            sk_surface_read_pixels(surface, buf.as_mut_ptr(), buf.len());
+            let px = |x: usize, y: usize| buf[(y * 32 + x) * 4];
+            assert!(px(10, 2) < 100, "rect drawn at its translated position");
+            assert!(px(2, 2) > 200, "nothing drawn at the untranslated position");
+
+            sk_surface_unref(surface);
+            sk_picture_unref(picture);
+            sk_picture_recorder_delete(rec);
+        }
+    }
+
+    #[test]
     fn test_picture_record_and_playback_ffi() {
         unsafe {
             let rec = sk_picture_recorder_new();
@@ -4443,7 +4743,7 @@ mod tests {
             // BGRA on little-endian RGBA8888 surfaces in this repo; accept
             // either order by looking for a high red/blue somewhere.
             let mut saw_colored = false;
-            for px in buf.chunks_exact(4) {
+            for px in buf.as_chunks::<4>().0 {
                 if px[0] > 150 || px[2] > 150 {
                     saw_colored = true;
                     break;
@@ -4761,6 +5061,223 @@ mod tests {
             assert!(!c3.is_null());
             sk_canvas_release(c3);
 
+            sk_surface_unref(surface);
+        }
+    }
+
+    /// Alpha of pixel (x, y) of a 20x20 surface.
+    unsafe fn surface_alpha(surface: *mut sk_surface_t, x: usize, y: usize) -> u8 {
+        let mut buf = vec![0u8; 20 * 20 * 4];
+        unsafe { sk_surface_read_pixels(surface, buf.as_mut_ptr(), buf.len()) };
+        buf[(y * 20 + x) * 4 + 3]
+    }
+
+    fn rect(left: f32, top: f32, right: f32, bottom: f32) -> sk_rect_t {
+        sk_rect_t {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn test_canvas_clips_keep_the_matrix_they_were_set_under() {
+        // SkCanvas fixes a clip in device space when it is set; a later
+        // translate must not move it.
+        unsafe {
+            let surface = sk_surface_new_raster(20, 20);
+            let canvas = sk_surface_lock_canvas(surface);
+            let r = rect(0.0, 0.0, 5.0, 5.0);
+            assert!(sk_canvas_clip_rect(canvas, &raw const r, 1, false));
+            sk_canvas_translate(canvas, 10.0, 10.0);
+            let paint = sk_paint_new();
+            sk_paint_set_color(paint, 0xFFFF_FFFF);
+            let all = rect(-10.0, -10.0, 10.0, 10.0);
+            sk_canvas_draw_rect(canvas, &raw const all, paint);
+            sk_paint_unref(paint);
+            sk_canvas_release(canvas);
+            assert_eq!(surface_alpha(surface, 2, 2), 255, "inside the clip");
+            assert_eq!(surface_alpha(surface, 12, 12), 0, "the clip did not move");
+            sk_surface_unref(surface);
+        }
+    }
+
+    #[test]
+    fn test_canvas_save_layer_composites_with_the_layer_paint() {
+        unsafe {
+            let surface = sk_surface_new_raster(20, 20);
+            let canvas = sk_surface_lock_canvas(surface);
+            let layer_paint = sk_paint_new();
+            sk_paint_set_color(layer_paint, 0x80FF_FFFF);
+            sk_canvas_save_layer(canvas, ptr::null(), layer_paint);
+            let paint = sk_paint_new();
+            sk_paint_set_color(paint, 0xFFFF_FFFF);
+            let r = rect(0.0, 0.0, 20.0, 20.0);
+            sk_canvas_draw_rect(canvas, &raw const r, paint);
+            sk_canvas_restore(canvas);
+            sk_paint_unref(paint);
+            sk_paint_unref(layer_paint);
+            sk_canvas_release(canvas);
+            let a = surface_alpha(surface, 5, 5);
+            assert!((126..=130).contains(&a), "half-alpha layer: {a}");
+            sk_surface_unref(surface);
+        }
+    }
+
+    #[test]
+    fn test_canvas_release_composites_open_layers() {
+        // Like ~SkCanvas, releasing with a layer still open composites it
+        // instead of dropping its content.
+        unsafe {
+            let surface = sk_surface_new_raster(20, 20);
+            let canvas = sk_surface_lock_canvas(surface);
+            let layer_paint = sk_paint_new();
+            sk_paint_set_color(layer_paint, 0x80FF_FFFF);
+            sk_canvas_save_layer(canvas, ptr::null(), layer_paint);
+            let paint = sk_paint_new();
+            sk_paint_set_color(paint, 0xFFFF_FFFF);
+            let r = rect(0.0, 0.0, 20.0, 20.0);
+            sk_canvas_draw_rect(canvas, &raw const r, paint);
+            sk_paint_unref(paint);
+            sk_paint_unref(layer_paint);
+            sk_canvas_release(canvas);
+            let a = surface_alpha(surface, 5, 5);
+            assert!(
+                (126..=130).contains(&a),
+                "the open layer was composited: {a}"
+            );
+            sk_surface_unref(surface);
+        }
+    }
+
+    #[test]
+    fn test_canvas_clip_ibounds_are_in_device_space_inside_a_layer() {
+        unsafe {
+            let surface = sk_surface_new_raster(20, 20);
+            let canvas = sk_surface_lock_canvas(surface);
+            let r = rect(2.0, 3.0, 10.0, 12.0);
+            assert!(sk_canvas_clip_rect(canvas, &raw const r, 1, false));
+            sk_canvas_save_layer(canvas, ptr::null(), ptr::null());
+            let mut out = sk_irect_t {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            assert!(sk_canvas_get_clip_ibounds(canvas, &raw mut out));
+            assert_eq!((out.left, out.top, out.right, out.bottom), (2, 3, 10, 12));
+            sk_canvas_release(canvas);
+            sk_surface_unref(surface);
+        }
+    }
+
+    #[test]
+    fn test_locked_canvas_keeps_its_surface_alive() {
+        // The lock holds a reference, so unreffing the surface while it is
+        // locked cannot free the buffer release composites into.
+        unsafe {
+            let surface = sk_surface_new_raster(20, 20);
+            let canvas = sk_surface_lock_canvas(surface);
+            assert_eq!(sk_surface_get_refcnt(surface), 2);
+            sk_canvas_release(canvas);
+            assert_eq!(sk_surface_get_refcnt(surface), 1);
+            // Relocking works: the lock entry was removed.
+            let again = sk_surface_lock_canvas(surface);
+            assert!(!again.is_null());
+            sk_canvas_release(again);
+            sk_surface_unref(surface);
+        }
+    }
+
+    #[test]
+    fn test_nested_filtered_layers_stay_bounded_by_the_surface() {
+        // Like Skia, each filtered layer covers its parent plus its own
+        // filter's reach (here capped at the surface size, 20): growth is
+        // linear in depth (-60..80 after three), not geometric as when the
+        // cap was taken from the parent layer (27x after three).
+        unsafe {
+            let surface = sk_surface_new_raster(20, 20);
+            let canvas = sk_surface_lock_canvas(surface);
+            let blur = sk_imagefilter_new_blur(1000.0, 1000.0, 0);
+            let paint = sk_paint_new();
+            sk_paint_set_image_filter(paint, blur);
+            for _ in 0..3 {
+                sk_canvas_save_layer(canvas, ptr::null(), paint);
+            }
+            let mut out = sk_irect_t {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            assert!(sk_canvas_get_clip_ibounds(canvas, &raw mut out));
+            assert!(
+                out.left >= -60 && out.top >= -60 && out.right <= 80 && out.bottom <= 80,
+                "layer bounds {:?}",
+                (out.left, out.top, out.right, out.bottom)
+            );
+            sk_canvas_release(canvas);
+            sk_paint_unref(paint);
+            sk_imagefilter_unref(blur);
+            sk_surface_unref(surface);
+        }
+    }
+
+    #[test]
+    fn test_canvas_empty_clip_inside_a_layer_is_all_zero() {
+        unsafe {
+            let surface = sk_surface_new_raster(20, 20);
+            let canvas = sk_surface_lock_canvas(surface);
+            let outer = rect(5.0, 5.0, 15.0, 15.0);
+            assert!(sk_canvas_clip_rect(canvas, &raw const outer, 1, false));
+            sk_canvas_save_layer(canvas, ptr::null(), ptr::null());
+            let miss = rect(100.0, 100.0, 110.0, 110.0);
+            assert!(sk_canvas_clip_rect(canvas, &raw const miss, 1, false));
+            let mut out = sk_irect_t {
+                left: 1,
+                top: 1,
+                right: 1,
+                bottom: 1,
+            };
+            sk_canvas_get_clip_ibounds(canvas, &raw mut out);
+            assert_eq!((out.left, out.top, out.right, out.bottom), (0, 0, 0, 0));
+            sk_canvas_release(canvas);
+            sk_surface_unref(surface);
+        }
+    }
+
+    #[test]
+    fn test_canvas_save_layer_hint_limits_content_not_the_filter_output() {
+        // Skia's bounds hint clips what is drawn into the layer, but a blur
+        // still spreads its result past the hint.
+        unsafe {
+            let surface = sk_surface_new_raster(20, 20);
+            let canvas = sk_surface_lock_canvas(surface);
+            let blur = sk_imagefilter_new_blur(1.5, 1.5, 0);
+            let layer_paint = sk_paint_new();
+            sk_paint_set_image_filter(layer_paint, blur);
+            let hint = rect(8.0, 8.0, 12.0, 12.0);
+            sk_canvas_save_layer(canvas, &raw const hint, layer_paint);
+            let paint = sk_paint_new();
+            sk_paint_set_color(paint, 0xFFFF_FFFF);
+            sk_canvas_draw_rect(canvas, &raw const hint, paint);
+            let outside = rect(0.0, 0.0, 3.0, 3.0);
+            sk_canvas_draw_rect(canvas, &raw const outside, paint);
+            sk_canvas_restore(canvas);
+            sk_paint_unref(paint);
+            sk_paint_unref(layer_paint);
+            sk_imagefilter_unref(blur);
+            sk_canvas_release(canvas);
+            assert!(
+                surface_alpha(surface, 6, 10) > 0,
+                "the blur spreads past the hint"
+            );
+            assert_eq!(
+                surface_alpha(surface, 1, 1),
+                0,
+                "content outside the hint is dropped"
+            );
             sk_surface_unref(surface);
         }
     }

@@ -5,7 +5,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/skia-rs-gpu"
 authors.workspace = true
 rust-version.workspace = true
@@ -19,7 +18,7 @@ default = []
 vulkan = ["dep:ash"]
 opengl = ["dep:glow"]
 metal = ["dep:metal"]
-wgpu-backend = ["dep:wgpu", "dep:pollster"]
+wgpu-backend = ["dep:wgpu", "dep:pollster", "dep:skia-rs-codec"]
 
 # WebGPU for WASM
 webgpu = ["wgpu-backend"]
@@ -28,7 +27,7 @@ webgpu = ["wgpu-backend"]
 skia-rs-core = { workspace = true }
 skia-rs-path = { workspace = true }
 skia-rs-paint = { workspace = true }
-skia-rs-codec = { workspace = true }
+skia-rs-codec = { workspace = true, optional = true }  # wgpu image upload/readback
 ash = { workspace = true, optional = true }
 glow = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }

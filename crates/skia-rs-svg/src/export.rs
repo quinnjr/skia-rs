@@ -164,7 +164,9 @@ fn export_node(output: &mut String, node: &SvgNode, options: &SvgExportOptions, 
             )
             .unwrap();
 
-            if rect.rx > 0.0 {
+            // Write both radii when either is set: a missing one reads back as
+            // "auto" (copying the other), which would round square corners.
+            if rect.rx != 0.0 || rect.ry != 0.0 {
                 write!(
                     output,
                     " rx=\"{}\"",
@@ -172,7 +174,7 @@ fn export_node(output: &mut String, node: &SvgNode, options: &SvgExportOptions, 
                 )
                 .unwrap();
             }
-            if rect.ry > 0.0 {
+            if rect.rx != 0.0 || rect.ry != 0.0 {
                 write!(
                     output,
                     " ry=\"{}\"",
@@ -454,14 +456,17 @@ fn export_node(output: &mut String, node: &SvgNode, options: &SvgExportOptions, 
                 output.push('>');
                 output.push_str(newline);
 
-                if let Some(css) = text_content {
-                    if !css.is_empty() {
-                        if options.pretty_print {
-                            output.push_str(&options.indent.repeat(depth + 1));
-                        }
-                        write!(output, "<![CDATA[{css}]]>").unwrap();
-                        output.push_str(newline);
+                if let Some(css) = text_content
+                    && !css.is_empty()
+                {
+                    if options.pretty_print {
+                        output.push_str(&options.indent.repeat(depth + 1));
                     }
+                    // A "]]>" inside the CSS would end the CDATA section:
+                    // split it across two sections.
+                    let css = css.replace("]]>", "]]]]><![CDATA[>");
+                    write!(output, "<![CDATA[{css}]]>").unwrap();
+                    output.push_str(newline);
                 }
 
                 for child in &node.children {
@@ -478,13 +483,13 @@ fn export_node(output: &mut String, node: &SvgNode, options: &SvgExportOptions, 
 
 fn export_common_attrs(output: &mut String, node: &SvgNode, options: &SvgExportOptions) {
     // ID (but not for gradients, which handle it specially)
-    if let Some(ref id) = node.id {
-        if !matches!(
+    if let Some(ref id) = node.id
+        && !matches!(
             node.kind,
             SvgNodeKind::LinearGradient(_) | SvgNodeKind::RadialGradient(_)
-        ) {
-            write!(output, " id=\"{}\"", escape_xml(id)).unwrap();
-        }
+        )
+    {
+        write!(output, " id=\"{}\"", escape_xml(id)).unwrap();
     }
 
     // Classes
@@ -1066,6 +1071,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_export_keeps_an_explicit_zero_radius() {
+        // rx="10" ry="0" draws square corners; exporting only rx would read
+        // back with ry "auto" = 10, rounding them.
+        use crate::parser::parse_svg;
+
+        let svg_in = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+          <rect width="80" height="80" rx="10" ry="0"/>
+        </svg>"#;
+        let exported = export_svg(&parse_svg(svg_in).unwrap());
+        let reparsed = parse_svg(&exported).unwrap();
+        let rect = reparsed
+            .root
+            .children
+            .iter()
+            .find_map(|n| match &n.kind {
+                crate::dom::SvgNodeKind::Rect(r) => Some(*r),
+                _ => None,
+            })
+            .expect("a rect");
+        assert_eq!((rect.rx, rect.ry), (10.0, 0.0), "{exported}");
+    }
+
+    #[test]
+    fn test_export_style_cdata_escapes_its_terminator() {
+        // "]]>" in the CSS must not end the CDATA section early: the export
+        // must re-parse with the rule intact.
+        use crate::parser::parse_svg;
+
+        let svg_in = r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+          <style>rect { fill: red; } /* ]]&gt; */</style>
+          <rect x="0" y="0" width="10" height="10"/>
+        </svg>"#;
+        let dom = parse_svg(svg_in).unwrap();
+        let exported = export_svg(&dom);
+        let reparsed = parse_svg(&exported);
+        assert!(
+            reparsed.is_ok(),
+            "export must stay well-formed:
+{exported}"
+        );
+        assert_eq!(reparsed.unwrap().stylesheet.rules.len(), 1);
+    }
     #[test]
     fn test_export_style_element_round_trips() {
         // When a <style> block is parsed, its contents end up in the

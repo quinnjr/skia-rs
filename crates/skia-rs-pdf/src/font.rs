@@ -293,12 +293,11 @@ impl PdfFont {
         let code = c as u32;
         self.used_chars.entry(code).or_insert(c);
         // Also flag the glyph as used if we can resolve it from the font.
-        if let Some(ref data) = self.font_data {
-            if let Ok(face) = ttf_parser::Face::parse(data, 0) {
-                if let Some(gid) = face.glyph_index(c) {
-                    self.use_glyph(gid.0);
-                }
-            }
+        if let Some(ref data) = self.font_data
+            && let Ok(face) = ttf_parser::Face::parse(data, 0)
+            && let Some(gid) = face.glyph_index(c)
+        {
+            self.use_glyph(gid.0);
         }
     }
 
@@ -625,13 +624,13 @@ fn parse_truetype_metrics(data: &[u8]) -> TrueTypeMetrics {
     // characters and wrong only for 0x80..0x9F decoratives.
     for code in 32u16..=255u16 {
         let ch = char::from_u32(u32::from(code)).unwrap_or('\0');
-        if let Some(gid) = face.glyph_index(ch) {
-            if let Some(adv) = face.glyph_hor_advance(gid) {
-                metrics.widths.insert(
-                    code,
-                    u16::try_from(floor_to_i32(Scalar::from(adv) * scale)).unwrap_or(0),
-                );
-            }
+        if let Some(gid) = face.glyph_index(ch)
+            && let Some(adv) = face.glyph_hor_advance(gid)
+        {
+            metrics.widths.insert(
+                code,
+                u16::try_from(floor_to_i32(Scalar::from(adv) * scale)).unwrap_or(0),
+            );
         }
     }
 
@@ -766,13 +765,13 @@ impl PdfFontManager {
 
     /// Get number of fonts.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.fonts.len()
     }
 
     /// Check if empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.fonts.is_empty()
     }
 }

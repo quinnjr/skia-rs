@@ -837,7 +837,7 @@ mod tests {
         let before_b = *atlas.lookup(id_b).unwrap();
 
         let result = atlas.compact();
-        assert!(result.removed.is_empty());
+        assert_eq!(result.removed, []);
 
         // Both entries still resolve (possibly with the same regions,
         // possibly remapped).

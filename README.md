@@ -6,7 +6,7 @@
 [![Documentation](https://docs.rs/skia-rs-safe/badge.svg)](https://docs.rs/skia-rs-safe)
 [![License](https://img.shields.io/crates/l/skia-rs-safe.svg)](https://github.com/quinnjr/skia-rs#license)
 [![Build Status](https://github.com/quinnjr/skia-rs/workflows/CI/badge.svg)](https://github.com/quinnjr/skia-rs/actions)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://blog.rust-lang.org/2024/02/08/Rust-1.85.0.html)
+[![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](https://releases.rs/docs/1.94.0/)
 
 **A 100% Rust implementation of the Skia 2D graphics library**
 

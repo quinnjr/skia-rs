@@ -7,6 +7,185 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-24
+
+### Changed
+
+- **Breaking**: the minimum supported Rust version is now **1.94** (was
+  1.85; `geo` 0.33 and `napi-build` 2.3 already required 1.88, so 1.85 no
+  longer built). Per `VERSIONING.md` an MSRV bump is a minor version
+  change, so the next release is **0.5.0**. The workspace now uses the
+  MSRV-aware `resolver = "3"`.
+- `Typeface::system_default()` looks for a system font once per process,
+  like Skia's default typeface, and also remembers a miss: if no font was
+  found on the first call, later calls return `None` without re-probing,
+  even if fonts are installed afterwards. A font that loads is always kept
+  (so every call returns the same typeface); a miss after a clearly
+  transient read error (too many open files, an interrupted, timed-out or
+  busy read, or a Windows sharing or lock violation) is not, and the next
+  call tries again.
+- `StrokeRec::set_stroke_style` maps a NaN or infinite width to `Fill`
+  (Skia keeps an infinite width as a stroke), so a `Stroke` width is
+  always finite and positive.
+- `Canvas::draw_round_rect` with a radius <= 0 (or NaN) draws, and
+  records, a plain rect, like `SkCanvas::drawRoundRect`; a round rect that
+  is really a rect or an oval draws as `draw_rect` / `draw_oval`.
+  `RecordingCanvas::draw_round_rect` (picture recording) likewise records
+  `DrawCommand::DrawRect` for such radii instead of `DrawRoundRect`.
+- `RecordingCanvas::restore` drops a restore with no matching save, like
+  `SkRecorder`, so it no longer appears in the commands or
+  `approximate_op_count`.
+- **Breaking**: `DisplacementMapImageFilter` keeps a signed scale per
+  device axis, so it maps exactly under non-uniform scales, mirrors,
+  quarter turns and axis swaps (ties round as Skia's: in device space for
+  scale-translate matrices, and as in its rotated layer otherwise; see
+  `ImageFilter::map_params`). Its serialized form (inside
+  `Paint::serialize`) now has two scales (x and y) and a flip byte instead
+  of one scale, and `Paint::deserialize` reads displacement maps back when
+  their inputs are kinds it reads (blur, drop shadow, morphology, offset,
+  compose, merge, displacement); others are still dropped. A non-finite
+  scale displaces nothing. The filter's `Debug` output shows `axis_scale`
+  and `axis_flips` instead of `scale`. `Paint::deserialize` drops an image
+  filter or shader chain longer than 64 levels (the rest of the paint
+  still loads; crafted input could overflow the stack), and checks lengths
+  without overflow.
+- `MergeImageFilter`, `BlendImageFilter` and `ArithmeticImageFilter` now
+  apply (they were no-ops): each input runs on the source and the results
+  are merged (src-over), blended with the mode, or combined arithmetically,
+  as in Skia.
+- `TrimEffect::new` (and the C API's trim constructor) pins `start` and
+  `end` to [0, 1] like `SkTrimPathEffect::Make`; only non-finite values
+  give `None` (out-of-range values used to).
+- Image shaders premultiply an `Unpremul` image's samples (after linear
+  filtering mixes the stored texels, as `SkImageShader`; `Shader::sample`
+  returns premultiplied color, and they were returned as stored), decode `Rgb888` and read it back from
+  `Paint::deserialize`, and read huge or mismatched dimensions as
+  transparent instead of overflowing. Rows must be tightly packed (now
+  documented). Image shaders, and paint or filter sections, too large for
+  the serialized form's u32 length are written as absent or not at all
+  (their lengths used to saturate, misaligning everything after them).
+- Image filters' `apply` filters only the `width` x `height` image at
+  the start of the buffer (any other length used to panic: now a
+  shorter buffer is left alone and a longer one's tail is kept), and huge
+  offsets no longer overflow.
+- `DisplacementMapImageFilter`'s `filter_bounds` and `input_bounds` round
+  the rect out to whole pixels and outset by `ceil(|scale| / 2)`, as
+  Skia's `outsetByMaxDisplacement` does in layer space (they outset by
+  `|scale| / 2` exactly, which could clip a displaced pixel at a
+  fractional edge); bounds are now pixel-aligned even for scale 0.
+- Deserialization rejects a present/absent flag other than 0 or 1 in
+  paint sections, image-filter inputs and shaders (such a flag used to
+  read as absent, or as present, and misalign what followed).
+- `PerlinNoiseShader::is_opaque` is always false, as Skia's (it was true
+  unconditionally).
+- Perlin noise shaders use at most 255 octaves (`SkPerlinNoiseShader`'s
+  `kMaxOctaves`), and with 0 draw as Skia does: fractal noise as
+  transparent gray, turbulence as transparent (a negative count draws the
+  same; Skia gives no shader). The constructors and `Paint::deserialize`
+  keep the octave count to 0..=255, so a shader reads back as built
+  (Skia's factory gives no shader outside that range). Many octaves no
+  longer overflow the noise lattice.
+- **Breaking**: the C API's `sk_canvas_save_layer` returns `int32_t`
+  (was `uint32_t`), the same type and value as `sk_canvas_save`.
+- **Breaking**: the C API's `sk_surface_lock_canvas` now holds a reference
+  on the surface until `sk_canvas_release`, so the surface outlives its
+  locked canvas. While locked, `sk_surface_get_refcnt` reports one more
+  and `sk_surface_is_unique` returns false.
+- The C API's `sk_canvas_save_layer` now makes a real offscreen layer
+  (it was a plain save): later draws go into it, and `sk_canvas_restore`
+  (or `sk_canvas_release`, which like `~SkCanvas` unwinds open saves)
+  composites it through the outer clip with the paint's alpha, blend mode,
+  color filter and image filter. C API clips now keep the matrix they were
+  set under, as in Skia; a later transform no longer moves them.
+- Layers implement `SaveLayerFlags::INIT_WITH_PREVIOUS` and apply the
+  layer paint's image filter on restore. Like Skia, a filtered layer is
+  sized from what the filter reads (new `ImageFilter::input_bounds`: a
+  blur's margin, an offset's or shadow's source, a tile's source rect), up
+  to 9x the device area (Skia downsamples larger layers; past that the
+  layer is cut to the device outset by its size).
+  As in Skia, the filter's parameters are mapped from local space into the
+  layer (sigmas, offsets and radii scale and rotate with the matrix) via
+  the new `ImageFilter::map_params` / `map_image_filter`. Filters run on
+  device-space layer pixels; Skia's decomposition of the matrix
+  (`decomposeCTM`) is not implemented. `ImageFilter::map_params` lists the
+  cases that match Skia exactly: most filters under scale/translate and
+  quarter turns; displacement maps also under non-uniform scales and
+  mirrors; matrix convolution under quarter turns and mirrors at unit
+  scale only; lighting under translate, scale and quarter turns. Blur and
+  drop-shadow sigmas are clamped to 532, like `SkBlurImageFilter`'s
+  `kMaxSigma`. New `Canvas::layer_bounds`, `layer_bounds_within`,
+  `layer_paint` and `composite_layer_pixels`.
+- **Breaking**: `DrawCommand::SaveLayer` has a `flags` field, so recorded
+  layers keep `INIT_WITH_PREVIOUS` on playback.
+- **Breaking**: new `DrawCommand::DrawVertices` variant, so recorded
+  `draw_vertices` calls are kept (they were dropped).
+- **Breaking**: new `DrawCommand::DrawRegion` variant. Recorded regions
+  stay regions, so playback draws them rect by rect or as one outline
+  depending on its own matrix and paint.
+- The `serde` feature (core, path, paint, and `skia-rs-safe`/`skia-rs`)
+  now does something: it derives `Serialize`/`Deserialize` for the plain
+  value types (points, sizes, rects, `RRect`, `Matrix`, `Matrix44`,
+  colors, `ImageInfo`/`ColorSpace`, surface props, and the enums such as
+  `BlendMode`, `FillType`, `Verb`, `TileMode`, stroke caps/joins). Types with
+  internal invariants (`Path`, `Region`) or shared handles (`Paint`,
+  shaders, filters) are not serializable yet.
+- **Breaking**: `DashEffect::new` (and the C API's dash constructor)
+  returns `None` for an odd number of intervals, like
+  `SkDashPathEffect::Make`, instead of repeating the pattern. The SVG
+  renderer still repeats an odd `stroke-dasharray`, as SVG specifies.
+- `PathBuilder::conic_to` degrades unusable weights like
+  `SkPath::conicTo`: a non-positive or NaN weight adds a line, an infinite
+  one two lines, and a weight of exactly 1 a quad, so the verbs built may
+  differ from the calls made.
+- **Breaking**: `skia-rs-core`'s `libm` feature is a deprecated no-op
+  (it only forwarded to the unused, now removed, `glam` dependency).
+- Unused dependencies were removed across the workspace; `skia-rs-gpu`
+  pulls in `skia-rs-codec` only with `wgpu-backend`.
+- `PathBuilder::add_round_rect` is now an exact port of
+  `SkPath::addRoundRect` (`SkRRect::setRectXY` + `addRRect`): conic
+  corners, uniform radius scaling, Skia's contour start point, oval/rect
+  degenerate cases, negative radii add nothing, non-finite input is
+  sanitized.
+- Path effects now run through `PathEffect::filter_path` with a
+  `StrokeRec`, matching `SkPathEffect::filterPath` (dash refuses filled
+  geometry, `Path1DEffect` fills its stamps, `Line2DEffect` strokes at its
+  own width, compose/sum share the record); several effects return an
+  empty path where Skia draws nothing.
+- `Path1DEffect::new` cleans up `phase` like `SkPath1DPathEffect` (a
+  positive phase starts stamps at `advance - phase mod advance`, a negative
+  one at `-phase mod advance`), rejects non-finite `advance`/`phase`, and
+  stamps restart at every contour. Callers that relied on the raw phase as
+  a start distance will see stamps move.
+- Path effects bound their output like Skia: dashes give up past
+  `kMaxDashCount` (summed over contours), `Path1DEffect` past 100,000 stamps
+  per contour, and the 1D/2D effects past a point budget.
+
+### Added
+
+- `Typeface::system_default()` loads the platform's default sans-serif
+  font (the text example now renders real text).
+- `Matrix::has_perspective`, `Matrix::is_similarity`, `Matrix::max_scale`.
+- `conformance_gen` example, raster reference images, and a `conformance`
+  test (the references are skia-rs self-renders, see `conformance/README.md`).
+
+### Fixed
+
+- Windows: `cargo test` no longer prints ~150 napi-sys symbol-load errors.
+- macOS: `skia-rs-python` links (extension-module link args); the Metal
+  backend builds against metal 0.29, detects Mac GPU families correctly,
+  and probes OS-version-dependent `MTLDevice` selectors instead of aborting
+  on older systems or iOS.
+- Rendering: conics honor their weight and every curve is flattened to a
+  0.25 device-px error under any CTM, including perspective; `draw_line`
+  honors stroke width and path effects; shapes (rect, oval, circle, round
+  rect, arc) apply path effects; fake bold (`Font::set_embolden`) renders;
+  hairlines use Skia's pixel centers; open contours fill as implicitly
+  closed; picture playback restores canvas state and ignores unbalanced
+  restores; text decoration intercepts no longer open false gaps.
+- C API: recording canvases record transforms instead of baking them into
+  geometry.
+- GPU: wgpu readback validates buffer sizes and avoids `u32` overflow.
+
 ## [0.4.0] - 2026-08-19
 
 ### Changed
@@ -1124,5 +1303,6 @@ The first public release of skia-rs, a pure Rust implementation of the Skia 2D g
 [0.1.0]: https://github.com/quinnjr/skia-rs/releases/tag/v0.1.0
 [0.3.0]: https://github.com/quinnjr/skia-rs/compare/v0.2.7...v0.3.0
 [0.4.0]: https://github.com/quinnjr/skia-rs/compare/v0.3.0...v0.4.0
-[Unreleased]: https://github.com/quinnjr/skia-rs/compare/v0.4.0...HEAD
+[0.5.0]: https://github.com/quinnjr/skia-rs/compare/v0.4.0...v0.5.0
+[Unreleased]: https://github.com/quinnjr/skia-rs/compare/v0.5.0...HEAD
 

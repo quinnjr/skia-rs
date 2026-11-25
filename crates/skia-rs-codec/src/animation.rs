@@ -39,14 +39,14 @@ impl AnimatedImage {
     /// Returns the number of frames.
     #[inline]
     #[must_use]
-    pub fn frame_count(&self) -> usize {
+    pub const fn frame_count(&self) -> usize {
         self.frames.len()
     }
 
     /// Returns `true` if the animation has no frames.
     #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
 

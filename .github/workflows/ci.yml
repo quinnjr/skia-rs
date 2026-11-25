@@ -54,6 +54,31 @@ jobs:
       # workspace `[lints]` table) as hard errors. Justified false positives
       # for the Skia port carry narrow `#[allow(..., reason = "...")]`.
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Feature-gated GPU backend code is invisible to the default build, so
+      # lint it explicitly. Metal only compiles on macOS; see `clippy-macos`.
+      - name: Clippy (GPU backends)
+        run: cargo clippy --workspace --all-targets --features "wgpu-backend,vulkan,opengl" -- -D warnings
+
+  clippy-macos:
+    name: Clippy (macOS, Metal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Lints the Metal backend and the aarch64 (NEON) code paths, neither of
+      # which the Linux clippy job compiles.
+      - run: cargo clippy --workspace --all-targets --features metal -- -D warnings
 
   # ==========================================================================
   # Build & Test Matrix
@@ -97,15 +122,18 @@ jobs:
 
       - name: Run doc tests
         run: cargo test --workspace --doc
-        continue-on-error: true
+
+      # The serde feature (derives and deserialization validation) is off
+      # by default, so test it explicitly.
+      - name: Run serde feature tests
+        run: cargo test -p skia-rs-core -p skia-rs-path -p skia-rs-paint --features serde
 
   # ==========================================================================
   # MSRV Check (Minimum Supported Rust Version)
   # ==========================================================================
   msrv:
-    name: MSRV (1.85)
+    name: MSRV (1.94)
     runs-on: ubuntu-latest
-    continue-on-error: true  # MSRV check is advisory
     steps:
       - uses: actions/checkout@v4
         with:
@@ -116,10 +144,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
-        continue-on-error: true
+      - run: cargo check --workspace --all-targets
 
   # ==========================================================================
   # Documentation
@@ -139,12 +166,12 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # `--cfg docsrs` (doc(cfg) badges) needs nightly and is exercised by
+      # docs.rs itself; here we just require warning-free docs on stable.
       - name: Build docs
         run: cargo doc --workspace --no-deps
-        continue-on-error: true
         env:
-          # Allow doc warnings but not errors
-          RUSTDOCFLAGS: --cfg docsrs
+          RUSTDOCFLAGS: -D warnings
 
   # ==========================================================================
   # Benchmarks (validation only)
@@ -217,6 +244,10 @@ jobs:
   conformance:
     name: Conformance (${{ matrix.backend }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # The scripts are POSIX sh; Windows runners default to PowerShell.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -284,40 +315,36 @@ jobs:
         with:
           key: conformance-${{ matrix.backend }}-${{ matrix.os }}
 
-      # Install Vulkan SDK on Linux
-      - name: Install Vulkan SDK (Linux)
+      # Install the Vulkan loader/tools on Linux. The runner image is Ubuntu
+      # 24.04 (noble); Mesa's lavapipe (mesa-vulkan-drivers, below) provides a
+      # software Vulkan ICD, so the LunarG SDK is not needed.
+      - name: Install Vulkan (Linux)
         if: matrix.backend == 'vulkan' && matrix.os == 'ubuntu-latest'
         run: |
-          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
-          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
           sudo apt-get update
-          sudo apt-get install -y vulkan-sdk
+          sudo apt-get install -y libvulkan-dev vulkan-tools glslang-tools
 
-      # Install Mesa for software rendering on Linux (for CI)
+      # Install Mesa for software rendering on Linux (for CI). Package names
+      # are for Ubuntu 24.04: the transitional libegl1-mesa no longer exists.
       - name: Install Mesa (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y mesa-utils libgl1-mesa-dri libegl1-mesa libgbm1
+          sudo apt-get install -y mesa-utils libgl1-mesa-dri libegl1 libegl-mesa0 libgbm1 mesa-vulkan-drivers
 
-      # Install ImageMagick for image comparison
+      # Install ImageMagick for image comparison (raster on Ubuntu only)
       - name: Install ImageMagick
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.backend == 'raster' && matrix.os == 'ubuntu-latest'
         run: sudo apt-get install -y imagemagick
-
-      - name: Install ImageMagick (macOS)
-        if: matrix.os == 'macos-latest'
-        run: brew install imagemagick
-
-      - name: Install ImageMagick (Windows)
-        if: matrix.os == 'windows-latest'
-        run: choco install imagemagick -y
 
       # Build with specific backend features
       - name: Build (${{ matrix.backend }})
+        id: build
         run: cargo build --workspace --features "${{ matrix.features }}"
 
-      # Run conformance tests for this backend
+      # Run conformance tests for this backend. This is the gate: the raster
+      # conformance test fails the job when any case exceeds MAX_RMSE
+      # (0.01), on every OS (the tolerance is meant to hold across platforms).
       - name: Run conformance tests (${{ matrix.backend }})
         run: cargo test --workspace --features "${{ matrix.features }}" -- --test-threads=1 conformance
         env:
@@ -328,34 +355,70 @@ jobs:
           # Disable GPU for WGPU in CI (use CPU adapter)
           WGPU_BACKEND: ${{ matrix.backend == 'wgpu' && 'gl' || '' }}
 
-      # Generate test images for this backend
+      # Generate test images. Only the raster backend has a canvas renderer;
+      # the GPU backends are covered by the build and test steps above.
+      # Run even when the conformance test failed, so its divergences are
+      # still reported and uploaded (but not after a failed build).
       - name: Generate test images
-        run: cargo run --example conformance_gen --features "${{ matrix.features }}" -- --backend ${{ matrix.backend }} --output-dir conformance_output
-        continue-on-error: true
+        id: generate
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.backend == 'raster' }}
+        run: cargo run -p skia-rs-safe --example conformance_gen -- --backend raster --output-dir conformance_output
 
-      # Compare against reference images
+      # Compare against reference images with ImageMagick, for the summary
+      # report only (informational: the conformance test above gates). Its
+      # RMSE is over the PNGs' unpremultiplied pixels, while the test's is
+      # over premultiplied ones, so near-threshold verdicts may differ.
       - name: Compare with reference images
-        if: matrix.os == 'ubuntu-latest'
+        if: ${{ !cancelled() && steps.generate.outcome == 'success' && matrix.os == 'ubuntu-latest' }}
         run: |
           mkdir -p conformance_results
+          # A reference with no generated image means a case stopped being
+          # produced (or was renamed): that is a failure, not a skip.
+          for ref in conformance/reference/*.png; do
+            base=$(basename "$ref")
+            if [ ! -f "conformance_output/$base" ]; then
+              echo "FAIL ${{ matrix.backend }}: $base - MISSING (no generated image)" >> conformance_results/report.txt
+            fi
+          done
           for img in conformance_output/*.png; do
             if [ -f "$img" ]; then
               base=$(basename "$img")
               ref="conformance/reference/$base"
               if [ -f "$ref" ]; then
-                # Calculate RMSE difference
+                # RMSE as "absolute (normalized)"; judge the normalized
+                # value against the conformance test's MAX_RMSE (0.01).
                 diff=$(compare -metric RMSE "$img" "$ref" null: 2>&1 || true)
-                echo "${{ matrix.backend }}: $base - RMSE: $diff" >> conformance_results/report.txt
+                norm=$(echo "$diff" | sed -n 's/.*(\([0-9.eE+-]*\)).*/\1/p')
+                if [ -n "$norm" ] && awk -v n="$norm" 'BEGIN { exit !(n + 0 <= 0.01) }'; then
+                  result=PASS
+                else
+                  result=FAIL
+                fi
+                echo "$result ${{ matrix.backend }}: $base - ImageMagick RMSE (unpremultiplied, informational): $diff" >> conformance_results/report.txt
+              else
+                # A new case without a committed reference was never checked.
+                echo "FAIL ${{ matrix.backend }}: $base - NO REFERENCE" >> conformance_results/report.txt
               fi
             fi
           done
         continue-on-error: true
+
+      # Every job uploads something, so the summary lists every row (with
+      # "Not compared" where no images are generated or compared).
+      - name: Record comparison status
+        if: always()
+        run: |
+          mkdir -p conformance_results
+          if [ ! -f conformance_results/report.txt ]; then
+            echo "not compared" > conformance_results/status.txt
+          fi
 
       # Upload conformance results
       - name: Upload conformance results
         uses: actions/upload-artifact@v4
         if: always()
         with:
+          if-no-files-found: ignore
           name: conformance-${{ matrix.backend }}-${{ matrix.os }}
           path: |
             conformance_output/
@@ -386,8 +449,11 @@ jobs:
         run: |
           echo "# Backend Conformance Report" > $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Backend | OS | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|---------|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "Image comparison against the references runs for raster on Ubuntu;" >> $GITHUB_STEP_SUMMARY
+          echo "every row's conformance test gates the job (overall: ${{ needs.conformance.result }})." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend | OS | Image comparison |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----|------------------|" >> $GITHUB_STEP_SUMMARY
 
           for dir in all-results/conformance-*/; do
             if [ -d "$dir" ]; then
@@ -395,10 +461,17 @@ jobs:
               backend=$(echo "$backend_os" | cut -d'-' -f1)
               os=$(echo "$backend_os" | cut -d'-' -f2-)
 
-              if [ -f "$dir/conformance_results/report.txt" ]; then
-                status="✅ Pass"
-              else
+              report="$dir/conformance_results/report.txt"
+              if [ "$backend" != "raster" ] || [ "$os" != "ubuntu-latest" ]; then
+                # Images are compared for raster on Ubuntu only; this row's
+                # conformance test still gates the job (overall result above).
+                status="➖ Not compared here (see overall result)"
+              elif [ ! -f "$report" ]; then
                 status="⚠️ No results"
+              elif grep -q '^FAIL ' "$report"; then
+                status="❌ Diverged"
+              else
+                status="✅ Pass"
               fi
 
               echo "| $backend | $os | $status |" >> $GITHUB_STEP_SUMMARY

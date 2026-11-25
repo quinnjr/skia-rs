@@ -351,8 +351,9 @@ all of them. Each contour should track its own closed state.
 
 ### Unused dependencies
 The `Cargo.toml` declares `thiserror`, `arrayvec`, and `proptest` (dev) as
-dependencies but none are used in any source file. `serde` is feature-gated but
-also unused. These should be cleaned up.
+dependencies but none are used in any source file. (`serde` is now used:
+the feature derives `Serialize`/`Deserialize` for the path enums and
+`PathElement`; `Path` itself is not serializable yet.) These should be cleaned up.
 
 ### Compiler warnings
 The crate produces 4 warnings:

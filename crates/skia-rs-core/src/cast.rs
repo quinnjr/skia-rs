@@ -87,7 +87,7 @@ pub const fn scalar_from_i32(x: i32) -> Scalar {
 /// 8-bit color/pixel components. NaN maps to `0`.
 #[inline]
 #[must_use]
-pub fn f32_to_u8_sat(x: f32) -> u8 {
+pub const fn f32_to_u8_sat(x: f32) -> u8 {
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -105,7 +105,7 @@ pub fn f32_to_u8_sat(x: f32) -> u8 {
 /// components. NaN maps to `0`.
 #[inline]
 #[must_use]
-pub fn f32_to_u16_sat(x: f32) -> u16 {
+pub const fn f32_to_u16_sat(x: f32) -> u16 {
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,

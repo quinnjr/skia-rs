@@ -73,6 +73,21 @@
 // Perspective 2 index.
 #define Matrix_PERSP_2 8
 
+// Filter mode for image sampling.
+enum FilterMode
+#ifdef __cplusplus
+  : uint8_t
+#endif // __cplusplus
+ {
+    // Nearest neighbor sampling.
+    FilterMode_Nearest = 0,
+    // Bilinear interpolation.
+    FilterMode_Linear,
+};
+#ifndef __cplusplus
+typedef uint8_t FilterMode;
+#endif // __cplusplus
+
 // Mipmap mode for image sampling.
 enum MipmapMode
 #ifdef __cplusplus
@@ -88,21 +103,6 @@ enum MipmapMode
 };
 #ifndef __cplusplus
 typedef uint8_t MipmapMode;
-#endif // __cplusplus
-
-// Filter mode for image sampling.
-enum FilterMode
-#ifdef __cplusplus
-  : uint8_t
-#endif // __cplusplus
- {
-    // Nearest neighbor sampling.
-    FilterMode_Nearest = 0,
-    // Bilinear interpolation.
-    FilterMode_Linear,
-};
-#ifndef __cplusplus
-typedef uint8_t FilterMode;
 #endif // __cplusplus
 
 // Describes the color space for interpreting colors.
@@ -449,17 +449,18 @@ void sk_surface_ref(sk_surface_t *surface);
 // Decrement the reference count of a surface.
 //
 // Frees the surface when the count reaches 0.
-//
-// # Panics
-// Panics (caught by `catch_panic_void`, see the crate-level docs) if the
-// internal locked-surfaces mutex is poisoned by another thread panicking
-// while holding it.
 void sk_surface_unref(sk_surface_t *surface);
 
 // Get the reference count of a surface.
+//
+// A canvas locked with [`sk_surface_lock_canvas`] holds one reference
+// until [`sk_canvas_release`].
 uint32_t sk_surface_get_refcnt(const sk_surface_t *surface);
 
 // Check if the surface has only one reference.
+//
+// A locked canvas holds a reference, so this is false while one is
+// locked.
 bool sk_surface_is_unique(const sk_surface_t *surface);
 
 // Get the width of a surface.
@@ -797,26 +798,28 @@ void sk_surface_draw_line(sk_surface_t *surface,
 
 // Acquire a canvas borrowed from the given surface.
 //
-// The returned canvas is valid until [`sk_canvas_release`] is called and
-// must not outlive `surface`. Only one canvas may be held per surface at
+// The returned canvas is valid until [`sk_canvas_release`] is called. It
+// holds a reference to `surface` until then, so unreffing the surface
+// while it is locked does not free it under the canvas. Only one canvas may be held per surface at
 // a time — attempting to lock twice returns null. While a surface is
 // locked, the `sk_surface_draw_*`/`sk_surface_clear` convenience helpers
 // (which bypass the locked canvas and draw directly on the surface) are
 // rejected (no-op) to avoid two independent mutable views of the same
 // pixel buffer.
 //
-// # Panics
-// Panics (caught by `catch_panic`, see the crate-level docs) if the
-// internal locked-surfaces mutex is poisoned by another thread panicking
-// while holding it.
+// # Safety
+// `surface` must be null or a live surface handle. The returned canvas must
+// be released exactly once with [`sk_canvas_release`] and not used after.
 struct sk_canvas_t *sk_surface_lock_canvas(sk_surface_t *surface);
 
 // Release a canvas acquired via [`sk_surface_lock_canvas`].
 //
-// # Panics
-// Panics (caught by `catch_panic_void`, see the crate-level docs) if the
-// internal locked-surfaces mutex is poisoned by another thread panicking
-// while holding it.
+// Like `~SkCanvas`, open saves are unwound first, compositing any open
+// layer into the surface.
+//
+// # Safety
+// `canvas` must be null or a canvas from [`sk_surface_lock_canvas`] that
+// has not been released; it must not be used afterwards.
 void sk_canvas_release(struct sk_canvas_t *canvas);
 
 // Get the width of the canvas.
@@ -826,26 +829,48 @@ int32_t sk_canvas_get_width(const struct sk_canvas_t *canvas);
 int32_t sk_canvas_get_height(const struct sk_canvas_t *canvas);
 
 // Save the current transformation matrix and clip stack.
+//
+// Returns the same value as `SkCanvas::save()`: the save count *before*
+// this call in Skia's 1-based counting (1 for the first save, 2 for a
+// nested one, ...). Returns 0 if `canvas` is null.
+//
+// # Safety
+// `canvas` must be null or a live canvas handle.
 int32_t sk_canvas_save(struct sk_canvas_t *canvas);
 
-// Save a layer — pushes a save frame that records the layer bounds and
-// paint for composition on restore.
+// Save a layer, like `SkCanvas::saveLayer`.
 //
-// Both `bounds` and `paint` are optional (null is acceptable). The layer
-// is allocated lazily (at the next draw) because draws go through the
-// transient [`Canvas`](skia_rs_canvas::Canvas) layer machinery already. Returns the new save count,
-// or 0 on failure (null canvas).
+// Later draws go into an offscreen layer until the matching
+// [`sk_canvas_restore`] (or [`sk_canvas_release`]), which composites it
+// through the clip in effect here using `paint`'s alpha, blend mode, color
+// filter and image filter. `bounds` (local coordinates), if given, clips
+// what is drawn into the layer, as in Skia; the image filter's result may
+// still spread past it, up to the clip. Both may be null. Inside the layer
+// only clips set after this call (and `bounds`) apply, as in Skia.
 //
-// **Pragmatic note:** because the FFI canvas reconstructs its underlying
-// [`Canvas`](skia_rs_canvas::Canvas) between calls, the `layer_paint` / `layer_bounds` are tracked but
-// composition is delegated to the transient canvas at the next draw — the
-// effective behavior matches the recording-only semantics in
-// [`skia_rs_canvas::Canvas::save_layer`].
-uint32_t sk_canvas_save_layer(struct sk_canvas_t *canvas,
-                              const struct sk_rect_t *_bounds,
-                              const sk_paint_t *_paint);
+// Returns the same value as `SkCanvas::saveLayer()` (and
+// [`sk_canvas_save`]): the save count *before* this call in Skia's
+// 1-based counting (1 for the first save, 2 for a nested one, ...).
+// Returns 0 if `canvas` is null.
+//
+// # Safety
+// `canvas` must be null or a live locked canvas; `bounds` must be null or
+// point to a valid `sk_rect_t`; `paint` must be null or a live paint
+// handle. The paint is copied, so it may be released afterwards.
+int32_t sk_canvas_save_layer(struct sk_canvas_t *canvas,
+                             const struct sk_rect_t *bounds,
+                             const sk_paint_t *paint);
 
-// Restore the most recently saved matrix and clip.
+// Restore the most recently saved matrix and clip, like `SkCanvas::restore`.
+//
+// If that save was a [`sk_canvas_save_layer`], its
+// offscreen layer is composited into the layer or surface below, through
+// the outer clip, with the layer paint's alpha, blend mode, color filter
+// and image filter. Does nothing when there is no save to restore.
+//
+// # Safety
+// `canvas` must be null or a canvas from [`sk_surface_lock_canvas`] that
+// has not been released.
 void sk_canvas_restore(struct sk_canvas_t *canvas);
 
 // Concatenate a matrix onto the canvas's current transform.
@@ -903,8 +928,14 @@ bool sk_canvas_clip_path(struct sk_canvas_t *canvas,
 
 // Fill `out` with the device-space integer clip bounds of this canvas.
 //
-// Returns true on success. If the clip is empty or the canvas has no clips,
-// `out` is filled with `[0, 0, width, height]`.
+// Returns true on success. With no clips `out` is the device bounds
+// `[0, 0, width, height]` (inside a layer, the layer's content bounds:
+// its `bounds` hint, if one was given); an empty clip gives
+// `[0, 0, 0, 0]`, as `SkCanvas::getDeviceClipBounds`.
+//
+// # Safety
+// `canvas` must be null or a live canvas handle, and `out` must be null or
+// point to writable memory for one `sk_irect_t`.
 bool sk_canvas_get_clip_ibounds(struct sk_canvas_t *canvas,
                                 struct sk_irect_t *out);
 
@@ -1175,6 +1206,18 @@ void sk_recording_canvas_release(struct sk_recording_canvas_t *canvas);
 sk_picture_t *sk_picture_recorder_finish_recording(struct sk_picture_recorder_t *r);
 
 // Push a save onto the recording canvas's state.
+//
+// Returns the same value as `SkCanvas::save()`: the save count *before*
+// this call in Skia's 1-based counting (1 for the first save). Returns 0
+// if the handle is null or its recorder was deleted.
+//
+// Like `SkPicture`, the recording stores the save and later transform ops
+// as commands and keeps geometry in local coordinates, so playback composes
+// with the target canvas's own matrix and path effects see local geometry.
+//
+// # Safety
+// `canvas` must be null or a recording canvas handle from
+// `sk_picture_recorder_begin_recording`.
 int32_t sk_recording_canvas_save(struct sk_recording_canvas_t *canvas);
 
 // Pop a save on the recording canvas's state.
@@ -1185,9 +1228,9 @@ void sk_recording_canvas_translate(struct sk_recording_canvas_t *canvas,
                                    float dx,
                                    float dy);
 
-// Draw a rect into the recording canvas. The rect is captured in the
-// caller-space coordinates (post-transform) so playback can place it on
-// any target canvas.
+// Draw a rect into the recording canvas. The rect is recorded in local
+// coordinates; the transform ops recorded before it are replayed on top of
+// the playback canvas's matrix, as with `SkPicture`.
 void sk_recording_canvas_draw_rect(struct sk_recording_canvas_t *canvas,
                                    const struct sk_rect_t *rect,
                                    const sk_paint_t *paint);
@@ -1251,8 +1294,9 @@ void sk_region_unref(sk_region_t *region);
 
 // Create a dash path effect.
 //
-// `intervals` must be non-null with `count` positive entries; the pattern
-// is duplicated internally if `count` is odd, matching Skia's semantics.
+// `intervals` must be non-null with an even `count` of at least 2
+// non-negative entries; like `SkDashPathEffect::Make`, an odd `count`
+// returns null.
 // `phase` shifts where the pattern starts. Returns null if the intervals
 // are invalid (empty, negative, or sum to 0).
 sk_patheffect_t *sk_patheffect_new_dash(const float *intervals,

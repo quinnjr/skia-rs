@@ -390,7 +390,7 @@ fn write_font(sfnt_version: [u8; 4], tables: &[(Tag, Vec<u8>)]) -> Vec<u8> {
         body_offsets.push(u32::try_from(cursor).unwrap_or(u32::MAX));
         cursor += body.len();
         // 4-byte alignment between table bodies.
-        while cursor % 4 != 0 {
+        while !cursor.is_multiple_of(4) {
             cursor += 1;
         }
     }

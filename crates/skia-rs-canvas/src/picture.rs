@@ -51,22 +51,38 @@ impl Picture {
     /// The canvas's CTM at the start of playback is captured so that recorded
     /// `SetMatrix` commands compose with it (`setMatrix(initialCTM * recorded)`,
     /// per `SkCanvasPriv`/`SkPicturePlayback`) instead of clobbering it.
+    ///
+    /// Like `SkPicturePlayback` (via `SkAutoCanvasRestore`), playback is
+    /// wrapped in a save/restore, so a recording with unbalanced saves or a
+    /// leftover transform cannot leak state into the caller's later draws.
+    /// Restores that would pop below that save are dropped, as `SkRecorder`
+    /// drops unbalanced restores, so the caller's own saves are never undone.
+    ///
+    /// Played into a recording canvas, the wrapper is recorded too (as
+    /// `SkRecordDraw` under `SkAutoCanvasRestore` records it), so the
+    /// picture's top-level transforms and clips cannot leak into the
+    /// recording's later draws; a re-recorded picture grows by that pair.
     pub fn playback(&self, canvas: &mut Canvas) {
+        let restore_count = canvas.save();
         let initial = *canvas.total_matrix();
         for command in &self.commands {
+            if matches!(command, DrawCommand::Restore) && canvas.save_count() <= restore_count + 1 {
+                continue;
+            }
             command.execute_with_base(canvas, &initial);
         }
+        canvas.restore_to_count(restore_count);
     }
 
     /// Get the approximate byte size of this picture.
     #[must_use]
-    pub fn approximate_bytes_used(&self) -> usize {
+    pub const fn approximate_bytes_used(&self) -> usize {
         std::mem::size_of::<Self>() + self.commands.len() * std::mem::size_of::<DrawCommand>()
     }
 
     /// Get the number of operations in this picture.
     #[must_use]
-    pub fn approximate_op_count(&self) -> usize {
+    pub const fn approximate_op_count(&self) -> usize {
         self.commands.len()
     }
 }
@@ -87,6 +103,8 @@ pub enum DrawCommand {
         bounds: Option<Rect>,
         /// Paint for the layer.
         paint: Option<Paint>,
+        /// Save-layer flags (e.g. `INIT_WITH_PREVIOUS`).
+        flags: crate::SaveLayerFlags,
     },
     /// Translate the canvas.
     Translate {
@@ -195,6 +213,26 @@ pub enum DrawCommand {
         /// The paint to use.
         paint: Paint,
     },
+    /// Draw a region (`SkCanvas::drawRegion`). Recorded as a region so
+    /// playback chooses rect-by-rect or the boundary outline for the
+    /// playback matrix and paint.
+    DrawRegion {
+        /// The region to draw.
+        region: skia_rs_core::Region,
+        /// The paint to use.
+        paint: Paint,
+    },
+    /// Draw vertices (`SkCanvas::drawVertices`).
+    DrawVertices {
+        /// How the positions form triangles.
+        mode: crate::VertexMode,
+        /// The vertex positions (local coordinates).
+        positions: Vec<Point>,
+        /// Optional per-vertex colors.
+        colors: Option<Vec<Color>>,
+        /// The paint to use.
+        paint: Paint,
+    },
     /// Draw an oval.
     DrawOval {
         /// The bounding rectangle of the oval.
@@ -277,11 +315,15 @@ impl DrawCommand {
             Self::Restore => {
                 canvas.restore();
             }
-            Self::SaveLayer { bounds, paint } => {
+            Self::SaveLayer {
+                bounds,
+                paint,
+                flags,
+            } => {
                 let rec = crate::SaveLayerRec {
                     bounds: bounds.as_ref(),
                     paint: paint.as_ref(),
-                    flags: crate::SaveLayerFlags::NONE,
+                    flags: *flags,
                 };
                 canvas.save_layer(&rec);
             }
@@ -346,6 +388,17 @@ impl DrawCommand {
             Self::DrawRect { rect, paint } => {
                 canvas.draw_rect(rect, paint);
             }
+            Self::DrawRegion { region, paint } => {
+                canvas.draw_region(region, paint);
+            }
+            Self::DrawVertices {
+                mode,
+                positions,
+                colors,
+                paint,
+            } => {
+                canvas.draw_vertices(*mode, positions, colors.as_deref(), paint);
+            }
             Self::DrawOval { rect, paint } => {
                 canvas.draw_oval(rect, paint);
             }
@@ -394,6 +447,9 @@ pub struct PictureRecorder {
     commands: Vec<DrawCommand>,
     cull_rect: Rect,
     is_recording: bool,
+    /// The recording's save count (starts at 1), kept as commands are
+    /// recorded instead of rescanning them per save.
+    save_count: usize,
 }
 
 impl Default for PictureRecorder {
@@ -410,6 +466,7 @@ impl PictureRecorder {
             commands: Vec::new(),
             cull_rect: Rect::EMPTY,
             is_recording: false,
+            save_count: 1,
         }
     }
 
@@ -418,6 +475,7 @@ impl PictureRecorder {
         self.commands.clear();
         self.cull_rect = cull_rect;
         self.is_recording = true;
+        self.save_count = 1;
         // Safety: we're returning a reference that allows recording
         unsafe { &mut *std::ptr::from_mut(self).cast::<RecordingCanvas>() }
     }
@@ -454,16 +512,8 @@ impl RecordingCanvas {
     ///
     /// Mirrors `SkCanvas::getSaveCount`: starts at 1, +1 per Save/SaveLayer,
     /// -1 per Restore (never below 1).
-    fn save_count(&self) -> usize {
-        let mut count = 1usize;
-        for cmd in &self.inner.commands {
-            match cmd {
-                DrawCommand::Save | DrawCommand::SaveLayer { .. } => count += 1,
-                DrawCommand::Restore => count = count.saturating_sub(1).max(1),
-                _ => {}
-            }
-        }
-        count
+    const fn save_count(&self) -> usize {
+        self.inner.save_count
     }
 
     /// Record a save command.
@@ -473,19 +523,37 @@ impl RecordingCanvas {
     pub fn save(&mut self) -> usize {
         let prev = self.save_count();
         self.inner.commands.push(DrawCommand::Save);
+        self.inner.save_count += 1;
         prev
     }
 
     /// Record a restore command.
     pub fn restore(&mut self) {
-        self.inner.commands.push(DrawCommand::Restore);
+        // Like SkRecorder, a restore with no save to undo is dropped.
+        if self.inner.save_count > 1 {
+            self.inner.commands.push(DrawCommand::Restore);
+            self.inner.save_count -= 1;
+        }
     }
 
     /// Record a save layer command.
     pub fn save_layer(&mut self, bounds: Option<Rect>, paint: Option<&Paint>) {
+        self.save_layer_rec(&crate::SaveLayerRec {
+            bounds: bounds.as_ref(),
+            paint,
+            flags: crate::SaveLayerFlags::NONE,
+        });
+    }
+
+    /// Record a save layer command with flags (such as
+    /// `SaveLayerFlags::INIT_WITH_PREVIOUS`), like `SkCanvas::saveLayer`
+    /// with a `SaveLayerRec`.
+    pub fn save_layer_rec(&mut self, rec: &crate::SaveLayerRec<'_>) {
+        self.inner.save_count += 1;
         self.inner.commands.push(DrawCommand::SaveLayer {
-            bounds,
-            paint: paint.cloned(),
+            bounds: rec.bounds.copied(),
+            paint: rec.paint.cloned(),
+            flags: rec.flags,
         });
     }
 
@@ -646,8 +714,15 @@ impl RecordingCanvas {
         });
     }
 
-    /// Record a draw round rect command.
+    /// Record a draw round rect command. Like `SkCanvas::drawRoundRect`
+    /// (which `SkRecorder` inherits), radii that are not both positive
+    /// record a rect. The command keeps the call's arguments, so playback
+    /// draws exactly what the live call draws.
     pub fn draw_round_rect(&mut self, rect: &Rect, rx: Scalar, ry: Scalar, paint: &Paint) {
+        if !(rx > 0.0 && ry > 0.0) {
+            self.draw_rect(rect, paint);
+            return;
+        }
         self.inner.commands.push(DrawCommand::DrawRoundRect {
             rect: *rect,
             rx,
@@ -683,6 +758,50 @@ impl RecordingCanvas {
 mod tests {
     use super::*;
     use crate::raster::PixelBuffer;
+
+    #[test]
+    fn playback_ignores_unbalanced_restores() {
+        // Extra Restores in a picture must not pop the caller's own saves.
+        let picture = Picture::from_parts(
+            vec![DrawCommand::Restore, DrawCommand::Restore],
+            Rect::from_xywh(0.0, 0.0, 16.0, 16.0),
+        );
+        let mut buffer = PixelBuffer::new(16, 16);
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.save();
+        canvas.translate(10.0, 10.0);
+        let matrix_before = *canvas.total_matrix();
+        let saves_before = canvas.save_count();
+
+        picture.playback(&mut canvas);
+
+        assert_eq!(canvas.save_count(), saves_before);
+        assert_eq!(*canvas.total_matrix(), matrix_before);
+    }
+
+    #[test]
+    fn playback_does_not_leak_unbalanced_state() {
+        // A recording that saves and translates without restoring must not
+        // change the playback canvas's matrix or save count afterwards
+        // (SkPicturePlayback runs under SkAutoCanvasRestore).
+        let picture = Picture::from_parts(
+            vec![
+                DrawCommand::Save,
+                DrawCommand::Translate { dx: 8.0, dy: 0.0 },
+            ],
+            Rect::from_xywh(0.0, 0.0, 16.0, 16.0),
+        );
+        let mut buffer = PixelBuffer::new(16, 16);
+        let mut canvas = Canvas::new_raster(&mut buffer);
+        canvas.translate(1.0, 2.0);
+        let matrix_before = *canvas.total_matrix();
+        let saves_before = canvas.save_count();
+
+        picture.playback(&mut canvas);
+
+        assert_eq!(*canvas.total_matrix(), matrix_before);
+        assert_eq!(canvas.save_count(), saves_before);
+    }
 
     #[test]
     fn test_clip_op_recorded_and_replayed() {
@@ -752,6 +871,37 @@ mod tests {
     }
 
     #[test]
+    fn round_rects_without_positive_radii_record_as_rects() {
+        let mut recorder = PictureRecorder::new();
+        let canvas = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, 10.0, 10.0));
+        let r = Rect::from_xywh(1.0, 1.0, 4.0, 4.0);
+        canvas.draw_round_rect(&r, 0.0, 2.0, &Paint::new());
+        canvas.draw_round_rect(&r, 2.0, 2.0, &Paint::new());
+        let picture = recorder.finish_recording().unwrap();
+        assert!(
+            matches!(
+                picture.commands.as_slice(),
+                [
+                    DrawCommand::DrawRect { .. },
+                    DrawCommand::DrawRoundRect { .. }
+                ]
+            ),
+            "{:?}",
+            picture.commands
+        );
+    }
+
+    #[test]
+    fn unbalanced_restores_are_not_recorded() {
+        let mut recorder = PictureRecorder::new();
+        let canvas = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, 10.0, 10.0));
+        canvas.draw_rect(&Rect::from_xywh(1.0, 1.0, 4.0, 4.0), &Paint::new());
+        canvas.restore();
+        let picture = recorder.finish_recording().unwrap();
+        assert_eq!(picture.approximate_op_count(), 1);
+    }
+
+    #[test]
     fn test_draw_picture_paint_applies_implicit_layer() {
         // drawPicture(picture, matrix, paint) wraps playback in an implicit
         // saveLayer(paint): a half-alpha paint halves the picture's opaque
@@ -802,17 +952,86 @@ mod tests {
     }
 
     #[test]
+    fn test_recording_save_count_tracks_saves_and_restores() {
+        let mut recorder = PictureRecorder::new();
+        let canvas = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, 10.0, 10.0));
+        assert_eq!(canvas.save(), 1);
+        canvas.save_layer(None, None);
+        assert_eq!(canvas.save(), 3);
+        canvas.restore();
+        canvas.restore();
+        canvas.restore();
+        canvas.restore(); // unbalanced: the count stays at 1
+        assert_eq!(canvas.save(), 1);
+    }
+
+    #[test]
+    fn test_recorded_save_layer_keeps_its_flags() {
+        let mut recorder = PictureRecorder::new();
+        let canvas = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, 10.0, 10.0));
+        canvas.save_layer_rec(&crate::SaveLayerRec {
+            flags: crate::SaveLayerFlags::INIT_WITH_PREVIOUS,
+            ..crate::SaveLayerRec::default()
+        });
+        canvas.restore();
+        let picture = recorder.finish_recording().unwrap();
+        assert!(picture.commands.iter().any(|c| matches!(
+            c,
+            DrawCommand::SaveLayer { flags, .. } if flags.contains(crate::SaveLayerFlags::INIT_WITH_PREVIOUS)
+        )));
+    }
+
+    #[test]
+    fn test_playback_into_a_recording_keeps_its_state_contained() {
+        // A picture's top-level translate must not leak into the recording's
+        // later draws: the playback wrapper is recorded around it.
+        let mut recorder = PictureRecorder::new();
+        let rc = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, 10.0, 10.0));
+        rc.translate(50.0, 0.0);
+        rc.draw_rect(&Rect::from_xywh(0.0, 0.0, 5.0, 5.0), &Paint::new());
+        let picture = recorder.finish_recording().unwrap();
+
+        let mut cmds = Vec::new();
+        {
+            let mut canvas = Canvas::new_recording(&mut cmds, 10, 10);
+            picture.playback(&mut canvas);
+            canvas.draw_rect(&Rect::from_xywh(0.0, 0.0, 5.0, 5.0), &Paint::new());
+        }
+        let translate = cmds
+            .iter()
+            .position(|c| matches!(c, DrawCommand::Translate { .. }))
+            .expect("translate recorded");
+        let restore = cmds
+            .iter()
+            .rposition(|c| matches!(c, DrawCommand::Restore))
+            .expect("wrapper restore recorded");
+        let last_draw = cmds
+            .iter()
+            .rposition(|c| matches!(c, DrawCommand::DrawRect { .. }))
+            .unwrap();
+        assert!(translate < restore && restore < last_draw, "{cmds:?}");
+    }
+
+    #[test]
     fn test_picture_playback() {
+        // The recorded translate applies to the recorded draws during
+        // playback, and the canvas state is restored afterwards (SkRecordDraw
+        // runs under SkAutoCanvasRestore).
         let mut recorder = PictureRecorder::new();
         let canvas = recorder.begin_recording(Rect::from_xywh(0.0, 0.0, 100.0, 100.0));
         canvas.translate(10.0, 20.0);
+        canvas.draw_rect(&Rect::from_xywh(0.0, 0.0, 5.0, 5.0), &Paint::new());
         let picture = recorder.finish_recording().unwrap();
 
-        let mut canvas = Canvas::new(100, 100);
-        picture.playback(&mut canvas);
-        // Verify canvas was modified
-        let matrix = canvas.total_matrix();
-        assert!(!matrix.is_identity());
+        let mut buffer = PixelBuffer::new(100, 100);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            picture.playback(&mut canvas);
+            assert!(canvas.total_matrix().is_identity(), "state restored");
+        }
+        let alpha = |x, y| buffer.get_pixel(x, y).map_or(0, |c| c.alpha());
+        assert!(alpha(12, 22) > 0, "rect drawn at the translated position");
+        assert_eq!(alpha(2, 2), 0, "nothing drawn at the untranslated position");
     }
 
     #[test]

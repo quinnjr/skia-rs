@@ -391,13 +391,13 @@ impl PdfImageManager {
 
     /// Get number of images.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.images.len()
     }
 
     /// Check if empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.images.is_empty()
     }
 }

@@ -25,7 +25,7 @@ use crate::{
 };
 
 #[cfg(feature = "metal")]
-use metal::{Device, DeviceRef, MTLPixelFormat, MTLSize};
+use metal::{Device, DeviceRef, MTLPixelFormat};
 
 /// Metal feature set levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -125,6 +125,10 @@ pub struct MetalContextConfig {
 
 /// Metal capabilities and limits.
 #[derive(Debug, Clone, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors an independent MTLDevice capability query; keeping them as named fields preserves the 1:1 mapping to Metal"
+)]
 pub struct MetalCaps {
     /// Base GPU capabilities.
     pub base: GpuCaps,
@@ -193,12 +197,13 @@ pub struct MetalPixelFormatInfo {
     pub renderable: bool,
 }
 
-/// Convert TextureFormat to Metal pixel format (nominal mapping).
+/// Convert `TextureFormat` to Metal pixel format (nominal mapping).
 ///
 /// Note: `Depth24Stencil8` maps to `Depth24Unorm_Stencil8`, which is **not**
 /// supported on all Metal devices (Apple-silicon GPUs do not support it).
 #[cfg(feature = "metal")]
-pub fn texture_format_to_metal(format: TextureFormat) -> MTLPixelFormat {
+#[must_use]
+pub const fn texture_format_to_metal(format: TextureFormat) -> MTLPixelFormat {
     match format {
         TextureFormat::Rgba8Unorm => MTLPixelFormat::RGBA8Unorm,
         TextureFormat::Rgba8UnormSrgb => MTLPixelFormat::RGBA8Unorm_sRGB,
@@ -213,9 +218,10 @@ pub fn texture_format_to_metal(format: TextureFormat) -> MTLPixelFormat {
     }
 }
 
-/// Convert Metal pixel format to TextureFormat.
+/// Convert Metal pixel format to `TextureFormat`.
 #[cfg(feature = "metal")]
-pub fn metal_to_texture_format(format: MTLPixelFormat) -> Option<TextureFormat> {
+#[must_use]
+pub const fn metal_to_texture_format(format: MTLPixelFormat) -> Option<TextureFormat> {
     match format {
         MTLPixelFormat::RGBA8Unorm => Some(TextureFormat::Rgba8Unorm),
         MTLPixelFormat::RGBA8Unorm_sRGB => Some(TextureFormat::Rgba8UnormSrgb),
@@ -464,24 +470,87 @@ pub struct MetalContext {
     caps: MetalCaps,
 }
 
+/// Whether `device` implements the Objective-C `selector`
+/// (`-respondsToSelector:`).
+///
+/// Newer `MTLDevice` queries (e.g. `supportsFamily:` on macOS 10.15 /
+/// iOS 13, `supportsRaytracing` on macOS 11 / iOS 14) raise an
+/// unrecognized-selector exception, aborting the process, when sent to a
+/// device on an older OS, so they must be probed first.
+#[cfg(feature = "metal")]
+fn device_responds_to(device: &DeviceRef, selector: &str) -> bool {
+    // Sent via `Message::send_message` with runtime-registered selectors:
+    // objc 0.2's `msg_send!`/`sel!` macros expand to a `cfg(feature =
+    // "cargo-clippy")` check that trips `unexpected_cfgs` in this crate.
+    use metal::objc::Message;
+    use metal::objc::runtime::{BOOL, NO, Sel};
+
+    let responds_to_selector = Sel::register("respondsToSelector:");
+    let selector = Sel::register(selector);
+    // SAFETY: `device` is a valid MTLDevice (an NSObject), and
+    // `respondsToSelector:` is implemented by every NSObject with the
+    // signature `- (BOOL)respondsToSelector:(SEL)aSelector`.
+    let responds: BOOL =
+        unsafe { device.send_message(responds_to_selector, (selector,)) }.unwrap_or(NO);
+    responds != NO
+}
+
+/// Send the argument-less `BOOL` query `selector` to `device`, or `false`
+/// when the device does not implement it.
+#[cfg(feature = "metal")]
+fn device_bool_query(device: &DeviceRef, selector: &str) -> bool {
+    use metal::objc::Message;
+    use metal::objc::runtime::{BOOL, NO, Sel};
+
+    if !device_responds_to(device, selector) {
+        return false;
+    }
+    // SAFETY: `device` is a valid MTLDevice that implements `selector`,
+    // which callers pass only for `- (BOOL)selector` getters.
+    let value: BOOL = unsafe { device.send_message(Sel::register(selector), ()) }.unwrap_or(NO);
+    value != NO
+}
+
+/// [`DeviceRef::supports_family`], or `false` on systems that predate the
+/// `supportsFamily:` query.
+#[cfg(feature = "metal")]
+fn supports_family(device: &DeviceRef, family: metal::MTLGPUFamily) -> bool {
+    device_responds_to(device, "supportsFamily:") && device.supports_family(family)
+}
+
 #[cfg(feature = "metal")]
 impl MetalContext {
     /// Create a new Metal context using the system default device.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError::DeviceCreation`] if the system has no Metal device.
     pub fn new() -> GpuResult<Self> {
         Self::with_config(MetalContextConfig::default())
     }
 
     /// Create a new Metal context with configuration.
+    ///
+    /// Falls back to the system default device when no device matches the
+    /// low-power / headless preference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError::DeviceCreation`] if the system has no Metal device.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public constructor takes the config by value (builder-style, like Skia's GrContextOptions); changing to a reference would break callers"
+    )]
     pub fn with_config(config: MetalContextConfig) -> GpuResult<Self> {
         let device = if config.prefer_low_power {
             Device::all()
                 .into_iter()
-                .find(|d| d.is_low_power())
+                .find(|d| device_responds_to(d, "isLowPower") && d.is_low_power())
                 .or_else(Device::system_default)
         } else if config.prefer_headless {
             Device::all()
                 .into_iter()
-                .find(|d| d.is_headless())
+                .find(|d| device_responds_to(d, "isHeadless") && d.is_headless())
                 .or_else(Device::system_default)
         } else {
             Device::system_default()
@@ -494,6 +563,12 @@ impl MetalContext {
     }
 
     /// Create a new Metal context from an existing device.
+    ///
+    /// # Errors
+    ///
+    /// Currently never fails: creating the command queue and querying
+    /// capabilities are infallible in Metal. The `Result` keeps the signature
+    /// aligned with the other backends' constructors.
     pub fn from_device(device: Device) -> GpuResult<Self> {
         let command_queue = device.new_command_queue();
 
@@ -512,17 +587,54 @@ impl MetalContext {
     fn query_caps(device: &DeviceRef) -> MetalCaps {
         let is_apple_silicon = device.name().contains("Apple");
 
-        // Query limits
-        let max_buffer_length = device.max_buffer_length();
+        // Every query newer than the oldest supported OS (macOS 10.12 is
+        // Rust's x86_64 baseline) is probed first; sending an unknown
+        // selector raises an exception that aborts the process. Fallbacks
+        // are Metal's guaranteed minimums.
+        let has = |selector: &str| device_responds_to(device, selector);
+
+        // macOS 10.14 / iOS 12. Every Metal device supports >= 256 MiB.
+        let max_buffer_length = if has("maxBufferLength") {
+            device.max_buffer_length()
+        } else {
+            256 * 1024 * 1024
+        };
         let max_threads = device.max_threads_per_threadgroup();
-        let max_threadgroup_memory = device.max_threadgroup_memory_length();
+        // macOS 10.13 / iOS 11. Every Metal device supports >= 16 KiB.
+        let max_threadgroup_memory = if has("maxThreadgroupMemoryLength") {
+            device.max_threadgroup_memory_length()
+        } else {
+            16 * 1024
+        };
+        // macOS 10.13 / iOS 11.
+        let argument_buffer_tier = if has("argumentBuffersSupport") {
+            match device.argument_buffers_support() {
+                metal::MTLArgumentBuffersTier::Tier1 => 1,
+                metal::MTLArgumentBuffersTier::Tier2 => 2,
+            }
+        } else {
+            0
+        };
+        // macOS 10.13 / iOS 11.
+        let read_write_texture_tier = if has("readWriteTextureSupport") {
+            match device.read_write_texture_support() {
+                metal::MTLReadWriteTextureTier::TierNone => 0,
+                metal::MTLReadWriteTextureTier::Tier1 => 1,
+                metal::MTLReadWriteTextureTier::Tier2 => 2,
+            }
+        } else {
+            0
+        };
+        // isLowPower / isHeadless are macOS-only (absent on iOS).
+        let is_low_power = has("isLowPower") && device.is_low_power();
+        let is_headless = has("isHeadless") && device.is_headless();
 
         // Detect highest feature set
         let feature_set = Self::detect_feature_set(device);
 
         // Query texture limits based on feature set
         let (max_texture_size, max_3d_size, max_cube_size, max_array_layers) =
-            Self::get_texture_limits(&feature_set);
+            Self::get_texture_limits(feature_set);
 
         MetalCaps {
             base: GpuCaps {
@@ -534,8 +646,8 @@ impl MetalContext {
                 instancing_support: true,
             },
             feature_set: Some(feature_set),
-            is_low_power: device.is_low_power(),
-            is_headless: device.is_headless(),
+            is_low_power,
+            is_headless,
             is_apple_silicon,
             max_buffer_length,
             max_threads_per_threadgroup: max_threads.width * max_threads.height * max_threads.depth,
@@ -548,33 +660,37 @@ impl MetalContext {
             max_textures_per_stage: 128,
             max_buffers_per_stage: 31,
             // Both Tier1 and Tier2 support argument buffers; only the tier
-            // differs. The previous `!= Tier1` reported Tier1 devices as
-            // lacking argument buffers entirely, which is wrong.
-            argument_buffers: matches!(
-                device.argument_buffers_support(),
-                metal::MTLArgumentBuffersTier::Tier1 | metal::MTLArgumentBuffersTier::Tier2
-            ),
-            raster_order_groups: device.are_raster_order_groups_supported(),
+            // differs (0 means the query is unavailable on this OS).
+            argument_buffers: argument_buffer_tier > 0,
+            // macOS 10.13 / iOS 11.
+            // The property's getter is `areRasterOrderGroupsSupported`;
+            // metal-rs 0.29 sends the unimplemented plain property name.
+            raster_order_groups: device_bool_query(device, "areRasterOrderGroupsSupported"),
             float32_filtering: true, // Most Metal devices support this
             msaa_depth_resolve: true,
-            sparse_textures: device.supports_sparse_textures(),
-            function_pointers: device.supports_function_pointers(),
-            ray_tracing: device.supports_raytracing(),
+            // metal-rs exposes no sparse-texture query; sparse textures require the
+            // Apple6 GPU family (A13 / Apple silicon) or newer.
+            sparse_textures: supports_family(device, metal::MTLGPUFamily::Apple6),
+            // macOS 11 / iOS 14 queries: absent (false) on older systems.
+            function_pointers: device_responds_to(device, "supportsFunctionPointers")
+                && device.supports_function_pointers(),
+            ray_tracing: device_responds_to(device, "supportsRaytracing")
+                && device.supports_raytracing(),
             mesh_shaders: false, // Requires checking specific feature set
-            argument_buffer_tier: match device.argument_buffers_support() {
-                metal::MTLArgumentBuffersTier::Tier1 => 1,
-                metal::MTLArgumentBuffersTier::Tier2 => 2,
-            },
-            read_write_texture_tier: match device.read_write_texture_support() {
-                metal::MTLReadWriteTextureTier::TierNone => 0,
-                metal::MTLReadWriteTextureTier::Tier1 => 1,
-                metal::MTLReadWriteTextureTier::Tier2 => 2,
-            },
+            argument_buffer_tier,
+            read_write_texture_tier,
         }
     }
 
     /// Detect the highest supported feature set.
     fn detect_feature_set(device: &DeviceRef) -> MetalFeatureSet {
+        // `supportsFamily:` needs macOS 10.15 / iOS 13; older systems get
+        // the platform's baseline feature set instead of an
+        // unrecognized-selector exception.
+        if !device_responds_to(device, "supportsFamily:") {
+            return Self::legacy_feature_set();
+        }
+
         // Check from highest to lowest
         // Apple Silicon families (newest first)
         if device.supports_family(metal::MTLGPUFamily::Apple9) {
@@ -605,6 +721,15 @@ impl MetalContext {
             return MetalFeatureSet::AppleFamily1;
         }
 
+        // macOS families before the Common ones: every Mac GPU also reports
+        // Common3, which would otherwise hide its (larger) Mac limits.
+        if device.supports_family(metal::MTLGPUFamily::Mac2) {
+            return MetalFeatureSet::MacosGpuFamily2V1;
+        }
+        if device.supports_family(metal::MTLGPUFamily::Mac1) {
+            return MetalFeatureSet::MacosGpuFamily1V4;
+        }
+
         // Common families
         if device.supports_family(metal::MTLGPUFamily::Common3) {
             return MetalFeatureSet::CommonFamily3;
@@ -616,41 +741,53 @@ impl MetalContext {
             return MetalFeatureSet::CommonFamily1;
         }
 
-        // macOS families (legacy)
-        if device.supports_family(metal::MTLGPUFamily::Mac2) {
-            return MetalFeatureSet::MacosGpuFamily2V1;
-        }
-        if device.supports_family(metal::MTLGPUFamily::Mac1) {
-            return MetalFeatureSet::MacosGpuFamily1V4;
-        }
+        Self::legacy_feature_set()
+    }
 
-        // Default to lowest common
-        MetalFeatureSet::CommonFamily1
+    /// Feature set assumed when `MTLGPUFamily` queries are unavailable or
+    /// match nothing: every Metal-capable Mac is at least macOS GPU family
+    /// 1 (16384-texel textures); on iOS the conservative lowest family
+    /// applies.
+    const fn legacy_feature_set() -> MetalFeatureSet {
+        if cfg!(target_os = "macos") {
+            MetalFeatureSet::MacosGpuFamily1V1
+        } else {
+            MetalFeatureSet::CommonFamily1
+        }
     }
 
     /// Get texture limits for a feature set.
-    fn get_texture_limits(feature_set: &MetalFeatureSet) -> (u32, u32, u32, u32) {
+    ///
+    /// Apple3+ GPUs (including the legacy iOS GPU family 3+ feature sets)
+    /// and every macOS family support 16384-texel 2D/cube textures; older
+    /// iOS families (A7/A8) are limited to 8192.
+    const fn get_texture_limits(feature_set: MetalFeatureSet) -> (u32, u32, u32, u32) {
         match feature_set {
-            MetalFeatureSet::AppleFamily7
+            MetalFeatureSet::IosGpuFamily3V1
+            | MetalFeatureSet::IosGpuFamily3V2
+            | MetalFeatureSet::IosGpuFamily4V1
+            | MetalFeatureSet::IosGpuFamily5V1
+            | MetalFeatureSet::MacosGpuFamily1V1
+            | MetalFeatureSet::MacosGpuFamily1V2
+            | MetalFeatureSet::MacosGpuFamily1V3
+            | MetalFeatureSet::AppleFamily3
+            | MetalFeatureSet::AppleFamily4
+            | MetalFeatureSet::AppleFamily5
+            | MetalFeatureSet::AppleFamily6
+            | MetalFeatureSet::AppleFamily7
             | MetalFeatureSet::AppleFamily8
             | MetalFeatureSet::AppleFamily9
+            | MetalFeatureSet::MacosGpuFamily1V4
             | MetalFeatureSet::MacosGpuFamily2V1 => (16384, 2048, 16384, 2048),
-            MetalFeatureSet::AppleFamily5
-            | MetalFeatureSet::AppleFamily6
-            | MetalFeatureSet::MacosGpuFamily1V4 => (16384, 2048, 16384, 2048),
-            MetalFeatureSet::AppleFamily3 | MetalFeatureSet::AppleFamily4 => {
-                (16384, 2048, 16384, 2048)
-            }
             _ => (8192, 2048, 8192, 2048),
         }
     }
 
     /// Build adapter info from device.
     fn build_adapter_info(device: &DeviceRef, caps: &MetalCaps) -> GpuAdapterInfo {
-        let device_type = if device.is_low_power() {
+        // Apple Silicon GPUs are integrated even when not flagged low-power.
+        let device_type = if caps.is_low_power || caps.is_apple_silicon {
             GpuDeviceType::Integrated
-        } else if caps.is_apple_silicon {
-            GpuDeviceType::Integrated // Apple Silicon is technically integrated
         } else {
             GpuDeviceType::Discrete
         };
@@ -664,64 +801,75 @@ impl MetalContext {
     }
 
     /// Get the Metal device.
+    #[must_use]
     pub fn device(&self) -> &DeviceRef {
         &self.device
     }
 
     /// Get the command queue.
+    #[must_use]
     pub fn command_queue(&self) -> &metal::CommandQueueRef {
         &self.command_queue
     }
 
     /// Get Metal capabilities.
-    pub fn metal_caps(&self) -> &MetalCaps {
+    #[must_use]
+    pub const fn metal_caps(&self) -> &MetalCaps {
         &self.caps
     }
 
     /// Create a new command buffer.
+    #[must_use]
     pub fn new_command_buffer(&self) -> metal::CommandBuffer {
         self.command_queue.new_command_buffer().to_owned()
     }
 
     /// Create a new render pass descriptor.
+    #[must_use]
     pub fn new_render_pass_descriptor() -> metal::RenderPassDescriptor {
         metal::RenderPassDescriptor::new().to_owned()
     }
 
     /// Create a new texture descriptor.
+    #[must_use]
     pub fn new_texture_descriptor() -> metal::TextureDescriptor {
         metal::TextureDescriptor::new()
     }
 
     /// Create a new buffer with data.
+    #[must_use]
     pub fn new_buffer_with_data(&self, data: &[u8]) -> metal::Buffer {
         self.device.new_buffer_with_data(
-            data.as_ptr() as *const _,
+            data.as_ptr().cast(),
             data.len() as u64,
             metal::MTLResourceOptions::StorageModeShared,
         )
     }
 
     /// Create a new buffer with size.
+    #[must_use]
     pub fn new_buffer(&self, size: u64) -> metal::Buffer {
         self.device
             .new_buffer(size, metal::MTLResourceOptions::StorageModeShared)
     }
 
     /// Create a new texture.
+    #[must_use]
     pub fn new_texture(&self, descriptor: &metal::TextureDescriptorRef) -> metal::Texture {
         self.device.new_texture(descriptor)
     }
 
     /// Create a new sampler state.
+    #[must_use]
     pub fn new_sampler_state(
         &self,
         descriptor: &metal::SamplerDescriptorRef,
     ) -> metal::SamplerState {
-        self.device.new_sampler_state(descriptor)
+        self.device.new_sampler(descriptor)
     }
 
     /// Create a new depth stencil state.
+    #[must_use]
     pub fn new_depth_stencil_state(
         &self,
         descriptor: &metal::DepthStencilDescriptorRef,
@@ -730,31 +878,39 @@ impl MetalContext {
     }
 
     /// Compile a shader library from source.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Metal compiler's error message if `source` fails to compile.
     pub fn new_library_with_source(&self, source: &str) -> Result<metal::Library, String> {
         let options = metal::CompileOptions::new();
-        self.device
-            .new_library_with_source(source, &options)
-            .map_err(|e| e.to_string())
+        self.device.new_library_with_source(source, &options)
     }
 
     /// Create a render pipeline state.
+    ///
+    /// # Errors
+    ///
+    /// Returns Metal's error message if the descriptor is invalid (e.g.
+    /// missing functions or incompatible attachment formats).
     pub fn new_render_pipeline_state(
         &self,
         descriptor: &metal::RenderPipelineDescriptorRef,
     ) -> Result<metal::RenderPipelineState, String> {
-        self.device
-            .new_render_pipeline_state(descriptor)
-            .map_err(|e| e.to_string())
+        self.device.new_render_pipeline_state(descriptor)
     }
 
     /// Create a compute pipeline state.
+    ///
+    /// # Errors
+    ///
+    /// Returns Metal's error message if `function` is not a valid kernel.
     pub fn new_compute_pipeline_state(
         &self,
         function: &metal::FunctionRef,
     ) -> Result<metal::ComputePipelineState, String> {
         self.device
             .new_compute_pipeline_state_with_function(function)
-            .map_err(|e| e.to_string())
     }
 }
 

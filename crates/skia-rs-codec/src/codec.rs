@@ -120,10 +120,10 @@ impl ImageFormat {
             if let (Some(width), Some(height)) = (
                 read_wbmp_int(data, &mut offset),
                 read_wbmp_int(data, &mut offset),
-            ) {
-                if width > 0 && height > 0 {
-                    return Self::Wbmp;
-                }
+            ) && width > 0
+                && height > 0
+            {
+                return Self::Wbmp;
             }
         }
 
@@ -623,7 +623,7 @@ impl ImageEncoder for JpegEncoder {
             .and_then(|n| n.checked_mul(3))
             .ok_or_else(|| CodecError::EncodingError("image dimensions overflow".into()))?;
         let mut rgb = Vec::with_capacity(rgb_capacity);
-        for chunk in rgba.chunks_exact(4) {
+        for chunk in rgba.as_chunks::<4>().0 {
             rgb.push(chunk[0]);
             rgb.push(chunk[1]);
             rgb.push(chunk[2]);
@@ -3015,7 +3015,7 @@ mod tests {
         let raw = vec![0xFFFFu16; 4 * 4];
         let rgb = demosaic_bayer_rggb(&raw, 4, 4);
         assert_eq!(rgb.len(), 4 * 4 * 3);
-        for (i, chunk) in rgb.chunks_exact(3).enumerate() {
+        for (i, chunk) in rgb.as_chunks::<3>().0.iter().enumerate() {
             assert!(chunk[0] > 200, "r too dim at pixel {}: {}", i, chunk[0]);
             assert!(chunk[1] > 200, "g too dim at pixel {}: {}", i, chunk[1]);
             assert!(chunk[2] > 200, "b too dim at pixel {}: {}", i, chunk[2]);
@@ -3075,7 +3075,7 @@ mod tests {
         // rather than panicking.
         let raw = vec![0u16; 10];
         let rgb = demosaic_bayer_rggb(&raw, 4, 4);
-        assert!(rgb.is_empty());
+        assert_eq!(rgb, [] as [u8; 0]);
     }
 
     #[cfg(feature = "gif")]

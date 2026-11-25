@@ -16,6 +16,7 @@ fn color_component_to_byte(v: Scalar) -> u8 {
 
 /// Paint style (fill, stroke, or both).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum Style {
     /// Fill the shape.
@@ -29,6 +30,7 @@ pub enum Style {
 
 /// Stroke cap style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum StrokeCap {
     /// Flat cap.
@@ -42,6 +44,7 @@ pub enum StrokeCap {
 
 /// Stroke join style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum StrokeJoin {
     /// Miter join.
@@ -456,56 +459,64 @@ impl Paint {
         data.push(flags);
 
         // Shader section
-        match self.shader.as_ref().and_then(|s| s.serialize()) {
-            Some(shader_data) => {
+        // A section whose length does not fit the u32 prefix is absent.
+        match self
+            .shader
+            .as_ref()
+            .and_then(|s| s.serialize())
+            .and_then(|d| Some((u32::try_from(d.len()).ok()?, d)))
+        {
+            Some((len, shader_data)) => {
                 data.push(1); // present
-                data.extend_from_slice(
-                    &u32::try_from(shader_data.len())
-                        .unwrap_or(u32::MAX)
-                        .to_le_bytes(),
-                );
+                data.extend_from_slice(&len.to_le_bytes());
                 data.extend_from_slice(&shader_data);
             }
             None => data.push(0), // absent
         }
 
         // MaskFilter section
-        match self.mask_filter.as_ref().and_then(|f| f.serialize()) {
-            Some(filter_data) => {
+        // A section whose length does not fit the u32 prefix is absent.
+        match self
+            .mask_filter
+            .as_ref()
+            .and_then(|f| f.serialize())
+            .and_then(|d| Some((u32::try_from(d.len()).ok()?, d)))
+        {
+            Some((len, filter_data)) => {
                 data.push(1);
-                data.extend_from_slice(
-                    &u32::try_from(filter_data.len())
-                        .unwrap_or(u32::MAX)
-                        .to_le_bytes(),
-                );
+                data.extend_from_slice(&len.to_le_bytes());
                 data.extend_from_slice(&filter_data);
             }
             None => data.push(0),
         }
 
         // ColorFilter section
-        match self.color_filter.as_ref().and_then(|f| f.serialize()) {
-            Some(filter_data) => {
+        // A section whose length does not fit the u32 prefix is absent.
+        match self
+            .color_filter
+            .as_ref()
+            .and_then(|f| f.serialize())
+            .and_then(|d| Some((u32::try_from(d.len()).ok()?, d)))
+        {
+            Some((len, filter_data)) => {
                 data.push(1);
-                data.extend_from_slice(
-                    &u32::try_from(filter_data.len())
-                        .unwrap_or(u32::MAX)
-                        .to_le_bytes(),
-                );
+                data.extend_from_slice(&len.to_le_bytes());
                 data.extend_from_slice(&filter_data);
             }
             None => data.push(0),
         }
 
         // ImageFilter section
-        match self.image_filter.as_ref().and_then(|f| f.serialize()) {
-            Some(filter_data) => {
+        // A section whose length does not fit the u32 prefix is absent.
+        match self
+            .image_filter
+            .as_ref()
+            .and_then(|f| f.serialize())
+            .and_then(|d| Some((u32::try_from(d.len()).ok()?, d)))
+        {
+            Some((len, filter_data)) => {
                 data.push(1);
-                data.extend_from_slice(
-                    &u32::try_from(filter_data.len())
-                        .unwrap_or(u32::MAX)
-                        .to_le_bytes(),
-                );
+                data.extend_from_slice(&len.to_le_bytes());
                 data.extend_from_slice(&filter_data);
             }
             None => data.push(0),
@@ -527,7 +538,13 @@ impl Paint {
         if *offset >= data.len() {
             return Ok(None);
         }
-        let present = data[*offset] == 1;
+        // 0 is absent and 1 present; any other flag is malformed (reading
+        // on would misalign every later section).
+        let present = match data[*offset] {
+            0 => false,
+            1 => true,
+            _ => return Err(()),
+        };
         *offset += 1;
         if !present {
             return Ok(None);
@@ -542,7 +559,7 @@ impl Paint {
             data[*offset + 3],
         ]) as usize;
         *offset += 4;
-        if *offset + len > data.len() {
+        if len > data.len() - *offset {
             return Err(());
         }
         let bytes = &data[*offset..*offset + len];

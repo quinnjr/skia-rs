@@ -14,6 +14,7 @@ use skia_rs_core::{Point, Rect, Scalar};
 
 /// Operation type for path boolean operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum PathOp {
     /// Subtract the second path from the first.
@@ -199,7 +200,7 @@ impl Polygon {
         self.points.push(p);
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.points.len() < 3
     }
 

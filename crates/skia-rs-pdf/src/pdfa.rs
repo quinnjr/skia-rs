@@ -554,14 +554,14 @@ impl PdfAValidator {
             });
         }
 
-        if let Some(ref xmp) = doc.xmp_metadata {
-            if xmp.pdfa_level.is_none() {
-                self.errors.push(PdfAError {
-                    code: PdfAErrorCode::MissingPdfaId,
-                    message: "PDF/A identification in XMP metadata is required".to_string(),
-                    location: None,
-                });
-            }
+        if let Some(ref xmp) = doc.xmp_metadata
+            && xmp.pdfa_level.is_none()
+        {
+            self.errors.push(PdfAError {
+                code: PdfAErrorCode::MissingPdfaId,
+                message: "PDF/A identification in XMP metadata is required".to_string(),
+                location: None,
+            });
         }
     }
 

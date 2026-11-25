@@ -489,21 +489,20 @@ impl Interp<'_> {
             } => {
                 // `child.eval(coord)` samples a bound child shader. The
                 // returned color follows the Shader::sample premul contract.
-                if method == "eval" {
-                    if let Expr::Var(name) = receiver.as_ref() {
-                        if let Some(&idx) = self.children_by_name.get(name.as_str()) {
-                            let coord = args
-                                .first()
-                                .map_or(Value::Vec2([0.0, 0.0]), |a| self.compute_expr(a));
-                            let xy = coord.as_vec2();
-                            if let Some(child) = self.children.get(idx) {
-                                let c = child.sample(xy[0], xy[1]);
-                                return Value::Vec4([c.r, c.g, c.b, c.a]);
-                            }
-                            // Unbound child: transparent black.
-                            return Value::Vec4([0.0, 0.0, 0.0, 0.0]);
-                        }
+                if method == "eval"
+                    && let Expr::Var(name) = receiver.as_ref()
+                    && let Some(&idx) = self.children_by_name.get(name.as_str())
+                {
+                    let coord = args
+                        .first()
+                        .map_or(Value::Vec2([0.0, 0.0]), |a| self.compute_expr(a));
+                    let xy = coord.as_vec2();
+                    if let Some(child) = self.children.get(idx) {
+                        let c = child.sample(xy[0], xy[1]);
+                        return Value::Vec4([c.r, c.g, c.b, c.a]);
                     }
+                    // Unbound child: transparent black.
+                    return Value::Vec4([0.0, 0.0, 0.0, 0.0]);
                 }
                 Value::Void
             }
@@ -707,10 +706,10 @@ fn apply_binary(op: BinaryOp, l: &Value, r: &Value) -> Value {
         };
     }
 
-    if matches!(op, BinaryOp::Mul) {
-        if let Some(v) = mat_mul(l, r) {
-            return v;
-        }
+    if matches!(op, BinaryOp::Mul)
+        && let Some(v) = mat_mul(l, r)
+    {
+        return v;
     }
 
     // Matrix element-wise ops: mat±mat, mat·scalar, scalar·mat, mat/scalar…

@@ -38,12 +38,12 @@
 **Effort:** Small (delegate to `generator::convert_pixels` with a per-row source crop; ~30 lines including tests).
 
 ### C-2: `Image::make_with_filter` is a no-op that returns `self.clone()`
-**File:** `image.rs` (lines 427-431)
+**File:** `image.rs` (`Image::make_with_filter`)
 **Severity:** Critical
-**Status:** RESOLVED (Phase 6B). Signature changed to `make_with_filter(&self, filter: &dyn skia_rs_paint::ImageFilter) -> Option<Self>`. Implementation converts the image to RGBA8/Premul via `read_pixels`, calls `filter.apply(pixels, width, height)` (the single-buffer apply added in Phase 4), and wraps the result as a new Image. The codec crate now depends on skia-rs-paint (no cycle; paint does not depend on codec). Multi-input filters (Merge, DisplacementMap's displacement pin) are documented as passing through unchanged because the paint-crate's single-buffer apply() API cannot supply multiple input buffers; a future multi-input apply will unblock them. Test: `test_make_with_filter_offset_shifts_pixels` using `OffsetImageFilter`.
-**Description:** Body: `// TODO: Implement matrix transformation\nSome(self.clone())`. In Skia, `SkImage::makeWithFilter` applies an `SkImageFilter` (blur, drop-shadow, color-matrix, etc.) to the image and returns a new filtered image. Here the function takes no filter argument at all, so even a correct implementation has no filter to apply — the signature is wrong.
+**Status:** RESOLVED (Phase 6B). Signature changed to `make_with_filter(&self, filter: &dyn skia_rs_paint::ImageFilter) -> Option<Self>`. Implementation converts the image to RGBA8/Premul via `read_pixels`, calls `filter.apply(pixels, width, height)` (the single-buffer apply added in Phase 4), and wraps the result as a new Image. The codec crate now depends on skia-rs-paint (no cycle; paint does not depend on codec). Filters with several inputs (Merge, Blend, Arithmetic, DisplacementMap) run each input on a copy of the buffer and combine the results, so they apply through the same single-buffer `apply()`. Test: `test_make_with_filter_offset_shifts_pixels` using `OffsetImageFilter`.
+**Description (historical):** The body was `// TODO: Implement matrix transformation\nSome(self.clone())` and the function took no filter argument. In Skia, `SkImage::makeWithFilter` applies an `SkImageFilter` (blur, drop-shadow, color-matrix, etc.) to the image and returns a new filtered image; the resolved version above does the same.
 **Impact:** Image filters defined in skia-rs-paint's `filter.rs` cannot be materialised onto an Image. Any UI-side image filtering pipeline is stuck on the CPU bitmap side.
-**Effort:** Medium (signature change to accept `&dyn ImageFilter` + `&Matrix` + clip rect; depends on N-4 from paint crate GAPS.md which added `apply()` methods to ImageFilter trait).
+**Effort:** Done (the signature now takes `&dyn ImageFilter`; it relies on N-4 from the paint crate's GAPS.md, which added `apply()` to the ImageFilter trait).
 
 ### C-3: `GpuImage` is a standalone pixel container, not GPU-backed; `has_texture()` is always the caller's responsibility
 **File:** `gpu_image.rs` (lines 100-446)

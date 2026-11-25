@@ -371,7 +371,7 @@ impl AnimatedProperty {
 
     /// Check if this property is animated.
     #[must_use]
-    pub fn is_animated(&self) -> bool {
+    pub const fn is_animated(&self) -> bool {
         self.keyframes.len() > 1
     }
 
@@ -614,11 +614,11 @@ fn parse_json_value(value: &serde_json::Value) -> KeyframeValue {
         }
         serde_json::Value::Array(arr) => {
             // Animated bezier path value: `"s": [{"i","o","v","c"}]`.
-            if let Some(first) = arr.first() {
-                if first.is_object() {
-                    return parse_path_object(first)
-                        .map_or(KeyframeValue::Scalar(0.0), KeyframeValue::Path);
-                }
+            if let Some(first) = arr.first()
+                && first.is_object()
+            {
+                return parse_path_object(first)
+                    .map_or(KeyframeValue::Scalar(0.0), KeyframeValue::Path);
             }
             let values: Vec<Scalar> = arr
                 .iter()

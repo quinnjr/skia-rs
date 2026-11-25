@@ -234,15 +234,111 @@ pub struct Typeface {
     parsed: OnceLock<Option<ParsedTypeface>>,
 }
 
+/// Source of [`Typeface::unique_id`] values, shared by every constructor so
+/// that IDs never collide between typefaces created through different paths.
+static NEXT_TYPEFACE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+fn next_typeface_id() -> u32 {
+    NEXT_TYPEFACE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a font read error is clearly transient (so a miss should not be
+/// cached). Anything else (missing, forbidden, a loop, an I/O error) counts
+/// as permanent for that candidate.
+fn is_transient(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    // Too many open files (EMFILE/ENFILE; Windows'
+    // ERROR_TOO_MANY_OPEN_FILES), and on Windows a file briefly held by
+    // another process (ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, e.g.
+    // antivirus or a font install), which std leaves uncategorized.
+    #[cfg(unix)]
+    const TRANSIENT_OS_ERRORS: &[i32] = &[23, 24];
+    #[cfg(windows)]
+    const TRANSIENT_OS_ERRORS: &[i32] = &[4, 32, 33];
+    #[cfg(not(any(unix, windows)))]
+    const TRANSIENT_OS_ERRORS: &[i32] = &[];
+    matches!(
+        error.kind(),
+        ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+            | ErrorKind::ResourceBusy
+            | ErrorKind::OutOfMemory
+    ) || error
+        .raw_os_error()
+        .is_some_and(|code| TRANSIENT_OS_ERRORS.contains(&code))
+}
+
+/// Well-known locations of each platform's default sans-serif font, in order
+/// of preference. Mirrors the families Skia's platform font managers resolve
+/// for a `nullptr` family name.
+fn system_default_font_candidates() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let mut paths = Vec::new();
+    if cfg!(target_os = "windows") {
+        let windir = std::env::var_os("WINDIR")
+            .or_else(|| std::env::var_os("SystemRoot"))
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        let fonts = windir.join("Fonts");
+        paths.extend(["segoeui.ttf", "arial.ttf", "tahoma.ttf"].map(|f| fonts.join(f)));
+    } else if cfg!(target_os = "ios") {
+        // iOS system fonts are not at stable paths, and sandboxed apps cannot
+        // read them by path; load bundled fonts with Typeface::from_data.
+    } else if cfg!(target_os = "macos") {
+        paths.extend(
+            [
+                "/System/Library/Fonts/Helvetica.ttc",
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/Library/Fonts/Arial.ttf",
+                "/System/Library/Fonts/Geneva.ttf",
+            ]
+            .map(PathBuf::from),
+        );
+    } else if cfg!(target_os = "android") {
+        paths.extend(
+            [
+                "/system/fonts/Roboto-Regular.ttf",
+                "/system/fonts/DroidSans.ttf",
+            ]
+            .map(PathBuf::from),
+        );
+    } else {
+        // Linux / BSD: the common distro locations of DejaVu, Liberation and
+        // Noto Sans (the usual fontconfig `sans-serif` matches).
+        paths.extend(
+            [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+                "/usr/local/share/fonts/dejavu/DejaVuSans.ttf",
+            ]
+            .map(PathBuf::from),
+        );
+    }
+    paths
+}
+
 impl Typeface {
     /// Create a default typeface.
+    ///
+    /// This is a data-less placeholder: it reports plausible metrics and can
+    /// measure text, but it carries no glyph outlines, so drawing text with it
+    /// produces no pixels. It never touches the file system, which keeps it
+    /// deterministic. Use [`system_default`](Self::system_default) for a real
+    /// platform font.
+    #[must_use]
     pub fn default_typeface() -> Self {
-        static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-
         Self {
             family_name: "sans-serif".to_string(),
             style: FontStyle::NORMAL,
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id: next_typeface_id(),
             data: None,
             units_per_em: 2048,
             glyph_count: 256,
@@ -250,14 +346,70 @@ impl Typeface {
         }
     }
 
+    /// Load the platform's default sans-serif typeface from the installed
+    /// system fonts (`Segoe UI` / `Arial` on Windows, `Helvetica` on macOS,
+    /// `DejaVu Sans` / `Liberation Sans` / `Noto Sans` on Linux, `Roboto` on
+    /// Android).
+    ///
+    /// Corresponds to Skia's
+    /// `SkFontMgr::legacyMakeTypeface(nullptr, SkFontStyle())`. Unlike
+    /// [`default_typeface`](Self::default_typeface),
+    /// the result has real glyph outlines and renders visible text. Like the
+    /// typeface Skia's font manager caches, it is loaded once per process:
+    /// every call returns the same typeface (same [`unique_id`](Self::unique_id)
+    /// and shared font bytes), so per-typeface caches keep hitting.
+    ///
+    /// Returns `None` when none of the well-known font files exists, e.g. in
+    /// a minimal container without fonts installed, and always on iOS, where
+    /// system fonts cannot be read by path (bundle a font and use
+    /// [`from_data`](Self::from_data)). Like Skia's default typeface (set
+    /// up once with `SkOnce`), the lookup runs once per process whether it
+    /// finds a font or not, so a font-less environment does not re-probe the
+    /// candidate paths on every call. A font that loads is always kept, even
+    /// a fallback reached because a preferred candidate failed, so every call
+    /// returns the same typeface. A miss is not kept when a candidate failed
+    /// with a clearly transient error (too many open files, an interrupted,
+    /// timed-out or busy read, or on Windows a file briefly held by another
+    /// process: a sharing or lock violation): the next call tries again.
+    #[must_use]
+    pub fn system_default() -> Option<Self> {
+        // A hit, or a definite miss, is cached; every call shares it.
+        static TYPEFACE: OnceLock<Option<Typeface>> = OnceLock::new();
+
+        if let Some(cached) = TYPEFACE.get() {
+            return cached.clone();
+        }
+        let mut transient_error = false;
+        let found =
+            system_default_font_candidates()
+                .into_iter()
+                .find_map(|path| match std::fs::read(path) {
+                    Ok(data) => Self::from_data(data),
+                    Err(e) => {
+                        transient_error |= is_transient(&e);
+                        None
+                    }
+                });
+        // A miss after a transient error may clear up: try again next call.
+        if found.is_none() && transient_error {
+            return None;
+        }
+        // Parse the font tables before caching: each returned clone copies
+        // the already-parsed metrics instead of parsing the font again.
+        if let Some(typeface) = &found {
+            let _ = typeface.parsed();
+        }
+        // If two threads look up concurrently, the first result is kept.
+        TYPEFACE.get_or_init(|| found).clone()
+    }
+
     /// Create a typeface from font data.
     ///
     /// The data is parsed with `ttf_parser` to extract real `units_per_em`,
     /// glyph count, family name, and style flags. Returns `None` if the data
     /// is not a valid OpenType/TrueType font (or collection, index 0).
+    #[must_use]
     pub fn from_data(data: Vec<u8>) -> Option<Self> {
-        static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-
         if data.len() < 12 {
             return None;
         }
@@ -291,7 +443,7 @@ impl Typeface {
                 width,
                 slant,
             },
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id: next_typeface_id(),
             data: Some(Arc::new(data)),
             units_per_em,
             glyph_count,
@@ -399,10 +551,10 @@ impl Typeface {
     /// Falls back to returning the character code for ASCII when no font
     /// data is available (the default typeface has no backing font).
     pub fn char_to_glyph(&self, c: char) -> u16 {
-        if let Some(data) = self.font_data() {
-            if let Ok(face) = ttf_parser::Face::parse(data, 0) {
-                return face.glyph_index(c).map_or(0, |g| g.0);
-            }
+        if let Some(data) = self.font_data()
+            && let Ok(face) = ttf_parser::Face::parse(data, 0)
+        {
+            return face.glyph_index(c).map_or(0, |g| g.0);
         }
         // Fallback for the dataless default typeface — just use the codepoint
         // for ASCII so existing non-data tests continue to produce non-zero
@@ -454,6 +606,35 @@ pub type TypefaceRef = Arc<Typeface>;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_system_default_typeface_comes_already_parsed() {
+        // Needs a system font; where there is none there is nothing to share.
+        if let Some(typeface) = Typeface::system_default() {
+            assert!(typeface.parsed.get().is_some(), "parsed before caching");
+        }
+    }
+
+    #[test]
+    fn only_clearly_transient_read_errors_are_retried() {
+        use std::io::{Error, ErrorKind};
+        assert!(super::is_transient(&Error::from(ErrorKind::Interrupted)));
+        assert!(super::is_transient(&Error::from(ErrorKind::TimedOut)));
+        #[cfg(unix)]
+        assert!(super::is_transient(&Error::from_raw_os_error(24)));
+        #[cfg(windows)]
+        for code in [4, 32, 33] {
+            assert!(
+                super::is_transient(&Error::from_raw_os_error(code)),
+                "{code}"
+            );
+        }
+        assert!(!super::is_transient(&Error::from(ErrorKind::NotFound)));
+        assert!(!super::is_transient(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!super::is_transient(&Error::other("I/O error")));
+    }
+
     use super::*;
 
     #[test]
@@ -472,6 +653,43 @@ mod tests {
         assert_eq!(tf.family_name(), "sans-serif");
         assert!(!tf.is_bold());
         assert!(!tf.is_italic());
+    }
+
+    #[test]
+    fn test_unique_ids_do_not_collide_across_constructors() {
+        let font = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/demo.ttf"
+        ))
+        .expect("demo.ttf fixture (git lfs pull)");
+        let ids = [
+            Typeface::default_typeface().unique_id(),
+            Typeface::from_data(font.clone()).unwrap().unique_id(),
+            Typeface::default_typeface().unique_id(),
+            Typeface::from_data(font).unwrap().unique_id(),
+        ];
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "duplicate typeface ids: {ids:?}");
+    }
+
+    #[test]
+    fn test_system_default_has_real_glyphs_when_available() {
+        // Machines without any of the well-known fonts (minimal containers)
+        // legitimately get `None`; everywhere else the typeface must carry
+        // real outlines, unlike the data-less `default_typeface`.
+        let Some(tf) = Typeface::system_default() else {
+            return;
+        };
+        assert!(tf.glyph_count() > 0);
+        assert_ne!(tf.char_to_glyph('A'), 0, "system font must map 'A'");
+        // Like Skia's cached default typeface: every call is the same face.
+        let again = Typeface::system_default().expect("cached font stays available");
+        assert_eq!(tf.unique_id(), again.unique_id());
+        assert_eq!(
+            tf.font_data().map(<[u8]>::as_ptr),
+            again.font_data().map(<[u8]>::as_ptr),
+            "font bytes must be shared, not re-read"
+        );
     }
 
     #[test]

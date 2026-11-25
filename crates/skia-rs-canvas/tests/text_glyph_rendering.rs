@@ -149,3 +149,334 @@ fn draw_text_blob_renders_non_rectangular_glyph() {
         "text_blob must have unfilled pixels within its bbox"
     );
 }
+
+/// Count pixels with a non-zero red channel in the whole buffer.
+fn lit_pixels(buffer: &PixelBuffer, width: i32, height: i32) -> usize {
+    let mut lit = 0;
+    for y in 0..height {
+        for x in 0..width {
+            if buffer.get_pixel(x, y).unwrap_or(Color::BLACK).red() > 0 {
+                lit += 1;
+            }
+        }
+    }
+    lit
+}
+
+#[test]
+fn embolden_thickens_glyphs_in_every_draw_path() {
+    use skia_rs_core::Point;
+    use skia_rs_text::TextBlob;
+
+    // Render the same glyph regular and emboldened through each public text
+    // entry point; fake bold (Skia's stroke-and-fill outset) must strictly
+    // increase coverage, and for a stroked paint it must widen the stroke.
+    let render = |embolden: bool, stroke: bool, entry: u8| {
+        let mut font = demo_font(120.0);
+        font.set_embolden(embolden);
+        let mut paint = Paint::new();
+        paint.set_color(Color::WHITE.into());
+        if stroke {
+            paint.set_style(skia_rs_paint::Style::Stroke);
+            paint.set_stroke_width(2.0);
+        }
+        let mut buffer = PixelBuffer::new(300, 300);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            match entry {
+                0 => canvas.draw_string("A", 60.0, 220.0, &font, &paint),
+                1 => {
+                    let blob = TextBlob::from_text("A", &font, Point::zero());
+                    canvas.draw_text_blob(&blob, 60.0, 220.0, &paint);
+                }
+                _ => canvas.draw_glyphs(
+                    &[1],
+                    &[Point::zero()],
+                    Point::new(60.0, 220.0),
+                    &font,
+                    &paint,
+                ),
+            }
+        }
+        lit_pixels(&buffer, 300, 300)
+    };
+
+    for entry in 0..3 {
+        for stroke in [false, true] {
+            let regular = render(false, stroke, entry);
+            let bold = render(true, stroke, entry);
+            assert!(regular > 0, "entry {entry}: regular glyph must paint");
+            assert!(
+                bold > regular,
+                "entry {entry} stroke={stroke}: embolden must add coverage \
+                 (regular={regular}, bold={bold})"
+            );
+        }
+    }
+}
+
+#[test]
+fn embolden_under_scale_adds_coverage_and_never_double_blends() {
+    // Emboldening is done in device space; under a 3x canvas scale both the
+    // opaque fast path and the translucent union path must thicken the
+    // glyph, and the translucent path must cover each pixel exactly once.
+    let render = |embolden: bool, alpha: u8| {
+        let mut font = demo_font(40.0);
+        font.set_embolden(embolden);
+        let mut paint = Paint::new();
+        paint.set_color32(Color::from_argb(alpha, 255, 255, 255));
+        paint.set_anti_alias(true);
+        let mut buffer = PixelBuffer::new(300, 300);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            canvas.scale(3.0, 3.0);
+            canvas.draw_string("A", 20.0, 80.0, &font, &paint);
+        }
+        let mut lit = 0usize;
+        let mut max_red = 0u8;
+        for y in 0..300 {
+            for x in 0..300 {
+                let red = buffer.get_pixel(x, y).unwrap_or(Color::BLACK).red();
+                max_red = max_red.max(red);
+                if red > 0 {
+                    lit += 1;
+                }
+            }
+        }
+        (lit, max_red)
+    };
+
+    for alpha in [255u8, 128] {
+        let (regular, regular_max) = render(false, alpha);
+        let (bold, bold_max) = render(true, alpha);
+        assert!(regular > 0, "alpha {alpha}: regular glyph must paint");
+        assert!(
+            bold > regular,
+            "alpha {alpha}: embolden must add coverage (regular={regular}, bold={bold})"
+        );
+        assert!(
+            bold_max <= regular_max.saturating_add(1),
+            "alpha {alpha}: bold glyph must not double-blend the fill/stroke \
+             overlap (regular max={regular_max}, bold max={bold_max})"
+        );
+    }
+}
+
+#[test]
+fn embolden_under_non_uniform_scale_strokes_in_local_space() {
+    // Skia strokes the fake-bold outset in local space, so a non-uniform
+    // CTM stretches it. Under scale(4, 1) emboldened text must match a
+    // local-space StrokeAndFill of the outline with Skia's outset
+    // (40pt -> 40 * 1/32 = 1.25), not a uniform device-space stroke.
+    use skia_rs_core::{Matrix, Point};
+
+    let size = 40.0;
+    let origin = Point::new(5.0, 60.0);
+    let mut paint = Paint::new();
+    paint.set_color(Color::WHITE.into());
+
+    let mut bold_font = demo_font(size);
+    bold_font.set_embolden(true);
+    let mut actual = PixelBuffer::new(300, 100);
+    {
+        let mut canvas = Canvas::new_raster(&mut actual);
+        canvas.scale(4.0, 1.0);
+        canvas.draw_glyphs(&[1], &[Point::zero()], origin, &bold_font, &paint);
+    }
+
+    let outline = demo_font(size)
+        .glyph_path(1)
+        .expect("demo.ttf glyph 1 has an outline")
+        .transformed(&Matrix::translate(origin.x, origin.y));
+    let mut expected_paint = paint.clone();
+    expected_paint.set_style(skia_rs_paint::Style::StrokeAndFill);
+    expected_paint.set_stroke_width(size / 32.0);
+    let mut expected = PixelBuffer::new(300, 100);
+    {
+        let mut canvas = Canvas::new_raster(&mut expected);
+        canvas.scale(4.0, 1.0);
+        canvas.draw_path(&outline, &expected_paint);
+    }
+
+    assert!(lit_pixels(&actual, 300, 100) > 0);
+    for y in 0..100 {
+        for x in 0..300 {
+            assert_eq!(
+                actual.get_pixel(x, y),
+                expected.get_pixel(x, y),
+                "pixel ({x},{y}) differs from Skia's local-space outset"
+            );
+        }
+    }
+}
+
+#[test]
+fn embolden_under_an_anti_aliased_clip_blends_once() {
+    // An anti-aliased clip applies its partial coverage to every draw, so
+    // the fill-then-stroke fast path would composite clip-edge pixels twice
+    // (1 - (1 - c)^2 > c). Bold text must never be brighter than a single
+    // solid draw through the same clip.
+    use skia_rs_canvas::ClipOp;
+    use skia_rs_core::{Point, Rect};
+
+    let clip = {
+        let mut b = skia_rs_path::PathBuilder::new();
+        b.add_circle(150.0, 150.0, 90.0);
+        b.build()
+    };
+    let mut paint = Paint::new();
+    paint.set_color(Color::WHITE.into());
+    paint.set_anti_alias(true);
+
+    let render = |draw: &dyn Fn(&mut Canvas<'_>)| {
+        let mut buffer = PixelBuffer::new(300, 300);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            canvas.clip_path(&clip, ClipOp::Intersect, true);
+            draw(&mut canvas);
+        }
+        buffer
+    };
+
+    let mut font = demo_font(160.0); // outset 160/32 = 5px: fast-path sized
+    font.set_embolden(true);
+    let text = render(&|c| {
+        c.draw_glyphs(
+            &[1],
+            &[Point::zero()],
+            Point::new(60.0, 250.0),
+            &font,
+            &paint,
+        );
+    });
+    let solid = render(&|c| c.draw_rect(&Rect::from_xywh(0.0, 0.0, 300.0, 300.0), &paint));
+
+    let mut painted = 0;
+    for y in 0..300 {
+        for x in 0..300 {
+            let t = text.get_pixel(x, y).unwrap_or(Color::BLACK).red();
+            let s = solid.get_pixel(x, y).unwrap_or(Color::BLACK).red();
+            assert!(
+                t <= s.saturating_add(1),
+                "pixel ({x},{y}) blended twice: text {t} > clip coverage {s}"
+            );
+            if t > 0 {
+                painted += 1;
+            }
+        }
+    }
+    assert!(painted > 0, "the bold glyph must paint inside the clip");
+}
+
+#[test]
+fn fake_bold_ignores_the_paint_stroke_join() {
+    // Skia emboldens with a default SkStrokeRec (miter join, limit 4, butt
+    // cap), so the paint's join must not change emboldened fill text.
+    let render = |join: skia_rs_paint::StrokeJoin| {
+        let mut font = demo_font(120.0);
+        font.set_embolden(true);
+        let mut paint = Paint::new();
+        paint.set_color(Color::WHITE.into());
+        paint.set_stroke_join(join);
+        let mut buffer = PixelBuffer::new(300, 300);
+        Canvas::new_raster(&mut buffer).draw_string("A", 60.0, 220.0, &font, &paint);
+        (0..300)
+            .flat_map(|y| (0..300).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).map_or(0, |c| c.red()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        render(skia_rs_paint::StrokeJoin::Round),
+        render(skia_rs_paint::StrokeJoin::Miter)
+    );
+}
+
+#[test]
+fn fake_bold_with_a_path_effect_ignores_the_paint_stroke_join() {
+    // The glyph-space path-effect branch emboldens too; it must use the same
+    // fake-bold stroke defaults as the plain branches.
+    let render = |join: skia_rs_paint::StrokeJoin| {
+        let mut font = demo_font(120.0);
+        font.set_embolden(true);
+        let mut paint = Paint::new();
+        paint.set_color(Color::WHITE.into());
+        paint.set_stroke_join(join);
+        // Zero-deviation discrete: keeps the glyph's sharp corners (a
+        // corner effect would round them away), so the join matters.
+        paint.set_path_effect(skia_rs_path::make_discrete(1000.0, 0.0, 1));
+        let mut buffer = PixelBuffer::new(300, 300);
+        Canvas::new_raster(&mut buffer).draw_string("A", 60.0, 220.0, &font, &paint);
+        (0..300)
+            .flat_map(|y| (0..300).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).map_or(0, |c| c.red()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        render(skia_rs_paint::StrokeJoin::Round),
+        render(skia_rs_paint::StrokeJoin::Miter)
+    );
+}
+
+#[test]
+fn recorded_text_keeps_its_path_effect_for_playback() {
+    // Like every other recorded draw, a glyph drawn with a path effect is
+    // recorded with the effect still on its paint (in glyph space, under a
+    // recorded translate), so playback applies it at the playback CTM's
+    // resolution instead of a dash baked in at record time.
+    use skia_rs_canvas::{DrawCommand, Picture};
+    use skia_rs_core::Rect;
+    use skia_rs_paint::Style;
+    use skia_rs_path::DashEffect;
+
+    let font = demo_font(12.0);
+    let mut paint = Paint::new();
+    paint.set_color(Color::WHITE.into());
+    paint.set_style(Style::Stroke);
+    paint.set_stroke_width(0.3);
+    paint.set_anti_alias(true);
+    paint.set_path_effect(Some(Arc::new(
+        DashEffect::new(vec![3.0, 1.0], 0.0).unwrap(),
+    )));
+
+    let mut commands = Vec::new();
+    {
+        let mut rec = Canvas::new_recording(&mut commands, 40, 40);
+        rec.draw_string("O", 2.0, 14.0, &font, &paint);
+    }
+    let deferred = commands
+        .iter()
+        .any(|c| matches!(c, DrawCommand::DrawPath { paint, .. } if paint.path_effect().is_some()));
+    assert!(deferred, "the glyph's path effect is deferred to playback");
+
+    // Playback renders essentially what drawing directly does (the recorded
+    // translate rounds a hair differently from translating the geometry).
+    let picture = Picture::from_parts(commands, Rect::from_xywh(0.0, 0.0, 40.0, 40.0));
+    let render = |use_picture: bool| {
+        let mut buffer = PixelBuffer::new(200, 200);
+        {
+            let mut canvas = Canvas::new_raster(&mut buffer);
+            canvas.scale(8.0, 8.0);
+            if use_picture {
+                picture.playback(&mut canvas);
+            } else {
+                canvas.draw_string("O", 2.0, 14.0, &font, &paint);
+            }
+        }
+        (0..200)
+            .flat_map(|y| (0..200).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.get_pixel(x, y).map_or(0, |c| c.red()))
+            .collect::<Vec<_>>()
+    };
+    let (direct, played) = (render(false), render(true));
+    assert!(direct.iter().any(|&v| v > 0));
+    let worst = direct
+        .iter()
+        .zip(&played)
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        worst <= 2,
+        "playback differs from direct drawing by up to {worst}"
+    );
+}

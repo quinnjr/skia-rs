@@ -5,7 +5,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/skia-rs-pdf"
 authors.workspace = true
 rust-version.workspace = true
@@ -17,9 +16,6 @@ readme = "README.md"
 skia-rs-core = { workspace = true }
 skia-rs-path = { workspace = true }
 skia-rs-paint = { workspace = true }
-skia-rs-canvas = { workspace = true }
-skia-rs-text = { workspace = true }
-pdf-writer = { workspace = true }
 flate2 = { workspace = true }
 thiserror = { workspace = true }
 ttf-parser = { workspace = true }

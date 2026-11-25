@@ -1,7 +1,12 @@
 //! Color, mask, and image filters.
 
+#![allow(
+    clippy::suboptimal_flops,
+    reason = "faithful port of Skia's fma-free reference arithmetic; mul_add's fused rounding diverges from Skia"
+)]
+
 use skia_rs_core::cast::{f32_to_u8_sat, round_to_i32, saturate_to_i32, scalar_from_i32};
-use skia_rs_core::{Color4f, Rect, Scalar, mul_div_255_round};
+use skia_rs_core::{Color4f, Matrix, Rect, Scalar, mul_div_255_round};
 use std::sync::Arc;
 
 /// Truncating (non-rounding), saturating `f32` -> `u8` cast.
@@ -247,6 +252,7 @@ impl ColorFilter for ColorMatrixFilter {
 
 /// Blur style for mask filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum BlurStyle {
     /// Normal blur.
@@ -379,8 +385,13 @@ pub trait ImageFilter: Send + Sync + std::fmt::Debug {
 
     /// Apply the filter to an RGBA8 image buffer in place.
     ///
-    /// `pixels` is a row-major `width * height * 4` byte buffer.
-    /// Default implementation is a no-op — concrete filters override.
+    /// The image is the first `width * height * 4` bytes of `pixels`
+    /// (row-major, tightly packed). Built-in filters filter only that
+    /// prefix, leave any longer buffer's tail untouched, and do nothing to
+    /// an empty image or a buffer too short to hold it; implementations
+    /// passed to combining filters (merge, blend, compose, displacement)
+    /// should do the same. Default implementation is a no-op — concrete
+    /// filters override.
     fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
         let _ = (pixels, width, height);
     }
@@ -389,6 +400,245 @@ pub trait ImageFilter: Send + Sync + std::fmt::Debug {
     /// is not serializable (e.g., user-provided types).
     fn serialize(&self) -> Option<Vec<u8>> {
         None
+    }
+
+    /// Whether the filter turns transparent black into something visible
+    /// (`SkImageFilter_Base::affectsTransparentBlack`): its output then
+    /// covers the whole clip, not just the layer's content. As in Skia, a
+    /// filter with inputs is affected when any input is; every built-in
+    /// filter with inputs overrides this to check them.
+    fn affects_transparent_black(&self) -> bool {
+        false
+    }
+
+    /// The area of the source this filter reads to produce `output` (both
+    /// in layer space), like `SkImageFilter_Base::onGetInputLayerBounds`:
+    /// a layer with this filter must hold it. The default mirrors
+    /// [`filter_bounds`](Self::filter_bounds), outsetting `output` by the
+    /// filter's largest spread on any side.
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        spread_input(&self.filter_bounds(output), output)
+    }
+
+    /// This filter with its geometric parameters (blur sigmas, offsets,
+    /// radii, rects, and those of its inputs) mapped through `matrix`, as
+    /// `SkCanvas` maps a layer's image filter from local space into layer
+    /// space (`skif::Mapping::paramToLayer`). `None` when nothing changes:
+    /// the default, for filters without geometric parameters or inputs
+    /// (every built-in filter that has either overrides this).
+    ///
+    /// Filters run on device-space layer pixels here, while Skia decomposes
+    /// the matrix (`skif::Mapping::decomposeCTM`) and filters in a
+    /// scale-only (or, for matrix convolution and lighting, translate-only)
+    /// layer space, resampling the result. The mapping here matches Skia:
+    /// - blur, drop shadow, morphology, offset, tile, color filter and the
+    ///   combining filters: under scale/translate and quarter turns;
+    /// - matrix convolution: under translate and axis-permuting matrices
+    ///   (quarter turns, mirrors) at unit scale (the kernel is re-oriented,
+    ///   not resampled);
+    /// - lighting: lights map under translate, scale and quarter turns
+    ///   (`apply` here shades with a uniform factor, not per-pixel normals);
+    /// - displacement map: under translate, scale (uniform or not), mirrors
+    ///   and quarter turns (a signed scale per device axis; the channels
+    ///   swap with the axes; ties round as Skia's: in device space for
+    ///   scale-translate matrices, mirrors included, and as in its rotated
+    ///   layer otherwise; Skia instead filters the whole tree unmirrored
+    ///   when it also holds a translate-only filter such as matrix
+    ///   convolution or lighting, which this per-filter mapping does not
+    ///   model); shears, rotations combined with a non-uniform scale, and
+    ///   perspective are fitted roughly.
+    ///
+    /// Anisotropic filters under other rotations or skews are fitted to the
+    /// nearest axes.
+    ///
+    /// The result is for drawing, not for keeping: mapping it again (or
+    /// serializing and later drawing it under a matrix) applies the matrix
+    /// twice. Paints hold, and serialize, the unmapped filter.
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        let _ = matrix;
+        None
+    }
+}
+
+/// `filter` with its parameters mapped through `matrix` (see
+/// [`ImageFilter::map_params`]); `filter` itself when nothing changes.
+#[must_use]
+pub fn map_image_filter(filter: &ImageFilterRef, matrix: &Matrix) -> ImageFilterRef {
+    filter
+        .map_params(matrix)
+        .unwrap_or_else(|| Arc::clone(filter))
+}
+
+/// `SkBlurImageFilter`'s `kMaxSigma`: blur sigmas (in layer space) are
+/// clamped to this, which also bounds how far a blur reaches.
+const MAX_BLUR_SIGMA: Scalar = 532.0;
+
+/// A blur sigma clamped like `SkBlurImageFilter` (to [`MAX_BLUR_SIGMA`]).
+/// A non-finite or negative sigma, which `SkImageFilters::Blur` rejects
+/// (no filter), is 0: no blur.
+const fn max_sigma(sigma: Scalar) -> Scalar {
+    if sigma.is_finite() && sigma > 0.0 {
+        sigma.min(MAX_BLUR_SIGMA)
+    } else {
+        0.0
+    }
+}
+
+/// `output` outset by the largest amount `spread` (a filter's output bounds
+/// for `output`) extends past it on any side.
+fn spread_input(spread: &Rect, output: &Rect) -> Rect {
+    let reach = [
+        output.left - spread.left,
+        output.top - spread.top,
+        spread.right - output.right,
+        spread.bottom - output.bottom,
+    ]
+    .into_iter()
+    .fold(0.0, Scalar::max);
+    if reach.is_finite() {
+        output.inset(-reach, -reach)
+    } else {
+        *output
+    }
+}
+
+/// Whether a color filter turns transparent black into something visible.
+#[must_use]
+pub fn color_filter_affects_transparent_black(filter: &dyn ColorFilter) -> bool {
+    filter.filter_color(Color4f::new(0.0, 0.0, 0.0, 0.0)).a > 0.0
+}
+
+/// Whether an optional input affects transparent black.
+fn input_affects(input: Option<&ImageFilterRef>) -> bool {
+    input.is_some_and(|f| f.affects_transparent_black())
+}
+
+/// The image an optional input produces from the source `pixels` (the
+/// source itself with no input), for filters that combine several inputs.
+fn input_image(
+    input: Option<&ImageFilterRef>,
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
+    let mut image = pixels.to_vec();
+    if let Some(input) = input {
+        input.apply(&mut image, width, height);
+    }
+    image
+}
+
+/// A premultiplied RGBA8 pixel as a `Color4f` (still premultiplied).
+fn premul_color(px: &[u8]) -> Color4f {
+    Color4f::new(
+        f32::from(px[0]) / 255.0,
+        f32::from(px[1]) / 255.0,
+        f32::from(px[2]) / 255.0,
+        f32::from(px[3]) / 255.0,
+    )
+}
+
+/// Stores a premultiplied `Color4f` (clamped to [0, 1]) as RGBA8.
+fn store_premul(px: &mut [u8], color: Color4f) {
+    let byte = |v: Scalar| f32_to_u8_sat((v.clamp(0.0, 1.0) * 255.0).round());
+    px[0] = byte(color.r);
+    px[1] = byte(color.g);
+    px[2] = byte(color.b);
+    px[3] = byte(color.a);
+}
+
+/// The pixel a displacement map samples for pixel `coord` moved by `disp`:
+/// Skia evaluates the color image at the displaced pixel *center* with
+/// nearest sampling, `floor(coord + 0.5 + disp)`. On an axis Skia filters
+/// unflipped and then flips into place (`flipped`), ties round the other
+/// way: `ceil(coord - 0.5 + disp)`.
+fn displaced_sample(coord: i32, disp: Scalar, flipped: bool) -> i32 {
+    if flipped {
+        saturate_to_i32((scalar_from_i32(coord) - 0.5 + disp).ceil())
+    } else {
+        saturate_to_i32((scalar_from_i32(coord) + 0.5 + disp).floor())
+    }
+}
+
+/// The `width` x `height` RGBA8 image at the start of `pixels`, or `None`
+/// for an empty image or a buffer too short to hold it (`apply` is public,
+/// so neither may be indexed past its end).
+fn image_part(pixels: &mut [u8], width: usize, height: usize) -> Option<&mut [u8]> {
+    let len = width.checked_mul(height)?.checked_mul(4)?;
+    if len == 0 {
+        return None;
+    }
+    pixels.get_mut(..len)
+}
+
+/// `SkDisplacementMapImageFilter`'s offset for one channel of a premultiplied
+/// map pixel: the channel is unpremultiplied, then `scale * (c / 255 - 0.5)`
+/// (so the full channel range moves by at most `scale / 2`).
+fn displacement_offset(map_px: &[u8], channel: usize, scale: Scalar) -> Scalar {
+    // Skia's sk_displacement (src/sksl/sksl_rt_shader.sksl):
+    // saturate(unpremul(color)), where unpremul (sksl_shared.sksl) divides
+    // by max(alpha, 0.0001).
+    let alpha = f32::from(map_px[3]) / 255.0;
+    let value = if channel == 3 {
+        alpha
+    } else {
+        (f32::from(map_px[channel]) / 255.0 / alpha.max(0.0001)).clamp(0.0, 1.0)
+    };
+    scale * (value - 0.5)
+}
+
+/// The bounds an optional `input` filter produces from `src` (`src` itself
+/// with no input): filters with an input start from it, as Skia's
+/// `onFilterBounds` maps through the inputs first.
+fn input_filter_bounds(input: Option<&ImageFilterRef>, src: &Rect) -> Rect {
+    input.map_or(*src, |input| input.filter_bounds(src))
+}
+
+/// What an optional input filter reads for `rect` (`None` is the source
+/// itself, which is read as is).
+fn input_of(input: Option<&ImageFilterRef>, rect: &Rect) -> Rect {
+    input.map_or(*rect, |f| f.input_bounds(rect))
+}
+
+/// Maps an optional input filter.
+fn map_input(input: Option<&ImageFilterRef>, matrix: &Matrix) -> Option<ImageFilterRef> {
+    input.map(|f| map_image_filter(f, matrix))
+}
+
+/// The uniform scale of `matrix`'s linear part (`sqrt(|det|)`).
+fn linear_scale(matrix: &Matrix) -> Scalar {
+    let v = &matrix.values;
+    (v[Matrix::SCALE_X] * v[Matrix::SCALE_Y] - v[Matrix::SKEW_X] * v[Matrix::SKEW_Y])
+        .abs()
+        .sqrt()
+}
+
+/// Maps a vector (an offset) through the linear part of `matrix`.
+fn map_vector(matrix: &Matrix, dx: Scalar, dy: Scalar) -> (Scalar, Scalar) {
+    let v = &matrix.values;
+    (
+        v[Matrix::SCALE_X] * dx + v[Matrix::SKEW_X] * dy,
+        v[Matrix::SKEW_Y] * dx + v[Matrix::SCALE_Y] * dy,
+    )
+}
+
+/// Maps a size (sigmas, radii) as the lengths of its mapped axis vectors,
+/// each assigned to the device axis its local axis mostly maps to: exact
+/// for scale/translate and quarter turns (where x and y swap). Other
+/// rotations and skews get the nearest axis-aligned fit; see
+/// [`ImageFilter::map_params`].
+fn map_size(matrix: &Matrix, w: Scalar, h: Scalar) -> (Scalar, Scalar) {
+    let (x0, y0) = map_vector(matrix, w, 0.0);
+    let (x1, y1) = map_vector(matrix, 0.0, h);
+    let (along_w, along_h) = (x0.hypot(y0), x1.hypot(y1));
+    // Where local x points, independent of w (which may be 0): a size goes
+    // where its mapped vector mostly lands. (The displacement map decides
+    // by which channel drives each axis instead, a different question.)
+    let (ux, uy) = map_vector(matrix, 1.0, 0.0);
+    if ux.abs() < uy.abs() {
+        (along_h, along_w)
+    } else {
+        (along_w, along_h)
     }
 }
 
@@ -413,20 +663,31 @@ impl BlurImageFilter {
 }
 
 impl ImageFilter for BlurImageFilter {
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        let (sigma_x, sigma_y) = map_size(matrix, max_sigma(self.sigma_x), max_sigma(self.sigma_y));
+        let (sigma_x, sigma_y) = (max_sigma(sigma_x), max_sigma(sigma_y));
+        Some(Arc::new(Self {
+            sigma_x,
+            sigma_y,
+            tile_mode: self.tile_mode,
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         // Blur expands bounds by ~3 sigma
-        let dx = self.sigma_x * 3.0;
-        let dy = self.sigma_y * 3.0;
+        let dx = max_sigma(self.sigma_x) * 3.0;
+        let dy = max_sigma(self.sigma_y) * 3.0;
         Rect::new(src.left - dx, src.top - dy, src.right + dx, src.bottom + dy)
     }
 
     fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
-        if width == 0 || height == 0 {
+        // Only the image part: a longer buffer's tail is left alone.
+        let Some(pixels) = image_part(pixels, width, height) else {
             return;
-        }
+        };
         // SkBlurMask::ConvertSigmaToRadius; do not truncate sigma directly.
-        let rx = sigma_to_int_box_radius(self.sigma_x);
-        let ry = sigma_to_int_box_radius(self.sigma_y);
+        let rx = sigma_to_int_box_radius(max_sigma(self.sigma_x));
+        let ry = sigma_to_int_box_radius(max_sigma(self.sigma_y));
         if rx == 0 && ry == 0 {
             return;
         }
@@ -484,13 +745,41 @@ impl DropShadowImageFilter {
 }
 
 impl ImageFilter for DropShadowImageFilter {
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        // The shadow at `output` comes from the source moved back by the
+        // offset, blurred (3 sigma); the source itself is drawn unless
+        // shadow-only.
+        let shadow = output.offset(-self.dx, -self.dy).inset(
+            -3.0 * max_sigma(self.sigma_x),
+            -3.0 * max_sigma(self.sigma_y),
+        );
+        if self.shadow_only {
+            shadow
+        } else {
+            shadow.union(output)
+        }
+    }
+
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        let (dx, dy) = map_vector(matrix, self.dx, self.dy);
+        let (sigma_x, sigma_y) = map_size(matrix, max_sigma(self.sigma_x), max_sigma(self.sigma_y));
+        let (sigma_x, sigma_y) = (max_sigma(sigma_x), max_sigma(sigma_y));
+        Some(Arc::new(Self {
+            dx,
+            dy,
+            sigma_x,
+            sigma_y,
+            ..self.clone()
+        }))
+    }
+
     #[allow(
         clippy::similar_names,
         reason = "blur_dx/blur_dy are the conventional x/y-axis pair for this offset+blur computation"
     )]
     fn filter_bounds(&self, src: &Rect) -> Rect {
-        let blur_dx = self.sigma_x * 3.0;
-        let blur_dy = self.sigma_y * 3.0;
+        let blur_dx = max_sigma(self.sigma_x) * 3.0;
+        let blur_dy = max_sigma(self.sigma_y) * 3.0;
 
         if self.shadow_only {
             Rect::new(
@@ -524,17 +813,18 @@ impl ImageFilter for DropShadowImageFilter {
     }
 
     fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
-        if width == 0 || height == 0 {
+        // Only the image part: a longer buffer's tail is left alone.
+        let Some(pixels) = image_part(pixels, width, height) else {
             return;
-        }
+        };
         // 1. Extract alpha channel into shadow buffer
         let mut shadow = vec![0u8; width * height];
         for i in 0..width * height {
             shadow[i] = pixels[i * 4 + 3];
         }
         // 2. Blur shadow (sigma converted per SkBlurMask::ConvertSigmaToRadius)
-        let rx = sigma_to_int_box_radius(self.sigma_x);
-        let ry = sigma_to_int_box_radius(self.sigma_y);
+        let rx = sigma_to_int_box_radius(max_sigma(self.sigma_x));
+        let ry = sigma_to_int_box_radius(max_sigma(self.sigma_y));
         if rx > 0 {
             box_blur_horizontal(&mut shadow, width, height, rx);
         }
@@ -551,14 +841,20 @@ impl ImageFilter for DropShadowImageFilter {
         let original = pixels.to_vec();
         for y in 0..height {
             for x in 0..width {
-                // Read shadow from offset position (clamp)
+                // Read the shadow from the offset position; outside the
+                // buffer there is none (transparent, as in Skia).
                 let x_i32 = i32::try_from(x).unwrap_or(i32::MAX);
                 let y_i32 = i32::try_from(y).unwrap_or(i32::MAX);
                 let width_i32 = i32::try_from(width).unwrap_or(i32::MAX);
                 let height_i32 = i32::try_from(height).unwrap_or(i32::MAX);
-                let sx = usize::try_from((x_i32 - dx).clamp(0, width_i32 - 1)).unwrap_or(0);
-                let sy = usize::try_from((y_i32 - dy).clamp(0, height_i32 - 1)).unwrap_or(0);
-                let shadow_alpha = (f32::from(shadow[sy * width + sx]) / 255.0) * sa_mul;
+                let (sx, sy) = (x_i32.saturating_sub(dx), y_i32.saturating_sub(dy));
+                let coverage = if (0..width_i32).contains(&sx) && (0..height_i32).contains(&sy) {
+                    shadow[usize::try_from(sy).unwrap_or(0) * width
+                        + usize::try_from(sx).unwrap_or(0)]
+                } else {
+                    0
+                };
+                let shadow_alpha = (f32::from(coverage) / 255.0) * sa_mul;
                 let shadow_rgba = [
                     f32_to_u8_trunc(f32::from(sr) * shadow_alpha),
                     f32_to_u8_trunc(f32::from(sg) * shadow_alpha),
@@ -628,7 +924,7 @@ impl MaskFilter for ShaderMaskFilter {
     fn serialize(&self) -> Option<Vec<u8>> {
         let mut buf = vec![MASK_FILTER_KIND_SHADER];
         let shader_data = self.shader.serialize()?;
-        let len = u32::try_from(shader_data.len()).unwrap_or(u32::MAX);
+        let len = u32::try_from(shader_data.len()).ok()?;
         buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(&shader_data);
         Some(buf)
@@ -703,6 +999,7 @@ impl MaskFilter for TableMaskFilter {
 
 /// Morphology filter type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MorphologyType {
     /// Dilate (expand bright regions).
     Dilate,
@@ -764,13 +1061,34 @@ impl MorphologyImageFilter {
 }
 
 impl ImageFilter for MorphologyImageFilter {
-    fn filter_bounds(&self, src: &Rect) -> Rect {
-        Rect::new(
-            src.left - self.radius_x,
-            src.top - self.radius_y,
-            src.right + self.radius_x,
-            src.bottom + self.radius_y,
+    fn affects_transparent_black(&self) -> bool {
+        input_affects(self.input.as_ref())
+    }
+
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        input_of(
+            self.input.as_ref(),
+            &output.inset(-self.radius_x.max(0.0), -self.radius_y.max(0.0)),
         )
+    }
+
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        // A negative or NaN radius does nothing; mapping takes lengths, so
+        // keep it at 0 rather than let the sign drop.
+        let (radius_x, radius_y) = map_size(matrix, self.radius_x.max(0.0), self.radius_y.max(0.0));
+        Some(Arc::new(Self {
+            morph_type: self.morph_type,
+            radius_x,
+            radius_y,
+            input: map_input(self.input.as_ref(), matrix),
+        }))
+    }
+
+    fn filter_bounds(&self, src: &Rect) -> Rect {
+        // A negative or NaN radius does nothing (as apply treats it).
+        let (rx, ry) = (self.radius_x.max(0.0), self.radius_y.max(0.0));
+        let src = input_filter_bounds(self.input.as_ref(), src);
+        Rect::new(src.left - rx, src.top - ry, src.right + rx, src.bottom + ry)
     }
 
     fn serialize(&self) -> Option<Vec<u8>> {
@@ -786,7 +1104,7 @@ impl ImageFilter for MorphologyImageFilter {
             Some(input) => {
                 let input_data = input.serialize()?;
                 buf.push(1);
-                let len = u32::try_from(input_data.len()).unwrap_or(u32::MAX);
+                let len = u32::try_from(input_data.len()).ok()?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(&input_data);
             }
@@ -796,8 +1114,13 @@ impl ImageFilter for MorphologyImageFilter {
     }
 
     fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
-        if width == 0 || height == 0 {
+        // Only the image part: a longer buffer's tail is left alone.
+        let Some(pixels) = image_part(pixels, width, height) else {
             return;
+        };
+        // The input filter runs first (Skia filters its input image).
+        if let Some(ref input) = self.input {
+            input.apply(pixels, width, height);
         }
         let rx = usize::try_from(round_to_i32(self.radius_x.max(0.0))).unwrap_or(0);
         let ry = usize::try_from(round_to_i32(self.radius_y.max(0.0))).unwrap_or(0);
@@ -888,16 +1211,33 @@ impl ColorFilterImageFilter {
 }
 
 impl ImageFilter for ColorFilterImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        input_affects(self.input.as_ref())
+            || color_filter_affects_transparent_black(self.color_filter.as_ref())
+    }
+
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        input_of(self.input.as_ref(), output)
+    }
+
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        let input = self.input.as_ref()?;
+        Some(Arc::new(Self {
+            color_filter: Arc::clone(&self.color_filter),
+            input: Some(map_image_filter(input, matrix)),
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
-        // Color filters don't change bounds
-        *src
+        // A color filter keeps its input's bounds.
+        input_filter_bounds(self.input.as_ref(), src)
     }
 
     fn serialize(&self) -> Option<Vec<u8>> {
         let mut buf = vec![IMAGE_FILTER_KIND_COLOR_FILTER];
         // Serialize the wrapped color filter
         let color_filter_data = self.color_filter.serialize()?;
-        let len = u32::try_from(color_filter_data.len()).unwrap_or(u32::MAX);
+        let len = u32::try_from(color_filter_data.len()).ok()?;
         buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(&color_filter_data);
         // Serialize input filter if present
@@ -905,7 +1245,7 @@ impl ImageFilter for ColorFilterImageFilter {
             Some(input) => {
                 let input_data = input.serialize()?;
                 buf.push(1);
-                let len = u32::try_from(input_data.len()).unwrap_or(u32::MAX);
+                let len = u32::try_from(input_data.len()).ok()?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(&input_data);
             }
@@ -915,9 +1255,10 @@ impl ImageFilter for ColorFilterImageFilter {
     }
 
     fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
-        if width == 0 || height == 0 {
+        // Only the image part: a longer buffer's tail is left alone.
+        let Some(pixels) = image_part(pixels, width, height) else {
             return;
-        }
+        };
         // Apply inner filter first if present
         if let Some(ref input) = self.input {
             input.apply(pixels, width, height);
@@ -961,13 +1302,23 @@ impl ImageFilter for ColorFilterImageFilter {
 pub struct DisplacementMapImageFilter {
     x_channel: ColorChannel,
     y_channel: ColorChannel,
-    scale: Scalar,
     displacement: ImageFilterRef,
     color: Option<ImageFilterRef>,
+    /// The signed displacement scale along each device axis: `(scale,
+    /// scale)` until `map_params` maps it through a matrix (a non-uniform
+    /// scale, mirror or quarter turn gives each axis its own).
+    axis_scale: (Scalar, Scalar),
+    /// Per device axis, whether Skia filters this layer unflipped and
+    /// flips it into place afterwards (a non-scale-translate matrix whose
+    /// driving entry is negative), which rounds displacement ties the other
+    /// way. Never set by a scale-translate matrix, mirrors included, which
+    /// Skia filters in device space directly.
+    axis_flips: (bool, bool),
 }
 
 /// Color channel selector for displacement map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ColorChannel {
     /// Red channel.
     R,
@@ -980,7 +1331,13 @@ pub enum ColorChannel {
 }
 
 impl DisplacementMapImageFilter {
-    /// Create a new displacement map filter.
+    /// Create a new displacement map filter. A non-finite `scale` (for
+    /// which `SkImageFilters::DisplacementMap` returns no filter) displaces
+    /// nothing: it is treated as 0, so the output is the color input's
+    /// (where Skia, having no filter, would not run that input either).
+    /// A finite scale that only overflows when `map_params` maps it is
+    /// instead saturated to the largest finite value, so it keeps moving
+    /// samples off the layer as a slightly smaller scale would.
     pub fn new(
         x_channel: ColorChannel,
         y_channel: ColorChannel,
@@ -988,26 +1345,139 @@ impl DisplacementMapImageFilter {
         displacement: ImageFilterRef,
         color: Option<ImageFilterRef>,
     ) -> Self {
+        let scale = if scale.is_finite() { scale } else { 0.0 };
         Self {
             x_channel,
             y_channel,
-            scale,
             displacement,
             color,
+            axis_scale: (scale, scale),
+            axis_flips: (false, false),
         }
+    }
+
+    /// `rect` rounded out to whole pixels and outset by the most a sample
+    /// can move, `ceil(|scale| / 2)` per axis (Skia's
+    /// `outsetByMaxDisplacement`): nearest sampling at a pixel center can
+    /// reach a pixel more than `|scale| / 2` away from a fractional edge.
+    const fn outset_by_max_displacement(&self, rect: &Rect) -> Rect {
+        let reach_x = (self.axis_scale.0.abs() / 2.0).ceil();
+        let reach_y = (self.axis_scale.1.abs() / 2.0).ceil();
+        Rect::new(
+            rect.left.floor() - reach_x,
+            rect.top.floor() - reach_y,
+            rect.right.ceil() + reach_x,
+            rect.bottom.ceil() + reach_y,
+        )
     }
 }
 
 impl ImageFilter for DisplacementMapImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        self.displacement.affects_transparent_black() || input_affects(self.color.as_ref())
+    }
+
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        // The color input is read up to the max displacement away along each
+        // axis; the displacement map at the output itself.
+        let color = input_of(
+            self.color.as_ref(),
+            &self.outset_by_max_displacement(output),
+        );
+        color.union(&self.displacement.input_bounds(output))
+    }
+
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        // Meant for an unmapped filter (the canvas maps the original once
+        // per layer, as Skia applies one CTM): mapping an already-mapped
+        // filter composes the axis scales, but its tie flips only roughly.
+        // The local displacement (axis_scale * (cx, cy)) maps through the
+        // linear part: local x goes to (scale_x, skew_y), local y to (skew_x,
+        // scale_y). The channels keep or swap axes by whichever pairing
+        // (diagonal or swapped) has the larger product, each scaled by its
+        // local axis's mapped length (as SkMatrix::decomposeScale takes column
+        // lengths) and signed by that local axis's component along the
+        // device axis. A degenerate (singular) matrix still gives each device
+        // axis one channel, possibly signed by a zero entry. This is exact for
+        // scales, mirrors and quarter turns, and keeps the displacement
+        // distance under other rotations (the nearest-axes fit).
+        let values = &matrix.values;
+        let (scale_x, skew_x, skew_y, scale_y) = (
+            values[Matrix::SCALE_X],
+            values[Matrix::SKEW_X],
+            values[Matrix::SKEW_Y],
+            values[Matrix::SCALE_Y],
+        );
+        let (local_x, local_y) = self.axis_scale;
+        let x_length = scale_x.hypot(skew_y);
+        let y_length = skew_x.hypot(scale_y);
+        // Swap when the off-diagonal pairing dominates (local x onto device
+        // y and local y onto device x). Exact for scales, mirrors and
+        // quarter turns. A shear is only a rough fit: without Skia's
+        // decomposeCTM (not implemented) a single channel per device axis
+        // cannot express it, so both the driving channel and the distance
+        // can differ from Skia's. For an invertible matrix the chosen
+        // entries are non-zero, so no sign comes from a zero.
+        // In f64: f32 products of tiny entries would underflow to 0.
+        let swapped = (f64::from(scale_x) * f64::from(scale_y)).abs()
+            < (f64::from(skew_x) * f64::from(skew_y)).abs();
+        // Skia's decomposeCTM filters a scale-translate matrix in device
+        // space (no flip); any other matrix is filtered in a scale-only
+        // layer and rotated into place, which flips a device axis whose
+        // driving entry is negative.
+        let scale_translate = matrix.is_scale_translate();
+        let (flips_x, flips_y) = self.axis_flips;
+        let axis_flips = if scale_translate {
+            self.axis_flips
+        } else if swapped {
+            ((skew_x < 0.0) != flips_y, (skew_y < 0.0) != flips_x)
+        } else {
+            ((scale_x < 0.0) != flips_x, (scale_y < 0.0) != flips_y)
+        };
+        let (x_channel, y_channel, axis_scale) = if swapped {
+            (
+                self.y_channel,
+                self.x_channel,
+                (
+                    local_y * y_length.copysign(skew_x),
+                    local_x * x_length.copysign(skew_y),
+                ),
+            )
+        } else {
+            (
+                self.x_channel,
+                self.y_channel,
+                (
+                    local_x * x_length.copysign(scale_x),
+                    local_y * y_length.copysign(scale_y),
+                ),
+            )
+        };
+        // A huge scale under a huge matrix can overflow: saturate to the
+        // largest finite scale (still moving every sample off the layer),
+        // rather than jumping to no displacement.
+        let finite = |v: Scalar| {
+            if v.is_nan() {
+                0.0
+            } else {
+                v.clamp(Scalar::MIN, Scalar::MAX)
+            }
+        };
+        Some(Arc::new(Self {
+            x_channel,
+            y_channel,
+            displacement: map_image_filter(&self.displacement, matrix),
+            color: map_input(self.color.as_ref(), matrix),
+            axis_scale: (finite(axis_scale.0), finite(axis_scale.1)),
+            axis_flips,
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
-        // Displacement can move pixels by up to scale/2 in each direction
-        let offset = self.scale / 2.0;
-        Rect::new(
-            src.left - offset,
-            src.top - offset,
-            src.right + offset,
-            src.bottom + offset,
-        )
+        // The color input's output, moved by up to |scale|/2 in each
+        // direction (a negative scale moves it the other way, not less).
+        let src = input_filter_bounds(self.color.as_ref(), src);
+        self.outset_by_max_displacement(&src)
     }
 
     fn serialize(&self) -> Option<Vec<u8>> {
@@ -1024,10 +1494,13 @@ impl ImageFilter for DisplacementMapImageFilter {
             ColorChannel::B => 2,
             ColorChannel::A => 3,
         });
-        buf.extend_from_slice(&self.scale.to_le_bytes());
+        // The signed scale along each axis (equal until mapped).
+        buf.extend_from_slice(&self.axis_scale.0.to_le_bytes());
+        buf.extend_from_slice(&self.axis_scale.1.to_le_bytes());
+        buf.push(u8::from(self.axis_flips.0) | (u8::from(self.axis_flips.1) << 1));
         // Serialize displacement filter
         let displacement_data = self.displacement.serialize()?;
-        let len = u32::try_from(displacement_data.len()).unwrap_or(u32::MAX);
+        let len = u32::try_from(displacement_data.len()).ok()?;
         buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(&displacement_data);
         // Serialize color filter if present
@@ -1035,7 +1508,7 @@ impl ImageFilter for DisplacementMapImageFilter {
             Some(color) => {
                 let color_data = color.serialize()?;
                 buf.push(1);
-                let len = u32::try_from(color_data.len()).unwrap_or(u32::MAX);
+                let len = u32::try_from(color_data.len()).ok()?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(&color_data);
             }
@@ -1045,15 +1518,19 @@ impl ImageFilter for DisplacementMapImageFilter {
     }
 
     fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
-        if width == 0 || height == 0 {
+        // Only the image part: a longer buffer's tail is left alone.
+        let Some(pixels) = image_part(pixels, width, height) else {
             return;
+        };
+        // As SkDisplacementMapImageFilter: the offsets come from the
+        // displacement input's output, and the pixels moved come from the
+        // color input's output (the source itself with no color input).
+        let mut map = pixels.to_vec();
+        self.displacement.apply(&mut map, width, height);
+        let mut src = pixels.to_vec();
+        if let Some(color) = &self.color {
+            color.apply(&mut src, width, height);
         }
-        // Baseline: use the source image's selected channels as displacement.
-        // A true implementation would apply the displacement filter input first,
-        // then use those pixels as the displacement map. This baseline uses the
-        // source image itself as the displacement map.
-        let scale = self.scale;
-        let src = pixels.to_vec();
         let x_channel_idx = match self.x_channel {
             ColorChannel::R => 0,
             ColorChannel::G => 1,
@@ -1069,22 +1546,25 @@ impl ImageFilter for DisplacementMapImageFilter {
         for y in 0..height {
             for x in 0..width {
                 let idx = (y * width + x) * 4;
-                // Read displacement channels (0..255 maps to -1..1)
-                let disp_x = (f32::from(src[idx + x_channel_idx]) / 127.5 - 1.0) * scale;
-                let disp_y = (f32::from(src[idx + y_channel_idx]) / 127.5 - 1.0) * scale;
+                // Offsets from the unpremultiplied map channels.
+                let map_px = &map[idx..idx + 4];
+                let disp_x = displacement_offset(map_px, x_channel_idx, self.axis_scale.0);
+                let disp_y = displacement_offset(map_px, y_channel_idx, self.axis_scale.1);
                 let x_i32 = i32::try_from(x).unwrap_or(i32::MAX);
                 let y_i32 = i32::try_from(y).unwrap_or(i32::MAX);
                 let width_i32 = i32::try_from(width).unwrap_or(i32::MAX);
                 let height_i32 = i32::try_from(height).unwrap_or(i32::MAX);
-                let sample_x = saturate_to_i32(scalar_from_i32(x_i32) + disp_x);
-                let sample_y = saturate_to_i32(scalar_from_i32(y_i32) + disp_y);
-                let sx = usize::try_from(sample_x.clamp(0, width_i32 - 1)).unwrap_or(0);
-                let sy = usize::try_from(sample_y.clamp(0, height_i32 - 1)).unwrap_or(0);
-                let src_idx = (sy * width + sx) * 4;
-                pixels[idx] = src[src_idx];
-                pixels[idx + 1] = src[src_idx + 1];
-                pixels[idx + 2] = src[src_idx + 2];
-                pixels[idx + 3] = src[src_idx + 3];
+                let sample_x = displaced_sample(x_i32, disp_x, self.axis_flips.0);
+                let sample_y = displaced_sample(y_i32, disp_y, self.axis_flips.1);
+                // Samples outside the color image are transparent.
+                if !((0..width_i32).contains(&sample_x) && (0..height_i32).contains(&sample_y)) {
+                    pixels[idx..idx + 4].fill(0);
+                    continue;
+                }
+                let src_idx = (usize::try_from(sample_y).unwrap_or(0) * width
+                    + usize::try_from(sample_x).unwrap_or(0))
+                    * 4;
+                pixels[idx..idx + 4].copy_from_slice(&src[src_idx..src_idx + 4]);
             }
         }
     }
@@ -1114,6 +1594,51 @@ pub enum LightType {
         /// Cutoff angle.
         cutoff_angle: Scalar,
     },
+}
+
+impl LightType {
+    /// The light mapped into layer space, like `SkLight::transform`: light
+    /// positions map as points with z scaled by the matrix's uniform scale
+    /// (`SkLight` averages the mapped (z, z) magnitudes). A distant light's
+    /// direction turns with the matrix but keeps its x/y length and z, so
+    /// its elevation does not change.
+    fn mapped(&self, matrix: &Matrix) -> Self {
+        // Heights scale by the uniform scale only: mapping (z, z) through the
+        // signed linear part would flip or zero them under rotations.
+        let z_scale = linear_scale(matrix);
+        let map_point3 = |(x, y, z): (Scalar, Scalar, Scalar)| {
+            let p = matrix.map_point(skia_rs_core::Point::new(x, y));
+            (p.x, p.y, z * z_scale)
+        };
+        match *self {
+            Self::Distant { direction } => {
+                let (dx, dy) = map_vector(matrix, direction.0, direction.1);
+                let (len, mapped_len) = (direction.0.hypot(direction.1), dx.hypot(dy));
+                let k = if mapped_len > 0.0 {
+                    len / mapped_len
+                } else {
+                    0.0
+                };
+                Self::Distant {
+                    direction: (dx * k, dy * k, direction.2),
+                }
+            }
+            Self::Point { location } => Self::Point {
+                location: map_point3(location),
+            },
+            Self::Spot {
+                location,
+                target,
+                specular_exponent,
+                cutoff_angle,
+            } => Self::Spot {
+                location: map_point3(location),
+                target: map_point3(target),
+                specular_exponent,
+                cutoff_angle,
+            },
+        }
+    }
 }
 
 /// A lighting image filter.
@@ -1174,9 +1699,33 @@ impl LightingImageFilter {
 }
 
 impl ImageFilter for LightingImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        input_affects(self.input.as_ref())
+    }
+
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        Some(Arc::new(Self {
+            light: self.light.mapped(matrix),
+            // apply uses surface_scale as a brightness factor (it does not
+            // build normals from a height field), so it is not mapped: the
+            // result must not depend on the zoom.
+            surface_scale: self.surface_scale,
+            diffuse_constant: self.diffuse_constant,
+            specular_constant: self.specular_constant,
+            specular_exponent: self.specular_exponent,
+            light_color: self.light_color,
+            input: map_input(self.input.as_ref(), matrix),
+        }))
+    }
+
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        // Surface normals read the neighbouring pixels.
+        input_of(self.input.as_ref(), &output.inset(-1.0, -1.0))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
-        // Lighting doesn't change bounds
-        *src
+        // Lighting keeps its input's bounds.
+        input_filter_bounds(self.input.as_ref(), src)
     }
 
     fn serialize(&self) -> Option<Vec<u8>> {
@@ -1235,7 +1784,7 @@ impl ImageFilter for LightingImageFilter {
             Some(input) => {
                 let input_data = input.serialize()?;
                 buf.push(1);
-                let len = u32::try_from(input_data.len()).unwrap_or(u32::MAX);
+                let len = u32::try_from(input_data.len()).ok()?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(&input_data);
             }
@@ -1245,8 +1794,13 @@ impl ImageFilter for LightingImageFilter {
     }
 
     fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
-        if width == 0 || height == 0 {
+        // Only the image part: a longer buffer's tail is left alone.
+        let Some(pixels) = image_part(pixels, width, height) else {
             return;
+        };
+        // The input filter runs first, as for the other filters with inputs.
+        if let Some(ref input) = self.input {
+            input.apply(pixels, width, height);
         }
         // Baseline lighting: modulate intensity by surface_scale factor.
         // A full implementation would compute per-pixel normals from the alpha
@@ -1259,9 +1813,14 @@ impl ImageFilter for LightingImageFilter {
         let lb = (self.light_color.b * 255.0).clamp(0.0, 255.0);
         for i in 0..width * height {
             let idx = i * 4;
-            pixels[idx] = f32_to_u8_trunc(f32::from(pixels[idx]) * factor * lr / 255.0);
-            pixels[idx + 1] = f32_to_u8_trunc(f32::from(pixels[idx + 1]) * factor * lg / 255.0);
-            pixels[idx + 2] = f32_to_u8_trunc(f32::from(pixels[idx + 2]) * factor * lb / 255.0);
+            // Premultiplied: no color channel may exceed alpha.
+            let alpha = pixels[idx + 3];
+            let lit = |v: u8, light: Scalar| {
+                f32_to_u8_trunc(f32::from(v) * factor * light / 255.0).min(alpha)
+            };
+            pixels[idx] = lit(pixels[idx], lr);
+            pixels[idx + 1] = lit(pixels[idx + 1], lg);
+            pixels[idx + 2] = lit(pixels[idx + 2], lb);
         }
     }
 }
@@ -1283,6 +1842,22 @@ impl ComposeImageFilter {
 }
 
 impl ImageFilter for ComposeImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        self.outer.affects_transparent_black() || self.inner.affects_transparent_black()
+    }
+
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        // The inner filter produces what the outer one reads.
+        self.inner.input_bounds(&self.outer.input_bounds(output))
+    }
+
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        Some(Arc::new(Self {
+            outer: map_image_filter(&self.outer, matrix),
+            inner: map_image_filter(&self.inner, matrix),
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         let inner_bounds = self.inner.filter_bounds(src);
         self.outer.filter_bounds(&inner_bounds)
@@ -1292,10 +1867,10 @@ impl ImageFilter for ComposeImageFilter {
         let mut buf = vec![IMAGE_FILTER_KIND_COMPOSE];
         let outer_data = self.outer.serialize()?;
         let inner_data = self.inner.serialize()?;
-        let len = u32::try_from(outer_data.len()).unwrap_or(u32::MAX);
+        let len = u32::try_from(outer_data.len()).ok()?;
         buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(&outer_data);
-        let len = u32::try_from(inner_data.len()).unwrap_or(u32::MAX);
+        let len = u32::try_from(inner_data.len()).ok()?;
         buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(&inner_data);
         Some(buf)
@@ -1325,6 +1900,27 @@ impl MergeImageFilter {
 }
 
 impl ImageFilter for MergeImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        self.inputs.iter().any(|i| input_affects(i.as_ref()))
+    }
+
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        self.inputs
+            .iter()
+            .map(|i| input_of(i.as_ref(), output))
+            .fold(*output, |acc, r| acc.union(&r))
+    }
+
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        Some(Arc::new(Self {
+            inputs: self
+                .inputs
+                .iter()
+                .map(|i| map_input(i.as_ref(), matrix))
+                .collect(),
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         let mut result = *src;
         for filter in self.inputs.iter().flatten() {
@@ -1336,14 +1932,14 @@ impl ImageFilter for MergeImageFilter {
 
     fn serialize(&self) -> Option<Vec<u8>> {
         let mut buf = vec![IMAGE_FILTER_KIND_MERGE];
-        let len = u32::try_from(self.inputs.len()).unwrap_or(u32::MAX);
+        let len = u32::try_from(self.inputs.len()).ok()?;
         buf.extend_from_slice(&len.to_le_bytes());
         for input in &self.inputs {
             match input {
                 Some(filter) => {
                     let filter_data = filter.serialize()?;
                     buf.push(1);
-                    let len = u32::try_from(filter_data.len()).unwrap_or(u32::MAX);
+                    let len = u32::try_from(filter_data.len()).ok()?;
                     buf.extend_from_slice(&len.to_le_bytes());
                     buf.extend_from_slice(&filter_data);
                 }
@@ -1353,13 +1949,30 @@ impl ImageFilter for MergeImageFilter {
         Some(buf)
     }
 
-    /// Apply is a no-op for this filter in the single-buffer `apply()` API.
-    ///
-    /// `MergeImageFilter` requires multiple independent input pixel buffers,
-    /// which the current single-buffer signature cannot provide. A future
-    /// revision will introduce a multi-input apply variant.
-    fn apply(&self, _pixels: &mut [u8], _width: usize, _height: usize) {
-        // Documented limitation: multi-input filter requires extended API.
+    fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
+        // Only the image part: a longer buffer's tail is left alone.
+        let Some(pixels) = image_part(pixels, width, height) else {
+            return;
+        };
+        // SkMergeImageFilter: each input's image (the source for `None`)
+        // drawn in order with src-over onto transparent black.
+        let images: Vec<Vec<u8>> = self
+            .inputs
+            .iter()
+            .map(|input| input_image(input.as_ref(), pixels, width, height))
+            .collect();
+        pixels.fill(0);
+        for image in &images {
+            for (dst, src) in pixels
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(image.as_chunks::<4>().0.iter())
+            {
+                let blended = crate::BlendMode::SrcOver.apply(premul_color(src), premul_color(dst));
+                store_premul(dst, blended);
+            }
+        }
     }
 }
 
@@ -1382,7 +1995,25 @@ impl OffsetImageFilter {
 }
 
 impl ImageFilter for OffsetImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        input_affects(self.input.as_ref())
+    }
+
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        input_of(self.input.as_ref(), &output.offset(-self.dx, -self.dy))
+    }
+
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        let (dx, dy) = map_vector(matrix, self.dx, self.dy);
+        Some(Arc::new(Self {
+            dx,
+            dy,
+            input: map_input(self.input.as_ref(), matrix),
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
+        let src = input_filter_bounds(self.input.as_ref(), src);
         Rect::new(
             src.left + self.dx,
             src.top + self.dy,
@@ -1399,7 +2030,7 @@ impl ImageFilter for OffsetImageFilter {
             Some(input) => {
                 let input_data = input.serialize()?;
                 buf.push(1);
-                let len = u32::try_from(input_data.len()).unwrap_or(u32::MAX);
+                let len = u32::try_from(input_data.len()).ok()?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(&input_data);
             }
@@ -1409,14 +2040,15 @@ impl ImageFilter for OffsetImageFilter {
     }
 
     fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
-        if width == 0 || height == 0 {
+        // Only the image part: a longer buffer's tail is left alone.
+        let Some(pixels) = image_part(pixels, width, height) else {
             return;
-        }
+        };
         // Apply input filter first if present
         if let Some(ref input) = self.input {
             input.apply(pixels, width, height);
         }
-        // Shift pixels with clamp-to-edge
+        // Shift pixels; the area uncovered is transparent (as in Skia).
         let offset_x = saturate_to_i32(self.dx.round());
         let offset_y = saturate_to_i32(self.dy.round());
         if offset_x == 0 && offset_y == 0 {
@@ -1434,13 +2066,22 @@ impl ImageFilter for OffsetImageFilter {
             for x in 0..width {
                 let x_i32 = i32::try_from(x).unwrap_or(i32::MAX);
                 let y_i32 = i32::try_from(y).unwrap_or(i32::MAX);
-                let src_x =
-                    usize::try_from((x_i32 - offset_x).clamp(0, width_i32 - 1)).unwrap_or(0);
-                let src_y =
-                    usize::try_from((y_i32 - offset_y).clamp(0, height_i32 - 1)).unwrap_or(0);
+                // Saturating: an offset near i32::MIN (a saturated huge
+                // dx) overflows the subtraction once x >= 128; it must land
+                // out of range instead.
+                let (src_x, src_y) = (
+                    x_i32.saturating_sub(offset_x),
+                    y_i32.saturating_sub(offset_y),
+                );
                 let dst_idx = (y * width + x) * 4;
-                let src_idx = (src_y * width + src_x) * 4;
-                pixels[dst_idx..dst_idx + 4].copy_from_slice(&copy[src_idx..src_idx + 4]);
+                if (0..width_i32).contains(&src_x) && (0..height_i32).contains(&src_y) {
+                    let src_idx = (usize::try_from(src_y).unwrap_or(0) * width
+                        + usize::try_from(src_x).unwrap_or(0))
+                        * 4;
+                    pixels[dst_idx..dst_idx + 4].copy_from_slice(&copy[src_idx..src_idx + 4]);
+                } else {
+                    pixels[dst_idx..dst_idx + 4].fill(0);
+                }
             }
         }
     }
@@ -1462,6 +2103,18 @@ pub struct MatrixConvolutionImageFilter {
 }
 
 impl MatrixConvolutionImageFilter {
+    /// The kernel's own outset of `src` (without its input's).
+    fn own_bounds(&self, src: &Rect) -> Rect {
+        let (kw, kh) = self.kernel_size;
+        let (ox, oy) = self.kernel_offset;
+        Rect::new(
+            src.left - scalar_from_i32(kw - ox - 1),
+            src.top - scalar_from_i32(kh - oy - 1),
+            src.right + scalar_from_i32(ox),
+            src.bottom + scalar_from_i32(oy),
+        )
+    }
+
     /// Create a matrix convolution filter.
     #[must_use]
     #[allow(
@@ -1491,23 +2144,105 @@ impl MatrixConvolutionImageFilter {
     }
 }
 
-impl ImageFilter for MatrixConvolutionImageFilter {
-    fn filter_bounds(&self, src: &Rect) -> Rect {
+impl MatrixConvolutionImageFilter {
+    /// The kernel (size, values, offset) as seen in device space under an
+    /// axis-permuting `matrix`: each tap's offset from the kernel origin is
+    /// mapped by the signs/permutation of the linear part. Other matrices
+    /// leave the kernel unchanged.
+    #[allow(clippy::float_cmp, reason = "exact zero tests for an axis permutation")]
+    fn reoriented(&self, matrix: &Matrix) -> ((i32, i32), Vec<Scalar>, (i32, i32)) {
+        let unchanged = (self.kernel_size, self.kernel.clone(), self.kernel_offset);
+        let values = &matrix.values;
+        let (scale_x, skew_x, skew_y, scale_y) = (
+            values[Matrix::SCALE_X],
+            values[Matrix::SKEW_X],
+            values[Matrix::SKEW_Y],
+            values[Matrix::SCALE_Y],
+        );
+        let sign = |t: Scalar| if t < 0.0 { -1 } else { 1 };
         let (kw, kh) = self.kernel_size;
+        // Checked: a bogus kernel size must not overflow or allocate.
+        let len = usize::try_from(kw)
+            .ok()
+            .zip(usize::try_from(kh).ok())
+            .and_then(|(w, h)| w.checked_mul(h));
+        let Some(len) = len else {
+            return unchanged;
+        };
+        if kw <= 0 || kh <= 0 || self.kernel.len() != len || matrix.has_perspective() {
+            return unchanged;
+        }
+        // Device tap offset (u', v') from a local one (u, v).
+        let map: Box<dyn Fn(i32, i32) -> (i32, i32)> =
+            if skew_x == 0.0 && skew_y == 0.0 && scale_x != 0.0 && scale_y != 0.0 {
+                let (sx, sy) = (sign(scale_x), sign(scale_y));
+                Box::new(move |u, w| (sx * u, sy * w))
+            } else if scale_x == 0.0 && scale_y == 0.0 && skew_x != 0.0 && skew_y != 0.0 {
+                let (sx, sy) = (sign(skew_x), sign(skew_y));
+                Box::new(move |u, w| (sx * w, sy * u))
+            } else {
+                return unchanged;
+            };
         let (ox, oy) = self.kernel_offset;
-        Rect::new(
-            src.left - scalar_from_i32(kw - ox - 1),
-            src.top - scalar_from_i32(kh - oy - 1),
-            src.right + scalar_from_i32(ox),
-            src.bottom + scalar_from_i32(oy),
+        let taps: Vec<((i32, i32), Scalar)> = (0..kh)
+            .flat_map(|ky| (0..kw).map(move |kx| (kx, ky)))
+            .map(|(kx, ky)| {
+                let value = self.kernel[usize::try_from(ky * kw + kx).unwrap_or(0)];
+                (map(kx - ox, ky - oy), value)
+            })
+            .collect();
+        let min_u = taps.iter().map(|t| t.0.0).min().unwrap_or(0);
+        let min_v = taps.iter().map(|t| t.0.1).min().unwrap_or(0);
+        let max_u = taps.iter().map(|t| t.0.0).max().unwrap_or(0);
+        let max_v = taps.iter().map(|t| t.0.1).max().unwrap_or(0);
+        let (nw, nh) = (max_u - min_u + 1, max_v - min_v + 1);
+        let mut kernel = vec![0.0; usize::try_from(nw * nh).unwrap_or(0)];
+        for ((u, w), value) in taps {
+            let index = usize::try_from((w - min_v) * nw + (u - min_u)).unwrap_or(0);
+            kernel[index] = value;
+        }
+        ((nw, nh), kernel, (-min_u, -min_v))
+    }
+}
+
+impl ImageFilter for MatrixConvolutionImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        // With convolve_alpha, a positive bias is added to transparent
+        // pixels too.
+        input_affects(self.input.as_ref()) || (self.convolve_alpha && self.bias > 0.0)
+    }
+
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        // Skia runs the kernel in a translate-only layer space and resamples.
+        // Here the kernel is re-oriented for axis-permuting matrices
+        // (quarter turns, mirrors), which is exact at unit scale; it is not
+        // scaled.
+        let (kernel_size, kernel, kernel_offset) = self.reoriented(matrix);
+        Some(Arc::new(Self {
+            kernel_size,
+            kernel,
+            kernel_offset,
+            input: map_input(self.input.as_ref(), matrix),
+            ..self.clone()
+        }))
+    }
+
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        input_of(
+            self.input.as_ref(),
+            &spread_input(&self.own_bounds(output), output),
         )
+    }
+
+    fn filter_bounds(&self, src: &Rect) -> Rect {
+        self.own_bounds(&input_filter_bounds(self.input.as_ref(), src))
     }
 
     fn serialize(&self) -> Option<Vec<u8>> {
         let mut buf = vec![IMAGE_FILTER_KIND_MATRIX_CONVOLUTION];
         buf.extend_from_slice(&self.kernel_size.0.to_le_bytes());
         buf.extend_from_slice(&self.kernel_size.1.to_le_bytes());
-        let len = u32::try_from(self.kernel.len()).unwrap_or(u32::MAX);
+        let len = u32::try_from(self.kernel.len()).ok()?;
         buf.extend_from_slice(&len.to_le_bytes());
         for v in &self.kernel {
             buf.extend_from_slice(&v.to_le_bytes());
@@ -1522,7 +2257,7 @@ impl ImageFilter for MatrixConvolutionImageFilter {
             Some(input) => {
                 let input_data = input.serialize()?;
                 buf.push(1);
-                let len = u32::try_from(input_data.len()).unwrap_or(u32::MAX);
+                let len = u32::try_from(input_data.len()).ok()?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(&input_data);
             }
@@ -1532,8 +2267,13 @@ impl ImageFilter for MatrixConvolutionImageFilter {
     }
 
     fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
-        if width == 0 || height == 0 {
+        // Only the image part: a longer buffer's tail is left alone.
+        let Some(pixels) = image_part(pixels, width, height) else {
             return;
+        };
+        // The input filter runs first (Skia filters its input image).
+        if let Some(ref input) = self.input {
+            input.apply(pixels, width, height);
         }
         let (kw, kh) = self.kernel_size;
         if kw <= 0 || kh <= 0 || self.kernel.is_empty() {
@@ -1646,6 +2386,23 @@ impl TileImageFilter {
 }
 
 impl ImageFilter for TileImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        input_affects(self.input.as_ref())
+    }
+
+    fn input_bounds(&self, _output: &Rect) -> Rect {
+        // SkTileImageFilter reads its source rect, whatever the output.
+        input_of(self.input.as_ref(), &self.src_rect)
+    }
+
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        Some(Arc::new(Self {
+            src_rect: matrix.map_rect_clipped(&self.src_rect),
+            dst_rect: matrix.map_rect_clipped(&self.dst_rect),
+            input: map_input(self.input.as_ref(), matrix),
+        }))
+    }
+
     fn filter_bounds(&self, _src: &Rect) -> Rect {
         self.dst_rect
     }
@@ -1664,7 +2421,7 @@ impl ImageFilter for TileImageFilter {
             Some(input) => {
                 let input_data = input.serialize()?;
                 buf.push(1);
-                let len = u32::try_from(input_data.len()).unwrap_or(u32::MAX);
+                let len = u32::try_from(input_data.len()).ok()?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(&input_data);
             }
@@ -1674,8 +2431,13 @@ impl ImageFilter for TileImageFilter {
     }
 
     fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
-        if width == 0 || height == 0 {
+        // Only the image part: a longer buffer's tail is left alone.
+        let Some(pixels) = image_part(pixels, width, height) else {
             return;
+        };
+        // The input filter runs first (Skia filters its input image).
+        if let Some(ref input) = self.input {
+            input.apply(pixels, width, height);
         }
         // Tile the src_rect region across dst_rect only (SkTileImageFilter
         // fills its destination rect, not the whole buffer).
@@ -1738,6 +2500,23 @@ impl BlendImageFilter {
 }
 
 impl ImageFilter for BlendImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        input_affects(self.background.as_ref()) || input_affects(self.foreground.as_ref())
+    }
+
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        input_of(self.background.as_ref(), output)
+            .union(&input_of(self.foreground.as_ref(), output))
+    }
+
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        Some(Arc::new(Self {
+            mode: self.mode,
+            background: map_input(self.background.as_ref(), matrix),
+            foreground: map_input(self.foreground.as_ref(), matrix),
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         let bg = self
             .background
@@ -1757,7 +2536,7 @@ impl ImageFilter for BlendImageFilter {
             Some(bg) => {
                 let bg_data = bg.serialize()?;
                 buf.push(1);
-                let len = u32::try_from(bg_data.len()).unwrap_or(u32::MAX);
+                let len = u32::try_from(bg_data.len()).ok()?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(&bg_data);
             }
@@ -1767,7 +2546,7 @@ impl ImageFilter for BlendImageFilter {
             Some(fg) => {
                 let fg_data = fg.serialize()?;
                 buf.push(1);
-                let len = u32::try_from(fg_data.len()).unwrap_or(u32::MAX);
+                let len = u32::try_from(fg_data.len()).ok()?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(&fg_data);
             }
@@ -1776,13 +2555,24 @@ impl ImageFilter for BlendImageFilter {
         Some(buf)
     }
 
-    /// Apply is a no-op for this filter in the single-buffer `apply()` API.
-    ///
-    /// `BlendImageFilter` requires separate background and foreground pixel
-    /// buffers, which the current single-buffer signature cannot provide.
-    /// A future revision will introduce a multi-input apply variant.
-    fn apply(&self, _pixels: &mut [u8], _width: usize, _height: usize) {
-        // Documented limitation: multi-input filter requires extended API.
+    fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
+        // Only the image part: a longer buffer's tail is left alone.
+        let Some(pixels) = image_part(pixels, width, height) else {
+            return;
+        };
+        // SkBlendImageFilter: the foreground image blended onto the
+        // background image with the mode (each the source for `None`).
+        let background = input_image(self.background.as_ref(), pixels, width, height);
+        let foreground = input_image(self.foreground.as_ref(), pixels, width, height);
+        for ((dst, bg), fg) in pixels
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(background.as_chunks::<4>().0.iter())
+            .zip(foreground.as_chunks::<4>().0.iter())
+        {
+            store_premul(dst, self.mode.apply(premul_color(fg), premul_color(bg)));
+        }
     }
 }
 
@@ -1825,6 +2615,30 @@ impl ArithmeticImageFilter {
 }
 
 impl ImageFilter for ArithmeticImageFilter {
+    fn affects_transparent_black(&self) -> bool {
+        // k4 is added to every pixel, transparent ones included.
+        self.k4 > 0.0
+            || input_affects(self.background.as_ref())
+            || input_affects(self.foreground.as_ref())
+    }
+
+    fn input_bounds(&self, output: &Rect) -> Rect {
+        input_of(self.background.as_ref(), output)
+            .union(&input_of(self.foreground.as_ref(), output))
+    }
+
+    fn map_params(&self, matrix: &Matrix) -> Option<ImageFilterRef> {
+        Some(Arc::new(Self {
+            k1: self.k1,
+            k2: self.k2,
+            k3: self.k3,
+            k4: self.k4,
+            enforce_pm_color: self.enforce_pm_color,
+            background: map_input(self.background.as_ref(), matrix),
+            foreground: map_input(self.foreground.as_ref(), matrix),
+        }))
+    }
+
     fn filter_bounds(&self, src: &Rect) -> Rect {
         let bg = self
             .background
@@ -1835,6 +2649,40 @@ impl ImageFilter for ArithmeticImageFilter {
             .as_ref()
             .map_or(*src, |f| f.filter_bounds(src));
         bg.union(&fg)
+    }
+
+    fn apply(&self, pixels: &mut [u8], width: usize, height: usize) {
+        // Only the image part: a longer buffer's tail is left alone.
+        let Some(pixels) = image_part(pixels, width, height) else {
+            return;
+        };
+        // SkArithmeticImageFilter on premultiplied values, src being the
+        // foreground and dst the background: k1*src*dst + k2*src + k3*dst
+        // + k4, clamped to [0, 1], and (enforcing premul) color <= alpha.
+        let background = input_image(self.background.as_ref(), pixels, width, height);
+        let foreground = input_image(self.foreground.as_ref(), pixels, width, height);
+        let (k1, k2, k3, k4) = (self.k1, self.k2, self.k3, self.k4);
+        let combine = |s: Scalar, d: Scalar| (k1 * s * d + k2 * s + k3 * d + k4).clamp(0.0, 1.0);
+        for ((out, bg), fg) in pixels
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(background.as_chunks::<4>().0.iter())
+            .zip(foreground.as_chunks::<4>().0.iter())
+        {
+            let (src, dst) = (premul_color(fg), premul_color(bg));
+            let a = combine(src.a, dst.a);
+            let mut color = Color4f::new(
+                combine(src.r, dst.r),
+                combine(src.g, dst.g),
+                combine(src.b, dst.b),
+                a,
+            );
+            if self.enforce_pm_color {
+                color = Color4f::new(color.r.min(a), color.g.min(a), color.b.min(a), a);
+            }
+            store_premul(out, color);
+        }
     }
 
     fn serialize(&self) -> Option<Vec<u8>> {
@@ -1848,7 +2696,7 @@ impl ImageFilter for ArithmeticImageFilter {
             Some(bg) => {
                 let bg_data = bg.serialize()?;
                 buf.push(1);
-                let len = u32::try_from(bg_data.len()).unwrap_or(u32::MAX);
+                let len = u32::try_from(bg_data.len()).ok()?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(&bg_data);
             }
@@ -1858,22 +2706,13 @@ impl ImageFilter for ArithmeticImageFilter {
             Some(fg) => {
                 let fg_data = fg.serialize()?;
                 buf.push(1);
-                let len = u32::try_from(fg_data.len()).unwrap_or(u32::MAX);
+                let len = u32::try_from(fg_data.len()).ok()?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(&fg_data);
             }
             None => buf.push(0),
         }
         Some(buf)
-    }
-
-    /// Apply is a no-op for this filter in the single-buffer `apply()` API.
-    ///
-    /// `ArithmeticImageFilter` requires separate background and foreground pixel
-    /// buffers, which the current single-buffer signature cannot provide.
-    /// A future revision will introduce a multi-input apply variant.
-    fn apply(&self, _pixels: &mut [u8], _width: usize, _height: usize) {
-        // Documented limitation: multi-input filter requires extended API.
     }
 }
 
@@ -2083,7 +2922,7 @@ pub(crate) fn deserialize_mask_filter(bytes: &[u8], offset: &mut usize) -> Optio
             }
             let len = u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().ok()?) as usize;
             *offset += 4;
-            if *offset + len > bytes.len() {
+            if len > bytes.len() - *offset {
                 return None;
             }
             let shader_bytes = &bytes[*offset..*offset + len];
@@ -2129,12 +2968,32 @@ pub(crate) fn deserialize_color_filter(bytes: &[u8], offset: &mut usize) -> Opti
     }
 }
 
-/// Deserialize an `ImageFilter` from bytes.
+/// The longest chain of nested image filters [`deserialize_image_filter`]
+/// reads; longer input is rejected rather than risking stack overflow.
+const MAX_FILTER_DEPTH: usize = 64;
+
+/// Reads an image filter written by [`ImageFilter::serialize`] at `offset`,
+/// advancing it. `None` for malformed, unknown or too deeply nested input.
+pub(crate) fn deserialize_image_filter(bytes: &[u8], offset: &mut usize) -> Option<ImageFilterRef> {
+    deserialize_image_filter_at(bytes, offset, 0)
+}
+
+/// Deserialize an `ImageFilter` from bytes, `depth` levels into nested
+/// filters.
 #[allow(
     clippy::too_many_lines,
     reason = "one match arm per serialized image-filter kind tag; splitting would obscure the pairing with each filter's serialize()"
 )]
-pub(crate) fn deserialize_image_filter(bytes: &[u8], offset: &mut usize) -> Option<ImageFilterRef> {
+fn deserialize_image_filter_at(
+    bytes: &[u8],
+    offset: &mut usize,
+    depth: usize,
+) -> Option<ImageFilterRef> {
+    // Untrusted input: bound the nesting so a deep chain of filters cannot
+    // overflow the stack.
+    if depth >= MAX_FILTER_DEPTH {
+        return None;
+    }
     if *offset >= bytes.len() {
         return None;
     }
@@ -2212,16 +3071,24 @@ pub(crate) fn deserialize_image_filter(bytes: &[u8], offset: &mut usize) -> Opti
                 }
                 let len = u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().ok()?) as usize;
                 *offset += 4;
-                if *offset + len > bytes.len() {
+                if len > bytes.len() - *offset {
                     return None;
                 }
                 let input_bytes = &bytes[*offset..*offset + len];
                 *offset += len;
                 let mut input_offset = 0;
-                Some(deserialize_image_filter(input_bytes, &mut input_offset)?)
+                Some(deserialize_image_filter_at(
+                    input_bytes,
+                    &mut input_offset,
+                    depth + 1,
+                )?)
             } else {
-                if *offset < bytes.len() {
-                    *offset += 1;
+                // 0 (or a missing trailing flag) is no input; any other
+                // byte is malformed.
+                match bytes.get(*offset) {
+                    Some(0) => *offset += 1,
+                    None => {}
+                    Some(_) => return None,
                 }
                 None
             };
@@ -2245,16 +3112,24 @@ pub(crate) fn deserialize_image_filter(bytes: &[u8], offset: &mut usize) -> Opti
                 }
                 let len = u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().ok()?) as usize;
                 *offset += 4;
-                if *offset + len > bytes.len() {
+                if len > bytes.len() - *offset {
                     return None;
                 }
                 let input_bytes = &bytes[*offset..*offset + len];
                 *offset += len;
                 let mut input_offset = 0;
-                Some(deserialize_image_filter(input_bytes, &mut input_offset)?)
+                Some(deserialize_image_filter_at(
+                    input_bytes,
+                    &mut input_offset,
+                    depth + 1,
+                )?)
             } else {
-                if *offset < bytes.len() {
-                    *offset += 1;
+                // 0 (or a missing trailing flag) is no input; any other
+                // byte is malformed.
+                match bytes.get(*offset) {
+                    Some(0) => *offset += 1,
+                    None => {}
+                    Some(_) => return None,
                 }
                 None
             };
@@ -2267,13 +3142,13 @@ pub(crate) fn deserialize_image_filter(bytes: &[u8], offset: &mut usize) -> Opti
             let outer_len =
                 u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().ok()?) as usize;
             *offset += 4;
-            if *offset + outer_len > bytes.len() {
+            if outer_len > bytes.len() - *offset {
                 return None;
             }
             let outer_bytes = &bytes[*offset..*offset + outer_len];
             *offset += outer_len;
             let mut outer_offset = 0;
-            let outer = deserialize_image_filter(outer_bytes, &mut outer_offset)?;
+            let outer = deserialize_image_filter_at(outer_bytes, &mut outer_offset, depth + 1)?;
 
             if *offset + 4 > bytes.len() {
                 return None;
@@ -2281,13 +3156,13 @@ pub(crate) fn deserialize_image_filter(bytes: &[u8], offset: &mut usize) -> Opti
             let inner_len =
                 u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().ok()?) as usize;
             *offset += 4;
-            if *offset + inner_len > bytes.len() {
+            if inner_len > bytes.len() - *offset {
                 return None;
             }
             let inner_bytes = &bytes[*offset..*offset + inner_len];
             *offset += inner_len;
             let mut inner_offset = 0;
-            let inner = deserialize_image_filter(inner_bytes, &mut inner_offset)?;
+            let inner = deserialize_image_filter_at(inner_bytes, &mut inner_offset, depth + 1)?;
 
             Some(Arc::new(ComposeImageFilter::new(outer, inner)))
         }
@@ -2297,6 +3172,11 @@ pub(crate) fn deserialize_image_filter(bytes: &[u8], offset: &mut usize) -> Opti
             }
             let count = u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().ok()?) as usize;
             *offset += 4;
+            // Each entry takes at least a byte: an untrusted count cannot
+            // reserve more than the remaining input could hold.
+            if count > bytes.len() - *offset {
+                return None;
+            }
             let mut inputs = Vec::with_capacity(count);
             for _ in 0..count {
                 if *offset >= bytes.len() {
@@ -2310,20 +3190,103 @@ pub(crate) fn deserialize_image_filter(bytes: &[u8], offset: &mut usize) -> Opti
                     let len =
                         u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().ok()?) as usize;
                     *offset += 4;
-                    if *offset + len > bytes.len() {
+                    if len > bytes.len() - *offset {
                         return None;
                     }
                     let input_bytes = &bytes[*offset..*offset + len];
                     *offset += len;
                     let mut input_offset = 0;
-                    Some(deserialize_image_filter(input_bytes, &mut input_offset)?)
-                } else {
+                    Some(deserialize_image_filter_at(
+                        input_bytes,
+                        &mut input_offset,
+                        depth + 1,
+                    )?)
+                } else if bytes[*offset] == 0 {
                     *offset += 1;
                     None
+                } else {
+                    // Only 0 (the source) and 1 (a filter) are entries.
+                    return None;
                 };
                 inputs.push(input);
             }
             Some(Arc::new(MergeImageFilter::new(inputs)))
+        }
+        IMAGE_FILTER_KIND_DISPLACEMENT_MAP => {
+            // Channels, the signed per-axis scales, the displacement input
+            // (length-prefixed), then an optional color input.
+            let channel = |b: u8| match b {
+                0 => Some(ColorChannel::R),
+                1 => Some(ColorChannel::G),
+                2 => Some(ColorChannel::B),
+                3 => Some(ColorChannel::A),
+                _ => None,
+            };
+            if *offset + 15 > bytes.len() {
+                return None;
+            }
+            let x_channel = channel(bytes[*offset])?;
+            let y_channel = channel(bytes[*offset + 1])?;
+            *offset += 2;
+            let scale_x = f32::from_le_bytes(bytes[*offset..*offset + 4].try_into().ok()?);
+            *offset += 4;
+            let scale_y = f32::from_le_bytes(bytes[*offset..*offset + 4].try_into().ok()?);
+            *offset += 4;
+            // A non-finite scale displaces nothing, as in `new` (where
+            // SkImageFilters::DisplacementMap gives no filter).
+            let finite = |v: Scalar| if v.is_finite() { v } else { 0.0 };
+            let (scale_x, scale_y) = (finite(scale_x), finite(scale_y));
+            let flips = bytes[*offset];
+            *offset += 1;
+            if flips > 3 {
+                return None;
+            }
+            let len = u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().ok()?) as usize;
+            *offset += 4;
+            if len > bytes.len() - *offset {
+                return None;
+            }
+            let mut sub_offset = 0;
+            let displacement = deserialize_image_filter_at(
+                &bytes[*offset..*offset + len],
+                &mut sub_offset,
+                depth + 1,
+            )?;
+            *offset += len;
+            let color = if *offset < bytes.len() && bytes[*offset] == 1 {
+                *offset += 1;
+                if *offset + 4 > bytes.len() {
+                    return None;
+                }
+                let len = u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().ok()?) as usize;
+                *offset += 4;
+                if len > bytes.len() - *offset {
+                    return None;
+                }
+                let color_bytes = &bytes[*offset..*offset + len];
+                *offset += len;
+                let mut color_offset = 0;
+                Some(deserialize_image_filter_at(
+                    color_bytes,
+                    &mut color_offset,
+                    depth + 1,
+                )?)
+            } else {
+                // The serializer writes 0 for no color input; a missing flag
+                // means none too (as the other arms read a missing trailing
+                // flag), while any other byte is malformed.
+                match bytes.get(*offset) {
+                    Some(0) => *offset += 1,
+                    None => {}
+                    Some(_) => return None,
+                }
+                None
+            };
+            let mut filter =
+                DisplacementMapImageFilter::new(x_channel, y_channel, scale_x, displacement, color);
+            filter.axis_scale = (scale_x, scale_y);
+            filter.axis_flips = (flips & 1 != 0, flips & 2 != 0);
+            Some(Arc::new(filter))
         }
         _ => None, // Other filter types not yet implemented in deserialization
     }
@@ -2331,7 +3294,769 @@ pub(crate) fn deserialize_image_filter(bytes: &[u8], offset: &mut usize) -> Opti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quarter_turns_swap_directional_filter_axes() {
+        // A horizontal blur under a 90-degree rotation is vertical on
+        // screen, as Skia draws it.
+        let blur: ImageFilterRef = Arc::new(BlurImageFilter::new(
+            10.0,
+            0.0,
+            crate::shader::TileMode::Decal,
+        ));
+        let mapped = map_image_filter(&blur, &Matrix::rotate(90.0_f32.to_radians()));
+        let debug = format!("{mapped:?}");
+        assert!(
+            debug.contains("sigma_x: 0.0") && debug.contains("sigma_y: 10.0"),
+            "{debug}"
+        );
+        // Scale alone keeps the axes.
+        let mapped = map_image_filter(&blur, &Matrix::scale(2.0, 3.0));
+        let debug = format!("{mapped:?}");
+        assert!(
+            debug.contains("sigma_x: 20.0") && debug.contains("sigma_y: 0.0"),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    fn convolution_kernels_reorient_under_quarter_turns() {
+        // A horizontal 3x1 edge kernel under rotate(90) is vertical on
+        // screen: local tap offset (u, v) maps to device (-v, u).
+        let conv: ImageFilterRef = Arc::new(MatrixConvolutionImageFilter::new(
+            (3, 1),
+            vec![1.0, 0.0, -1.0],
+            1.0,
+            0.0,
+            (1, 0),
+            crate::shader::TileMode::Decal,
+            true,
+            None,
+        ));
+        let mapped = map_image_filter(&conv, &Matrix::rotate(90.0_f32.to_radians()));
+        let debug = format!("{mapped:?}");
+        assert!(debug.contains("kernel_size: (1, 3)"), "{debug}");
+        assert!(debug.contains("kernel: [1.0, 0.0, -1.0]"), "{debug}");
+        assert!(debug.contains("kernel_offset: (0, 1)"), "{debug}");
+    }
+
+    #[test]
+    fn distant_lights_keep_their_elevation() {
+        // Under scale a distant light keeps its direction; under a quarter
+        // turn it turns with the content.
+        let light = LightType::Distant {
+            direction: (1.0, 0.0, 1.0),
+        };
+        let scaled = light.mapped(&Matrix::scale(2.0, 2.0));
+        assert!(matches!(scaled, LightType::Distant { direction } if direction == (1.0, 0.0, 1.0)));
+        // The surface scale is not mapped (as in Skia), so the shading
+        // does not change with zoom.
+        let lighting: ImageFilterRef = Arc::new(LightingImageFilter::diffuse(
+            light.clone(),
+            1.5,
+            1.0,
+            Color4f::new(1.0, 1.0, 1.0, 1.0),
+            None,
+        ));
+        let debug = format!(
+            "{:?}",
+            map_image_filter(&lighting, &Matrix::scale(2.0, 2.0))
+        );
+        assert!(
+            debug.contains("surface_scale: 1.5"),
+            "zoom must not change it: {debug}"
+        );
+        // Point lights keep their height (scaled, never flipped) under turns.
+        let point = LightType::Point {
+            location: (10.0, 20.0, 5.0),
+        };
+        for turn in [90.0_f32, 180.0] {
+            let mapped = point.mapped(&Matrix::rotate(turn.to_radians()));
+            assert!(
+                matches!(mapped, LightType::Point { location } if (location.2 - 5.0).abs() < 1e-4),
+                "{turn}: {mapped:?}"
+            );
+        }
+        let turned = light.mapped(&Matrix::rotate(90.0_f32.to_radians()));
+        assert!(matches!(turned, LightType::Distant { direction } if direction == (0.0, 1.0, 1.0)));
+    }
+
+    #[test]
+    fn filters_report_whether_they_affect_transparent_black() {
+        let mut add_alpha = [0.0; 20];
+        for i in 0..4 {
+            add_alpha[i * 5 + i] = 1.0;
+        }
+        add_alpha[19] = 1.0;
+        let cf: ColorFilterRef = Arc::new(ColorMatrixFilter::new(add_alpha));
+        assert!(ColorFilterImageFilter::new(cf, None).affects_transparent_black());
+        let identity: ColorFilterRef = Arc::new(ColorMatrixFilter::identity());
+        assert!(!ColorFilterImageFilter::new(identity, None).affects_transparent_black());
+        let blur = BlurImageFilter::new(2.0, 2.0, crate::shader::TileMode::Decal);
+        assert!(!blur.affects_transparent_black());
+    }
+
+    #[test]
+    fn transparent_black_is_seen_through_inputs() {
+        let mut add_alpha = [0.0; 20];
+        for i in 0..4 {
+            add_alpha[i * 5 + i] = 1.0;
+        }
+        add_alpha[19] = 1.0;
+        let cf: ColorFilterRef = Arc::new(ColorMatrixFilter::new(add_alpha));
+        let wash: ImageFilterRef = Arc::new(ColorFilterImageFilter::new(cf, None));
+        assert!(
+            OffsetImageFilter::new(5.0, 5.0, Some(Arc::clone(&wash))).affects_transparent_black()
+        );
+        assert!(
+            MorphologyImageFilter::dilate(1.0, 1.0, Some(Arc::clone(&wash)))
+                .affects_transparent_black()
+        );
+        // A biased, alpha-convolving kernel lights up transparent pixels.
+        let biased = MatrixConvolutionImageFilter::new(
+            (1, 1),
+            vec![1.0],
+            1.0,
+            0.5,
+            (0, 0),
+            crate::shader::TileMode::Decal,
+            true,
+            None,
+        );
+        assert!(biased.affects_transparent_black());
+    }
+
+    #[test]
+    fn lighting_keeps_pixels_premultiplied() {
+        let lighting = LightingImageFilter::diffuse(
+            LightType::Distant {
+                direction: (0.0, 0.0, 1.0),
+            },
+            10.0,
+            1.0,
+            Color4f::new(1.0, 1.0, 1.0, 1.0),
+            None,
+        );
+        // Half-transparent red (premultiplied 128, 0, 0, 128).
+        let mut pixels = vec![128u8, 0, 0, 128];
+        lighting.apply(&mut pixels, 1, 1);
+        assert!(pixels[0] <= pixels[3], "color <= alpha: {pixels:?}");
+    }
+
+    #[test]
+    fn lighting_runs_its_input_filter() {
+        // An input that clears the pixels: lighting of nothing is nothing.
+        let mut clear = [0.0; 20];
+        clear[19] = 0.0;
+        let cf: ColorFilterRef = Arc::new(ColorMatrixFilter::new(clear));
+        let input: ImageFilterRef = Arc::new(ColorFilterImageFilter::new(cf, None));
+        let lighting = LightingImageFilter::diffuse(
+            LightType::Distant {
+                direction: (0.0, 0.0, 1.0),
+            },
+            1.0,
+            1.0,
+            Color4f::new(1.0, 1.0, 1.0, 1.0),
+            Some(input),
+        );
+        let mut pixels = vec![200u8, 100, 50, 255];
+        lighting.apply(&mut pixels, 1, 1);
+        assert_eq!(pixels[3], 0, "the input cleared the pixel: {pixels:?}");
+    }
+
+    #[test]
+    fn invalid_blur_and_morphology_parameters_stay_no_ops() {
+        let ident = Matrix::identity();
+        for sigma in [f32::NAN, -5.0] {
+            let blur: ImageFilterRef = Arc::new(BlurImageFilter::new(
+                sigma,
+                sigma,
+                crate::shader::TileMode::Decal,
+            ));
+            let mapped = format!("{:?}", map_image_filter(&blur, &ident));
+            assert!(
+                mapped.contains("sigma_x: 0.0") && mapped.contains("sigma_y: 0.0"),
+                "{mapped}"
+            );
+            let r = Rect::new(0.0, 0.0, 10.0, 10.0);
+            assert_eq!(blur.filter_bounds(&r), r, "no reach for sigma {sigma}");
+        }
+        let dilate: ImageFilterRef = Arc::new(MorphologyImageFilter::dilate(-3.0, -3.0, None));
+        let mapped = format!("{:?}", map_image_filter(&dilate, &ident));
+        assert!(
+            mapped.contains("radius_x: 0.0") && mapped.contains("radius_y: 0.0"),
+            "{mapped}"
+        );
+    }
+
+    #[test]
+    fn negative_displacement_scales_reach_as_far_as_positive_ones() {
+        let map: ImageFilterRef = Arc::new(OffsetImageFilter::new(0.0, 0.0, None));
+        let r = Rect::new(0.0, 0.0, 10.0, 10.0);
+        for scale in [20.0, -20.0] {
+            let f = DisplacementMapImageFilter::new(
+                ColorChannel::R,
+                ColorChannel::G,
+                scale,
+                Arc::clone(&map),
+                None,
+            );
+            assert_eq!(
+                f.filter_bounds(&r),
+                Rect::new(-10.0, -10.0, 20.0, 20.0),
+                "{scale}"
+            );
+        }
+    }
+
+    #[test]
+    fn bogus_convolution_kernel_sizes_do_not_overflow() {
+        let conv: ImageFilterRef = Arc::new(MatrixConvolutionImageFilter::new(
+            (65536, 65536),
+            vec![1.0],
+            1.0,
+            0.0,
+            (0, 0),
+            crate::shader::TileMode::Decal,
+            true,
+            None,
+        ));
+        // Mapping (done for every layer) leaves the bogus kernel alone.
+        let mapped = map_image_filter(&conv, &Matrix::rotate(90.0_f32.to_radians()));
+        assert!(format!("{mapped:?}").contains("kernel_size: (65536, 65536)"));
+    }
+
+    #[test]
+    fn displacement_mapping_follows_half_turns_and_diagonal_swaps() {
+        let map: ImageFilterRef = Arc::new(OffsetImageFilter::new(0.0, 0.0, None));
+        let filter: ImageFilterRef = Arc::new(DisplacementMapImageFilter::new(
+            ColorChannel::R,
+            ColorChannel::G,
+            20.0,
+            map,
+            None,
+        ));
+        // A half turn reverses both axes: both axis signs flip.
+        let turned = format!(
+            "{:?}",
+            map_image_filter(&filter, &Matrix::rotate(180.0_f32.to_radians()))
+        );
+        assert!(turned.contains("axis_scale: (-20.0, -20.0)"), "{turned}");
+        // Reflecting across the diagonal swaps which channel drives which axis.
+        let mut swap = Matrix::identity();
+        swap.values = [0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        // A tiny quarter turn still swaps (its products underflow in f32).
+        let mut tiny = Matrix::identity();
+        tiny.values = [0.0, -1e-25, 0.0, 1e-25, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let tiny = format!("{:?}", map_image_filter(&filter, &tiny));
+        assert!(
+            tiny.contains("x_channel: G") && tiny.contains("y_channel: R"),
+            "{tiny}"
+        );
+        let swapped = format!("{:?}", map_image_filter(&filter, &swap));
+        assert!(
+            swapped.contains("x_channel: G")
+                && swapped.contains("y_channel: R")
+                && swapped.contains("axis_scale: (20.0, 20.0)"),
+            "{swapped}"
+        );
+    }
+
+    #[test]
+    fn displacement_maps_exactly_under_a_single_axis_mirror() {
+        let filter: ImageFilterRef = Arc::new(DisplacementMapImageFilter::new(
+            ColorChannel::R,
+            ColorChannel::G,
+            10.0,
+            Arc::new(OffsetImageFilter::new(0.0, 0.0, None)),
+            None,
+        ));
+        let mirrored = format!("{:?}", map_image_filter(&filter, &Matrix::scale(-1.0, 1.0)));
+        assert!(
+            mirrored.contains("x_channel: R")
+                && mirrored.contains("y_channel: G")
+                && mirrored.contains("axis_scale: (-10.0, 10.0)"),
+            "{mirrored}"
+        );
+    }
+
+    #[test]
+    fn displacement_ties_under_a_mirror_round_like_skia() {
+        // scale 1 and R = 255: half a pixel right locally. A mirror is
+        // scale-translate, which Skia filters in device space with the
+        // signed scale: D = -0.5 floors back onto the same pixel. B tags
+        // each column.
+        let filter: ImageFilterRef = Arc::new(DisplacementMapImageFilter::new(
+            ColorChannel::R,
+            ColorChannel::G,
+            1.0,
+            Arc::new(OffsetImageFilter::new(0.0, 0.0, None)),
+            None,
+        ));
+        let mirrored = map_image_filter(&filter, &Matrix::scale(-1.0, 1.0));
+        let mut px = Vec::new();
+        for column in 0..3_u8 {
+            px.extend_from_slice(&[255, 128, column * 100, 255]);
+        }
+        let mut negative = px.clone();
+        mirrored.apply(&mut px, 3, 1);
+        assert_eq!(px[4 + 2], 100, "column 1 shows itself");
+        assert_eq!(px[8 + 2], 200, "column 2 shows itself");
+        // A negative scale is not a flip: unmapped, scale -1 also floors.
+        let flipped_scale = DisplacementMapImageFilter::new(
+            ColorChannel::R,
+            ColorChannel::G,
+            -1.0,
+            Arc::new(OffsetImageFilter::new(0.0, 0.0, None)),
+            None,
+        );
+        flipped_scale.apply(&mut negative, 3, 1);
+        assert_eq!(
+            negative[4 + 2],
+            100,
+            "negative scale: column 1 shows itself"
+        );
+        // A quarter turn is filtered unrotated and turned into place: device
+        // x (driven by -local y) is flipped, device y is not.
+        let mut quarter = Matrix::IDENTITY;
+        quarter.values[Matrix::SCALE_X] = 0.0;
+        quarter.values[Matrix::SKEW_X] = -1.0;
+        quarter.values[Matrix::SKEW_Y] = 1.0;
+        quarter.values[Matrix::SCALE_Y] = 0.0;
+        let turned = format!("{:?}", map_image_filter(&filter, &quarter));
+        assert!(turned.contains("axis_flips: (true, false)"), "{turned}");
+    }
+
+    #[test]
+    fn displacement_keeps_the_driving_channels_under_a_shear() {
+        // device x = local x (+ 0 * local y): R must still drive x.
+        let filter: ImageFilterRef = Arc::new(DisplacementMapImageFilter::new(
+            ColorChannel::R,
+            ColorChannel::G,
+            10.0,
+            Arc::new(OffsetImageFilter::new(0.0, 0.0, None)),
+            None,
+        ));
+        let mut shear = Matrix::IDENTITY;
+        shear.values[Matrix::SKEW_Y] = 2.0;
+        let sheared = format!("{:?}", map_image_filter(&filter, &shear));
+        assert!(
+            sheared.contains("x_channel: R") && sheared.contains("y_channel: G"),
+            "{sheared}"
+        );
+    }
+
+    #[test]
+    fn displacement_mapping_keeps_the_scale_sign() {
+        let map: ImageFilterRef = Arc::new(OffsetImageFilter::new(0.0, 0.0, None));
+        let filter: ImageFilterRef = Arc::new(DisplacementMapImageFilter::new(
+            ColorChannel::R,
+            ColorChannel::G,
+            -20.0,
+            map,
+            None,
+        ));
+        let mapped = map_image_filter(&filter, &Matrix::scale(2.0, 2.0));
+        let debug = format!("{mapped:?}");
+        assert!(debug.contains("axis_scale: (-40.0, -40.0)"), "{debug}");
+        // A non-uniform scale scales each axis by its own factor (Skia moves
+        // up to 5 px in x and 15 px in y here, not the mean on both).
+        let map: ImageFilterRef = Arc::new(OffsetImageFilter::new(0.0, 0.0, None));
+        let filter: ImageFilterRef = Arc::new(DisplacementMapImageFilter::new(
+            ColorChannel::R,
+            ColorChannel::G,
+            10.0,
+            map,
+            None,
+        ));
+        let stretched = format!("{:?}", map_image_filter(&filter, &Matrix::scale(1.0, 3.0)));
+        assert!(
+            stretched.contains("axis_scale: (10.0, 30.0)"),
+            "{stretched}"
+        );
+    }
+
+    #[test]
+    fn lighting_and_convolution_map_their_inputs_and_lights() {
+        // A point light at (10, 20, 5) under scale(4) moves to (40, 80, 20),
+        // and a convolution's offset input maps too (its reach grows 4x).
+        let m = Matrix::scale(4.0, 4.0);
+        let light = LightType::Point {
+            location: (10.0, 20.0, 5.0),
+        }
+        .mapped(&m);
+        assert!(matches!(light, LightType::Point { location } if location == (40.0, 80.0, 20.0)));
+
+        let offset: ImageFilterRef = Arc::new(OffsetImageFilter::new(100.0, 0.0, None));
+        let conv: ImageFilterRef = Arc::new(MatrixConvolutionImageFilter::new(
+            (1, 1),
+            vec![1.0],
+            1.0,
+            0.0,
+            (0, 0),
+            crate::shader::TileMode::Decal,
+            true,
+            Some(offset),
+        ));
+        let mapped = map_image_filter(&conv, &m);
+        let out = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let input = mapped.input_bounds(&out);
+        assert_eq!(input.left, -400.0, "the offset input maps: {input:?}");
+    }
+
     use super::*;
+
+    #[test]
+    fn multi_input_filters_combine_their_inputs() {
+        // Source: a red pixel at x = 0 of a 3x1 image; `shift` moves it to 1.
+        let red = [255, 0, 0, 255];
+        let source = [red, [0; 4], [0; 4]].concat();
+        let shift: ImageFilterRef = Arc::new(OffsetImageFilter::new(1.0, 0.0, None));
+
+        // Merge: the source and its shifted copy, src-over.
+        let mut px = source.clone();
+        MergeImageFilter::new(vec![None, Some(shift.clone())]).apply(&mut px, 3, 1);
+        assert_eq!(&px[..8], &[255, 0, 0, 255, 255, 0, 0, 255], "merge");
+
+        // Blend: the shifted copy (foreground) over the source (background).
+        let mut px = source.clone();
+        BlendImageFilter::new(crate::BlendMode::SrcOver, None, Some(shift.clone()))
+            .apply(&mut px, 3, 1);
+        assert_eq!(&px[..8], &[255, 0, 0, 255, 255, 0, 0, 255], "blend");
+
+        // Arithmetic k2 = 1: the foreground alone; k4 = 1: opaque white.
+        let mut px = source.clone();
+        ArithmeticImageFilter::new(0.0, 1.0, 0.0, 0.0, true, None, Some(shift))
+            .apply(&mut px, 3, 1);
+        assert_eq!(&px[..8], &[0, 0, 0, 0, 255, 0, 0, 255], "arithmetic k2");
+        let mut px = source;
+        ArithmeticImageFilter::new(0.0, 0.0, 0.0, 1.0, true, None, None).apply(&mut px, 3, 1);
+        assert!(px.iter().all(|&v| v == 255), "arithmetic k4");
+    }
+
+    #[test]
+    fn displacement_maps_exactly_under_a_quarter_turn() {
+        // Map: R = 255 (+scale/2 along local x), G = 128 (~0 along local y),
+        // so locally pixels come from one column right. Under a quarter
+        // turn (device x = -local y, device y = local x) they must come
+        // from one row *down* instead. B tags each row.
+        let filter = DisplacementMapImageFilter::new(
+            ColorChannel::R,
+            ColorChannel::G,
+            2.0,
+            Arc::new(OffsetImageFilter::new(0.0, 0.0, None)),
+            None,
+        );
+        let mut quarter = Matrix::IDENTITY;
+        quarter.values[Matrix::SCALE_X] = 0.0;
+        quarter.values[Matrix::SKEW_X] = -1.0;
+        quarter.values[Matrix::SKEW_Y] = 1.0;
+        quarter.values[Matrix::SCALE_Y] = 0.0;
+        let mapped = filter.map_params(&quarter).expect("maps");
+        let mut px = Vec::new();
+        for row in 0..3_u8 {
+            for _ in 0..3 {
+                px.extend_from_slice(&[255, 128, row * 100, 255]);
+            }
+        }
+        mapped.apply(&mut px, 3, 3);
+        assert_eq!(px[2], 100, "row 0 shows row 1");
+        assert_eq!(px[3 * 4 + 2], 200, "row 1 shows row 2");
+    }
+
+    #[test]
+    fn displacement_fits_near_axis_matrices_to_the_nearest_axes() {
+        let filter: ImageFilterRef = Arc::new(DisplacementMapImageFilter::new(
+            ColorChannel::R,
+            ColorChannel::G,
+            10.0,
+            Arc::new(OffsetImageFilter::new(0.0, 0.0, None)),
+            None,
+        ));
+        // Almost a quarter turn: still swaps the channels.
+        let rotation = Matrix::rotate(80.0_f32.to_radians());
+        let turned = format!("{:?}", map_image_filter(&filter, &rotation));
+        assert!(
+            turned.contains("x_channel: G") && turned.contains("y_channel: R"),
+            "{turned}"
+        );
+        // scale(1, 3) barely rotated stays close to (10, 30), not the mean.
+        let mut stretched = Matrix::scale(1.0, 3.0);
+        stretched = stretched.concat(&Matrix::rotate(0.5_f32.to_radians()));
+        let debug = format!("{:?}", map_image_filter(&filter, &stretched));
+        let scales: Vec<Scalar> = debug
+            .split("axis_scale: (")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .map(|pair| pair.split(", ").filter_map(|v| v.parse().ok()).collect())
+            .unwrap_or_default();
+        assert!(
+            scales.len() == 2 && (scales[0] - 10.0).abs() < 0.1 && (scales[1] - 30.0).abs() < 0.1,
+            "{debug}"
+        );
+        // Under 45 degrees the distance is kept (column lengths), not
+        // shortened to the axis components (0.71 of it).
+        let diagonal = format!(
+            "{:?}",
+            map_image_filter(&filter, &Matrix::rotate(45.0_f32.to_radians()))
+        );
+        let scales: Vec<Scalar> = diagonal
+            .split("axis_scale: (")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .map(|pair| pair.split(", ").filter_map(|v| v.parse().ok()).collect())
+            .unwrap_or_default();
+        assert!(
+            scales.len() == 2 && scales.iter().all(|v| (v.abs() - 10.0).abs() < 0.01),
+            "{diagonal}"
+        );
+        // Both per-axis scales are serialized, after the kind and channels.
+        let bytes = map_image_filter(&filter, &stretched)
+            .serialize()
+            .expect("serializes");
+        let read = |at: usize| {
+            f32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+        };
+        assert!((read(3) - 10.0).abs() < 0.1 && (read(7) - 30.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn displacement_maps_round_trip_through_serialization() {
+        let filter: ImageFilterRef = Arc::new(DisplacementMapImageFilter::new(
+            ColorChannel::B,
+            ColorChannel::A,
+            10.0,
+            Arc::new(OffsetImageFilter::new(1.0, 2.0, None)),
+            Some(Arc::new(OffsetImageFilter::new(3.0, 4.0, None))),
+        ));
+        let mapped = map_image_filter(&filter, &Matrix::scale(-1.0, 3.0));
+        let bytes = mapped.serialize().expect("serializes");
+        let mut offset = 0;
+        let back = deserialize_image_filter(&bytes, &mut offset).expect("reads back");
+        assert_eq!(offset, bytes.len());
+        assert_eq!(format!("{back:?}"), format!("{mapped:?}"));
+    }
+
+    #[test]
+    fn deserialization_rejects_deep_nesting_and_non_finite_displacement() {
+        let nest = |depth: usize| {
+            let mut filter: ImageFilterRef = Arc::new(OffsetImageFilter::new(1.0, 0.0, None));
+            for _ in 0..depth {
+                filter = Arc::new(OffsetImageFilter::new(1.0, 0.0, Some(filter)));
+            }
+            filter.serialize().expect("serializes")
+        };
+        let mut offset = 0;
+        assert!(deserialize_image_filter(&nest(10), &mut offset).is_some());
+        let mut offset = 0;
+        assert!(deserialize_image_filter(&nest(MAX_FILTER_DEPTH + 5), &mut offset).is_none());
+
+        let filter = DisplacementMapImageFilter::new(
+            ColorChannel::R,
+            ColorChannel::G,
+            10.0,
+            Arc::new(OffsetImageFilter::new(0.0, 0.0, None)),
+            None,
+        );
+        // A non-finite scale from new() displaces nothing (0)...
+        let infinite = DisplacementMapImageFilter::new(
+            ColorChannel::R,
+            ColorChannel::G,
+            f32::INFINITY,
+            Arc::new(OffsetImageFilter::new(0.0, 0.0, None)),
+            None,
+        );
+        assert!(format!("{infinite:?}").contains("axis_scale: (0.0, 0.0)"));
+        // ...and so does one in crafted bytes (kind, two channel bytes,
+        // then the x scale), rather than failing the whole filter.
+        let mut bytes = filter.serialize().expect("serializes");
+        bytes[3..7].copy_from_slice(&f32::INFINITY.to_le_bytes());
+        let mut offset = 0;
+        let read = deserialize_image_filter(&bytes, &mut offset).expect("reads");
+        assert!(
+            format!("{read:?}").contains("axis_scale: (0.0, 10.0)"),
+            "{read:?}"
+        );
+        // A missing trailing color flag reads as no color input; a flag
+        // other than 0 or 1 is malformed.
+        let mut bytes = filter.serialize().expect("serializes");
+        assert_eq!(bytes.pop(), Some(0));
+        let mut offset = 0;
+        assert!(deserialize_image_filter(&bytes, &mut offset).is_some());
+        bytes.push(2);
+        let mut offset = 0;
+        assert!(deserialize_image_filter(&bytes, &mut offset).is_none());
+        // A Merge entry flag other than 0 or 1 is malformed.
+        let mut offset = 0;
+        assert!(deserialize_image_filter(&[8, 1, 0, 0, 0, 0], &mut offset).is_some());
+        let mut offset = 0;
+        assert!(deserialize_image_filter(&[8, 1, 0, 0, 0, 2], &mut offset).is_none());
+        // A Merge claiming more entries than bytes left reads nothing.
+        let mut offset = 0;
+        assert!(deserialize_image_filter(&[8, 0xFF, 0xFF, 0xFF, 0xFF], &mut offset).is_none());
+    }
+
+    #[test]
+    fn displacement_bounds_round_out_like_skia() {
+        // Scale 1 reaches half a pixel, but from a fractional edge nearest
+        // sampling can reach a whole pixel: [0.6, 10.4] -> [-1, 12].
+        let filter = DisplacementMapImageFilter::new(
+            ColorChannel::R,
+            ColorChannel::G,
+            1.0,
+            Arc::new(OffsetImageFilter::new(0.0, 0.0, None)),
+            None,
+        );
+        let bounds = filter.filter_bounds(&Rect::new(0.6, 0.6, 10.4, 10.4));
+        assert_eq!(bounds, Rect::new(-1.0, -1.0, 12.0, 12.0));
+    }
+
+    #[test]
+    fn shifting_filters_survive_extreme_offsets_and_short_buffers() {
+        // A huge negative offset saturates near i32::MIN; from x = 128 on,
+        // x - offset would overflow i32. Everything shifts out of view.
+        let mut px = vec![255u8; 200 * 4];
+        OffsetImageFilter::new(-3e9, 0.0, None).apply(&mut px, 200, 1);
+        assert!(px.iter().all(|&v| v == 0));
+        let mut px = vec![255u8; 200 * 4];
+        DropShadowImageFilter::new(-3e9, 0.0, 0.0, 0.0, Color4f::new(0.0, 0.0, 0.0, 1.0), true)
+            .apply(&mut px, 200, 1);
+        assert!(px.iter().all(|&v| v == 0));
+        // A longer buffer: only the image is filtered, the tail kept.
+        let mut long = vec![255u8; 20];
+        OffsetImageFilter::new(1.0, 0.0, None).apply(&mut long, 2, 2);
+        assert_eq!(&long[..4], &[0; 4]);
+        assert_eq!(&long[16..], &[255; 4]);
+        // A buffer shorter than width x height is left alone, by every
+        // filter that reads the image.
+        let mut short = vec![7u8; 12];
+        OffsetImageFilter::new(1.0, 0.0, None).apply(&mut short, 2, 2);
+        DisplacementMapImageFilter::new(
+            ColorChannel::R,
+            ColorChannel::G,
+            4.0,
+            Arc::new(OffsetImageFilter::new(0.0, 0.0, None)),
+            None,
+        )
+        .apply(&mut short, 2, 2);
+        BlurImageFilter::new(2.0, 2.0, crate::shader::TileMode::Clamp).apply(&mut short, 2, 2);
+        MergeImageFilter::new(vec![
+            Some(Arc::new(BlurImageFilter::new(
+                2.0,
+                2.0,
+                crate::shader::TileMode::Clamp,
+            ))),
+            None,
+        ])
+        .apply(&mut short, 2, 2);
+        assert!(short.iter().all(|&v| v == 7));
+    }
+
+    #[test]
+    fn displacement_samples_at_the_displaced_pixel_center() {
+        assert_eq!(
+            displaced_sample(5, -0.25, false),
+            5,
+            "less than half a pixel: no move"
+        );
+        assert_eq!(displaced_sample(5, 0.7, false), 6);
+        assert_eq!(displaced_sample(5, -0.6, false), 4);
+        // A tie on a flipped axis rounds as Skia's mirrored layer does.
+        assert_eq!(displaced_sample(5, -0.5, true), 4);
+        assert_eq!(displaced_sample(5, -0.5, false), 5);
+    }
+
+    #[test]
+    fn displacement_offsets_match_skia() {
+        // scale * (c / 255 - 0.5) on the unpremultiplied channel.
+        assert!((displacement_offset(&[255, 0, 0, 255], 0, 20.0) - 10.0).abs() < 1e-5);
+        assert!((displacement_offset(&[0, 0, 0, 255], 0, 20.0) + 10.0).abs() < 1e-5);
+        // R 255 at 50% alpha is stored as 128: still the full +scale/2.
+        assert!((displacement_offset(&[128, 0, 0, 128], 0, 20.0) - 10.0).abs() < 1e-5);
+        // Alpha 0: Skia divides by 0.0001 and saturates, so any color is 1.
+        assert!((displacement_offset(&[10, 0, 0, 0], 0, 20.0) - 10.0).abs() < 1e-5);
+        // Premul R 100 at alpha 200 is exactly 0.5: no move at any scale
+        // (rounding it to a byte first would give 128 / 255).
+        assert!(displacement_offset(&[100, 0, 0, 200], 0, 300.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn shifted_content_leaves_transparent_pixels_behind() {
+        let red = [255, 0, 0, 255];
+        let mut px = [red, [0; 4], [0; 4]].concat();
+        OffsetImageFilter::new(1.0, 0.0, None).apply(&mut px, 3, 1);
+        assert_eq!(&px[..8], &[0, 0, 0, 0, 255, 0, 0, 255], "offset");
+
+        let mut px = [red, [0; 4], [0; 4]].concat();
+        let shadow =
+            DropShadowImageFilter::new(1.0, 0.0, 0.0, 0.0, Color4f::new(0.0, 0.0, 1.0, 1.0), true);
+        shadow.apply(&mut px, 3, 1);
+        assert_eq!(px[3], 0, "no shadow enters from outside");
+        assert_eq!(px[7], 255, "the shadow moved right");
+    }
+
+    #[test]
+    fn morphology_bounds_ignore_negative_and_nan_radii() {
+        let src = Rect::new(10.0, 10.0, 60.0, 60.0);
+        assert_eq!(
+            MorphologyImageFilter::dilate(-5.0, -5.0, None).filter_bounds(&src),
+            src
+        );
+        assert_eq!(
+            MorphologyImageFilter::dilate(f32::NAN, 0.0, None).filter_bounds(&src),
+            src
+        );
+        assert_eq!(
+            MorphologyImageFilter::dilate(-5.0, -5.0, None).input_bounds(&src),
+            src
+        );
+    }
+
+    #[test]
+    fn filters_run_their_inputs_and_bound_through_them() {
+        // Each filter runs its input first: here a 1-pixel shift right.
+        let shift: ImageFilterRef = Arc::new(OffsetImageFilter::new(1.0, 0.0, None));
+        let filters: Vec<ImageFilterRef> = vec![
+            Arc::new(MorphologyImageFilter::dilate(0.0, 0.0, Some(shift.clone()))),
+            Arc::new(MatrixConvolutionImageFilter::new(
+                (1, 1),
+                vec![1.0],
+                1.0,
+                0.0,
+                (0, 0),
+                crate::shader::TileMode::Decal,
+                true,
+                Some(shift.clone()),
+            )),
+            Arc::new(TileImageFilter::new(
+                Rect::new(0.0, 0.0, 3.0, 1.0),
+                Rect::new(0.0, 0.0, 3.0, 1.0),
+                Some(shift.clone()),
+            )),
+            // Scale 0 moves nothing: the output is the color input's.
+            Arc::new(DisplacementMapImageFilter::new(
+                ColorChannel::R,
+                ColorChannel::G,
+                0.0,
+                Arc::new(OffsetImageFilter::new(0.0, 0.0, None)),
+                Some(shift),
+            )),
+        ];
+        for filter in &filters {
+            let mut px = vec![255, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0];
+            filter.apply(&mut px, 3, 1);
+            assert_eq!(&px[4..8], &[255, 0, 0, 255], "{filter:?}");
+        }
+
+        // A filter wrapping a blur reaches as far as the blur.
+        let blur: ImageFilterRef = Arc::new(BlurImageFilter::new(
+            5.0,
+            5.0,
+            crate::shader::TileMode::Decal,
+        ));
+        let src = Rect::new(40.0, 40.0, 60.0, 60.0);
+        let wrapped = OffsetImageFilter::new(0.0, 0.0, Some(blur.clone()));
+        assert_eq!(wrapped.filter_bounds(&src), blur.filter_bounds(&src));
+    }
 
     #[test]
     fn test_blur_mask_filter_blurs() {
@@ -2620,9 +4345,10 @@ mod tests {
         pixels[0] = 255; // red at top-left
         pixels[3] = 255; // alpha
         filter.apply(&mut pixels, 4, 4);
-        // Pixel should have shifted right and down
-        // Top-left should now be clamped from what was at (-1, -1) = top-left
-        assert_eq!(pixels[0], 255, "clamp-to-edge should preserve top-left");
+        // The pixel moved right and down; the uncovered top-left is
+        // transparent, as in Skia.
+        assert_eq!(&pixels[..4], &[0, 0, 0, 0], "top-left uncovered");
+        assert_eq!(&pixels[20..24], &[255, 0, 0, 255], "moved to (1, 1)");
     }
 
     #[test]
