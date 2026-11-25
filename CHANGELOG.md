@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-25
+
+### Added
+
+- `Canvas::clip_round_rect`, `ClipStack::clip_round_rect` and
+  `RecordingCanvas::clip_round_rect` / `clip_round_rect_op`: round-rect
+  clips are recorded as `DrawCommand::ClipRoundRect` and survive picture
+  playback (#23).
+- Benchmarks for aliased and anti-aliased path clips (#23).
+
+### Changed
+
+- Anti-aliased path clipping builds its coverage mask with the same edge
+  table as anti-aliased path fills, which is much faster for repeated
+  clips, and `ClipStack::clip_path` takes a fast path for empty paths (#23).
+
+### Fixed
+
+- The release workflow validates on `ubuntu-24.04`: the newer
+  `ubuntu-latest` image's nasm failed libaom's assembler check in the
+  `--all-features` build.
+
 ## [0.5.0] - 2026-11-24
 
 ### Changed
@@ -1304,5 +1326,6 @@ The first public release of skia-rs, a pure Rust implementation of the Skia 2D g
 [0.3.0]: https://github.com/quinnjr/skia-rs/compare/v0.2.7...v0.3.0
 [0.4.0]: https://github.com/quinnjr/skia-rs/compare/v0.3.0...v0.4.0
 [0.5.0]: https://github.com/quinnjr/skia-rs/compare/v0.4.0...v0.5.0
-[Unreleased]: https://github.com/quinnjr/skia-rs/compare/v0.5.0...HEAD
+[0.5.1]: https://github.com/quinnjr/skia-rs/compare/v0.5.0...v0.5.1
+[Unreleased]: https://github.com/quinnjr/skia-rs/compare/v0.5.1...HEAD
 
