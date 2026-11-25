@@ -7,6 +7,7 @@ use skia_rs_bench::{
 use skia_rs_canvas::{Canvas, ClipOp, PictureRecorder, SaveLayerRec, Surface};
 use skia_rs_core::{Color, ImageInfo, Matrix, Point, Rect};
 use skia_rs_paint::Paint;
+use skia_rs_path::PathBuilder;
 use std::hint::black_box;
 
 fn bench_canvas_creation(c: &mut Criterion) {
@@ -256,6 +257,7 @@ fn bench_canvas_transforms(c: &mut Criterion) {
     group.finish();
 }
 
+#[allow(clippy::too_many_lines)]
 fn bench_canvas_clip(c: &mut Criterion) {
     let mut group = c.benchmark_group("Canvas/clip");
 
@@ -321,6 +323,60 @@ fn bench_canvas_clip(c: &mut Criterion) {
                     |mut canvas| {
                         for rect in rects {
                             canvas.clip_rect(rect, ClipOp::Intersect, false);
+                        }
+                        canvas
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    // Multiple clip_path operations
+    for count in [5, 10, 20] {
+        let mut rng = create_rng();
+        let bounds = Rect::from_xywh(0.0, 0.0, 1920.0, 1080.0);
+        let rects = random_rects(&mut rng, count, &bounds, 200.0);
+
+        group.bench_with_input(
+            BenchmarkId::new("multiple_clip_paths", count),
+            &rects,
+            |b, rects| {
+                b.iter_batched(
+                    || Canvas::new(1920, 1080),
+                    |mut canvas| {
+                        for rect in rects {
+                            let mut rect_path_builder = PathBuilder::new();
+                            rect_path_builder.add_rect(rect);
+                            let rect_path = rect_path_builder.build();
+                            canvas.clip_path(&rect_path, ClipOp::Intersect, false);
+                        }
+                        canvas
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    // Multiple anti-aliased clip_path operations
+    for count in [5, 10, 20] {
+        let mut rng = create_rng();
+        let bounds = Rect::from_xywh(0.0, 0.0, 1920.0, 1080.0);
+        let rects = random_rects(&mut rng, count, &bounds, 200.0);
+
+        group.bench_with_input(
+            BenchmarkId::new("multiple_clip_paths_aa", count),
+            &rects,
+            |b, rects| {
+                b.iter_batched(
+                    || Canvas::new(1920, 1080),
+                    |mut canvas| {
+                        for rect in rects {
+                            let mut rect_path_builder = PathBuilder::new();
+                            rect_path_builder.add_rect(rect);
+                            let rect_path = rect_path_builder.build();
+                            canvas.clip_path(&rect_path, ClipOp::Intersect, true);
                         }
                         canvas
                     },
